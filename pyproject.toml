@@ -3,6 +3,9 @@ name = "invoice-approval-workflow"
 version = "0.1.0"
 description = "AI-assisted invoice and expense approval platform"
 requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.9",
+]
 
 [tool.ruff]
 line-length = 100
