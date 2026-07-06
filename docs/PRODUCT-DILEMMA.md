@@ -1,7 +1,7 @@
 # Product Dilemma - Autonomy Posture
 
 ## The Dilemma
-ApprovalFlow serves millions of users and handles real company money. This creates a fundamental tension. If the agent auto-approves too much, the system risks approving fraudulent, mistaken, or out-of-policy expenses with no human catching them. If it escalates too much, the product loses its purpose — approvers end up rubber-stamping items the system could safely handle alone (F6), and a $0 ceiling, while trivially "safe", defeats the product entirely. The dilemma is choosing where the line sits: which expenses are safe enough for the agent to approve alone, and which must a human see. There is no single correct answer - this document states my chosen posture and justifies its trade-off. A per-category ceiling was considered but deferred for simplicity - see Trade-off
+ApprovalFlow (repo: invoice-approval-workflow) serves millions of users and handles real company money. This creates a fundamental tension. If the agent auto-approves too much, the system risks approving fraudulent, mistaken, or out-of-policy expenses with no human catching them. If it escalates too much, the product loses its purpose — approvers end up rubber-stamping items the system could safely handle alone (F6), and a $0 ceiling, while trivially "safe", defeats the product entirely. The dilemma is choosing where the line sits: which expenses are safe enough for the agent to approve alone, and which must a human see. There is no single correct answer - this document states my chosen posture and justifies its trade-off. A per-category ceiling was considered but deferred for simplicity - see Trade-off
 
 ## My Posture
 | Parameter | Value | 
