@@ -32,7 +32,10 @@ The priority is:
 
 ## Current Focus
 
-Phase 1 (Deterministic Decision Router) is complete. Next: Phase 2, Decision Service.
+Phase 1 (Deterministic Decision Router) is complete. LLM provider abstraction (part of Phase 3)
+is also complete, done early since Phase 2's Decision Service will need it. Next: the LangGraph
+agent/graph itself (rest of Phase 3), or Phase 2's Decision Service - either order is fine since
+both now depend only on already-completed pieces.
 
 ---
 
@@ -134,8 +137,10 @@ The agent does NOT decide.
 - [ ] Implement LangGraph agent flow
 - [ ] Add structured output
 - [ ] Add policy context input
-- [ ] Add LLM provider abstraction
-- [ ] Add provider error handling
+- [x] Add LLM provider abstraction (`services/decision/accessors/`: `LLMProvider` Protocol,
+  `GroqProvider`, `MockProvider`, `get_llm_provider()` factory selected by `LLM_PROVIDER` env var)
+- [x] Add provider error handling (fail-fast: missing `GROQ_API_KEY` raises `LLMProviderError`
+  at construction; SDK errors and empty completions are wrapped, never swallowed)
 
 ## Fallback Strategy
 

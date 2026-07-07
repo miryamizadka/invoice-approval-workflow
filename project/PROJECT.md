@@ -90,9 +90,11 @@ Completed
 - Product Dilemma
 - Decision Service data models
 - Deterministic Router (implementation + tests, ruff/mypy clean)
+- LLM Provider Abstraction (implementation + tests, ruff/mypy clean)
 
 In Progress
 
+- LangGraph agent/graph
 - Decision Service implementation
 
 Planned

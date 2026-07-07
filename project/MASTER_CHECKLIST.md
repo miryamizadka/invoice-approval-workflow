@@ -269,8 +269,9 @@ Priority: CRITICAL
 - [ ] Error handling
 - [ ] Health checks
 - [ ] Separation of concerns
-- [ ] LLM provider abstraction
-- [ ] Provider failure handling
+- [x] LLM provider abstraction (`LLMProvider` Protocol, swappable via `LLM_PROVIDER` env var)
+- [x] Provider failure handling (fail-fast on missing key; SDK/empty-completion errors wrapped
+  in `LLMProviderError`, never silent)
 
 
 ## M16 — CI
@@ -284,6 +285,7 @@ Priority: CRITICAL
 
 - [ ] Tests run in CI
 - [x] Router tests (69 unit tests: fixture-driven + per-rule boundaries)
+- [x] LLM provider tests (18 unit tests: MockProvider, GroqProvider with a fake client, factory)
 - [ ] Integration tests
 
 
@@ -425,10 +427,11 @@ Completed:
 - [x] Product Dilemma
 - [x] Decision Models
 - [x] Deterministic Router (implementation + 69 unit tests, ruff/mypy clean)
+- [x] LLM Provider Abstraction (implementation + 18 unit tests, ruff/mypy clean)
 
 Current:
 
-- [ ] Decision Service (FastAPI wrapper around the router + agent)
+- [ ] LangGraph agent/graph, and/or Decision Service (FastAPI wrapper around router + agent)
 
 Next:
 
