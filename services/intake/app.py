@@ -54,3 +54,6 @@ def create_app(
         return SubmissionStatusResponse.from_submission(submission)
 
     return app
+
+app = create_app()
+
