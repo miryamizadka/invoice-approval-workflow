@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from pydantic import BaseModel
+
 
 class LLMProviderError(Exception):
     """Raised on any provider failure - missing config, API/network errors.
@@ -15,15 +17,26 @@ class LLMProviderError(Exception):
 @runtime_checkable
 class LLMProvider(Protocol):
     async def complete(
-        self, system_prompt: str, user_message: str, *, json_mode: bool = False
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        schema: type[BaseModel] | None = None,
     ) -> str:
         """Return the model's raw text completion.
 
         Raw text, not a parsed Recommendation - interpreting/validating the
         agent's expected schema is the agent's job (Engine layer), not this
-        Accessor's. json_mode requests a JSON-parseable string from
-        providers that support it natively; it does not imply any specific
-        schema - enforcing the Recommendation schema is decided when the
-        agent is designed, not here.
+        Accessor's. The Accessor accepts any Pydantic model class via
+        `schema` and stays domain-agnostic - it never imports or knows about
+        Recommendation specifically.
+
+        schema, if given, requests strict constrained decoding: the
+        provider guarantees the returned text parses into that exact
+        schema, and takes precedence over json_mode (which becomes
+        irrelevant when schema is set). json_mode alone requests a
+        JSON-parseable string from providers that support it, without
+        enforcing any particular shape.
         """
         ...

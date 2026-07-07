@@ -427,11 +427,17 @@ Completed:
 - [x] Product Dilemma
 - [x] Decision Models
 - [x] Deterministic Router (implementation + 69 unit tests, ruff/mypy clean)
-- [x] LLM Provider Abstraction (implementation + 18 unit tests, ruff/mypy clean)
+- [x] LLM Provider Abstraction, incl. Groq strict structured-output support
+  (implementation + 23 unit tests, ruff/mypy clean)
+- [x] LangGraph Agent (`preprocess`/`classify`/`router` nodes, DI'd provider+thresholds;
+  implementation + 11 unit tests, ruff/mypy clean; 103 tests total in the suite)
 
 Current:
 
-- [ ] LangGraph agent/graph, and/or Decision Service (FastAPI wrapper around router + agent)
+- [ ] Manual smoke-test of GroqProvider strict mode against the real API
+  (`scripts/smoke_test_groq_strict.py` - written, blocked by a sandbox network/SSL
+  restriction, needs running in an environment with real access to api.groq.com)
+- [ ] Decision Service (FastAPI wrapper around agent + router)
 
 Next:
 

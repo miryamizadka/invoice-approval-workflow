@@ -28,14 +28,17 @@ The priority is:
 - [x] CLAUDE.md
 - [x] MASTER_CHECKLIST.md
 - [x] Decision Service domain models
-- [x] Router TDD started
+- [x] Deterministic Router (services/decision/router/)
+- [x] LLM provider abstraction (services/decision/accessors/)
+- [x] LangGraph agent (services/decision/agent/) - Phase 3 done, pending the manual Groq
+  smoke-test (see Phase 3 tasks below)
 
 ## Current Focus
 
-Phase 1 (Deterministic Decision Router) is complete. LLM provider abstraction (part of Phase 3)
-is also complete, done early since Phase 2's Decision Service will need it. Next: the LangGraph
-agent/graph itself (rest of Phase 3), or Phase 2's Decision Service - either order is fine since
-both now depend only on already-completed pieces.
+Phase 1 and Phase 3 (AI Agent Integration) are both complete at the code/test level. Remaining
+before Phase 3 is fully "production-ready": run `scripts/smoke_test_groq_strict.py` manually
+against the real Groq API (blocked in the current dev sandbox by a network/SSL restriction, not
+by the code). Next: Phase 2, the Decision Service (FastAPI layer wiring intake -> agent -> router).
 
 ---
 
@@ -134,13 +137,27 @@ The agent does NOT decide.
 
 ## Tasks
 
-- [ ] Implement LangGraph agent flow
-- [ ] Add structured output
-- [ ] Add policy context input
+- [x] Implement LangGraph agent flow (`services/decision/agent/`: `preprocess` -> `ClassifyNode`
+  -> `RouterNode`, wired by `build_agent_graph(provider, thresholds)`; provider and thresholds
+  both dependency-injected, not hardcoded/global). `AgentState.raw_llm_response` retains the
+  LLM's exact text even on a successful parse, for F9 audit trail purposes. Second-round design
+  review incorporated: `policy` deliberately stays in state (not injected as a fixed dependency)
+  because N5 (RAG over policy) will need it to vary per-invocation once built.
+- [x] Add structured output (Groq strict `json_schema` mode via `LLMProvider.complete(schema=...)`;
+  `openai/gpt-oss-120b` constrained decoding guarantees the response parses as `Recommendation` -
+  no manual JSON-mode parsing/retries needed). **Numeric bound (min/max on `confidence`) support
+  in Groq's strict mode is not yet confirmed against the real API** - `scripts/smoke_test_groq_strict.py`
+  is written and ready but could not be run to completion in this environment (SSL/network
+  restriction blocks egress to api.groq.com here) - run it manually before calling this
+  production-ready. See that script's docstring.
+- [x] Add policy context input (`AgentState.policy`, consumed by `preprocess` to build the prompt)
 - [x] Add LLM provider abstraction (`services/decision/accessors/`: `LLMProvider` Protocol,
   `GroqProvider`, `MockProvider`, `get_llm_provider()` factory selected by `LLM_PROVIDER` env var)
 - [x] Add provider error handling (fail-fast: missing `GROQ_API_KEY` raises `LLMProviderError`
-  at construction; SDK errors and empty completions are wrapped, never swallowed)
+  at construction; SDK errors and empty completions are wrapped, never swallowed; the agent graph
+  wraps `LLMProviderError`/schema-parse failures as `AgentError` and never falls back to
+  `recommendation=None` silently inside the graph - see `services/decision/agent/nodes.py`
+  module docstring for the documented caller-owns-fallback contract)
 
 ## Fallback Strategy
 

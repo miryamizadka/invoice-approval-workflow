@@ -11,11 +11,18 @@ from typing import Any
 
 import pytest
 from groq import GroqError
+from pydantic import BaseModel
 
 from services.decision.accessors.factory import get_llm_provider
 from services.decision.accessors.groq_provider import DEFAULT_MODEL, GroqProvider
 from services.decision.accessors.llm_provider import LLMProvider, LLMProviderError
 from services.decision.accessors.mock_provider import MockProvider
+
+
+class _SampleSchema(BaseModel):
+    """A throwaway schema for exercising the `schema` parameter in tests."""
+
+    answer: str
 
 
 class _FakeCompletions:
@@ -74,6 +81,38 @@ async def test_mock_provider_returns_configured_response() -> None:
 
 def test_mock_provider_satisfies_llm_provider_protocol() -> None:
     assert isinstance(MockProvider(), LLMProvider)
+
+
+@pytest.mark.asyncio
+async def test_mock_provider_ignores_schema_even_when_response_does_not_match_it() -> None:
+    """Locks in the design decision: Mock never validates against schema.
+
+    The configured response deliberately does NOT match _SampleSchema - if
+    MockProvider ever started validating, this test would catch it.
+    """
+    provider = MockProvider(response="not valid json for any schema")
+    result = await provider.complete("system", "user", schema=_SampleSchema)
+    assert result == "not valid json for any schema"
+
+
+# --- Cross-provider Protocol conformance -----------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider",
+    [
+        MockProvider(),
+        GroqProvider(api_key="k", client=_FakeGroqClient(content="{}")),
+    ],
+    ids=["mock", "groq"],
+)
+async def test_every_provider_accepts_the_schema_parameter(provider: LLMProvider) -> None:
+    """Guards against a future provider silently forgetting to add `schema`
+    to its complete() signature - would otherwise only surface as a
+    TypeError the first time something actually passes schema=..., which
+    could easily be much later than when the provider was added."""
+    await provider.complete("system", "user", schema=_SampleSchema)
 
 
 # --- GroqProvider: fail-fast (M15) ----------------------------------------
@@ -146,6 +185,32 @@ async def test_groq_provider_fails_clean_on_empty_completion() -> None:
     provider = GroqProvider(api_key="k", client=fake_client)
     with pytest.raises(LLMProviderError, match="empty completion"):
         await provider.complete("sys", "user")
+
+
+@pytest.mark.asyncio
+async def test_groq_provider_builds_strict_json_schema_response_format() -> None:
+    fake_client = _FakeGroqClient(content='{"answer": "ok"}')
+    provider = GroqProvider(api_key="k", client=fake_client)
+    await provider.complete("sys", "user", schema=_SampleSchema)
+    assert fake_client.completions.last_kwargs is not None
+    response_format = fake_client.completions.last_kwargs["response_format"]
+    assert response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "_SampleSchema",
+            "strict": True,
+            "schema": _SampleSchema.model_json_schema(),
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_groq_provider_schema_takes_precedence_over_json_mode() -> None:
+    fake_client = _FakeGroqClient(content='{"answer": "ok"}')
+    provider = GroqProvider(api_key="k", client=fake_client)
+    await provider.complete("sys", "user", json_mode=True, schema=_SampleSchema)
+    assert fake_client.completions.last_kwargs is not None
+    assert fake_client.completions.last_kwargs["response_format"]["type"] == "json_schema"
 
 
 # --- factory ----------------------------------------------------------------

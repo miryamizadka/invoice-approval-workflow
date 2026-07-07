@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from groq import AsyncGroq, GroqError
+from pydantic import BaseModel
 
 from services.decision.accessors.llm_provider import LLMProviderError
 
@@ -69,10 +70,18 @@ class GroqProvider:
         if not resolved_key:
             raise LLMProviderError("GROQ_API_KEY is not set; cannot construct GroqProvider.")
         self._model = model or os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
-        self._client = client or AsyncGroq(api_key=resolved_key)
+        # AsyncGroq's real create() has fixed named parameters, not **kwargs, so
+        # mypy can't structurally verify it against GroqClient's **kwargs: Any
+        # Protocol method even though it satisfies it at runtime - hence the cast.
+        self._client: GroqClient = client or cast(GroqClient, AsyncGroq(api_key=resolved_key))
 
     async def complete(
-        self, system_prompt: str, user_message: str, *, json_mode: bool = False
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        json_mode: bool = False,
+        schema: type[BaseModel] | None = None,
     ) -> str:
         try:
             response = await self._client.chat.completions.create(
@@ -81,7 +90,7 @@ class GroqProvider:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_message},
                 ],
-                response_format={"type": "json_object"} if json_mode else None,
+                response_format=_response_format(schema, json_mode),
             )
         except GroqError as exc:
             raise LLMProviderError(f"Groq API call failed ({self._model}): {exc}") from exc
@@ -89,3 +98,18 @@ class GroqProvider:
         if not content:
             raise LLMProviderError(f"Groq returned an empty completion ({self._model}).")
         return content
+
+
+def _response_format(schema: type[BaseModel] | None, json_mode: bool) -> dict[str, Any] | None:
+    if schema is not None:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "strict": True,
+                "schema": schema.model_json_schema(),
+            },
+        }
+    if json_mode:
+        return {"type": "json_object"}
+    return None

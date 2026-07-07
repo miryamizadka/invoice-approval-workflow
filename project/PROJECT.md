@@ -90,11 +90,13 @@ Completed
 - Product Dilemma
 - Decision Service data models
 - Deterministic Router (implementation + tests, ruff/mypy clean)
-- LLM Provider Abstraction (implementation + tests, ruff/mypy clean)
+- LLM Provider Abstraction, incl. Groq strict structured-output (implementation + tests,
+  ruff/mypy clean)
+- LangGraph Agent (implementation + tests, ruff/mypy clean)
 
 In Progress
 
-- LangGraph agent/graph
+- Manual Groq strict-mode smoke-test (script ready, blocked by sandbox network access)
 - Decision Service implementation
 
 Planned
