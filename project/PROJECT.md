@@ -93,11 +93,13 @@ Completed
 - LLM Provider Abstraction, incl. Groq strict structured-output (implementation + tests,
   ruff/mypy clean)
 - LangGraph Agent (implementation + tests, ruff/mypy clean)
+- Decision Service - FastAPI wrapper (`services/decision/service/`) around the agent + router,
+  with a transport-agnostic `Decider` core, structured logging, correlation-id, health check,
+  and a global exception handler (implementation + integration tests, ruff/mypy clean)
 
 In Progress
 
 - Manual Groq strict-mode smoke-test (script ready, blocked by sandbox network access)
-- Decision Service implementation
 
 Planned
 

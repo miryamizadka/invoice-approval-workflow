@@ -32,13 +32,17 @@ The priority is:
 - [x] LLM provider abstraction (services/decision/accessors/)
 - [x] LangGraph agent (services/decision/agent/) - Phase 3 done, pending the manual Groq
   smoke-test (see Phase 3 tasks below)
+- [x] Decision Service (services/decision/service/) - Phase 2 done: FastAPI wrapping the agent
+  graph + router, with a clean `Decider.decide()` transport-agnostic core (see Phase 2 below)
 
 ## Current Focus
 
-Phase 1 and Phase 3 (AI Agent Integration) are both complete at the code/test level. Remaining
-before Phase 3 is fully "production-ready": run `scripts/smoke_test_groq_strict.py` manually
-against the real Groq API (blocked in the current dev sandbox by a network/SSL restriction, not
-by the code). Next: Phase 2, the Decision Service (FastAPI layer wiring intake -> agent -> router).
+Phase 1, Phase 2 (Decision Service), and Phase 3 (AI Agent Integration) are all complete at the
+code/test level. Remaining before Phase 3 is fully "production-ready": run
+`scripts/smoke_test_groq_strict.py` manually against the real Groq API (blocked in the current
+dev sandbox by a network/SSL restriction, not by the code). Next: connect Intake -> Decision
+Service (still synchronous HTTP only; Dapr pub/sub as a second transport is explicitly deferred -
+`build_decider()` already exists as the seam it will use), or start Phase 5 (Approval Service).
 
 ---
 
@@ -111,12 +115,34 @@ Expose decision capability as a real service.
 
 ## Tasks
 
-- [ ] Create Decision Service API
-- [ ] Add FastAPI endpoints
-- [ ] Add request validation
-- [ ] Connect AI recommendation input
-- [ ] Return final router decision
-- [ ] Add API documentation
+- [x] Create Decision Service API (`services/decision/service/`: `Decider`/`build_decider`
+  transport-agnostic core + `app.py` FastAPI wrapper - endpoints only call `decider.decide()`,
+  no business logic in the transport layer)
+- [x] Add FastAPI endpoints (`POST /decisions`, `GET /health`)
+- [x] Add request validation (automatic: `Invoice` as the endpoint's Pydantic parameter type -
+  malformed bodies get a 422 for free)
+- [x] Connect AI recommendation input (`Decider.decide()` builds `AgentState` and runs
+  `build_agent_graph(...)`, reusing the existing agent - not reimplemented)
+- [x] Return final router decision (`Decision` returned directly; `AgentError` from the agent
+  is caught and falls back to `route_decision(invoice, recommendation=None, ...)` - the router's
+  own safe path - documented and tested, never a silent crash)
+- [x] Add API documentation (automatic: FastAPI generates OpenAPI/Swagger UI at `/docs` from the
+  existing Pydantic models - no extra work needed, satisfies D4)
+
+Also added (not in the original task list, cheap and directly serves M14/M15):
+- Structured JSON logging (`services/decision/service/logging_config.py`, stdlib only) with
+  `correlation_id` on request/response/fallback log lines.
+- `X-Correlation-Id` request header support (used if supplied, generated as a UUID otherwise;
+  echoed back in the response header and in `Decision.correlation_id`).
+- A global FastAPI exception handler for genuinely unexpected errors (distinct from the
+  documented `AgentError` fallback) - logs with correlation_id, returns a JSON 500 instead of
+  FastAPI's default undocumented one.
+
+Tests: `tests/integration/test_decision_service.py` (7 tests, `TestClient` + `MockProvider`/a
+stub, no real network) - valid invoice -> decision, invalid invoice -> 422, `AgentError` ->
+human_review fallback (not a 500), health check, correlation-id echo/generation, and an
+end-to-end M12 proof through the real HTTP layer (over-ceiling invoice + an LLM mocked to
+confidently recommend approval still comes back `human_review`).
 
 ---
 
