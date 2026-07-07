@@ -156,6 +156,8 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+scripts/grok_provider_demo.py
+run_agent.py
 
 # Spyder project settings
 .spyderproject
