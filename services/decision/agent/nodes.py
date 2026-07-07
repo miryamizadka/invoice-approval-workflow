@@ -19,9 +19,9 @@ from pydantic import ValidationError
 from services.decision.accessors.llm_provider import LLMProvider, LLMProviderError
 from services.decision.agent.prompts import SYSTEM_PROMPT
 from services.decision.agent.state import AgentState
-from services.decision.models import Decision, Invoice, Recommendation
 from services.decision.router.config import AutonomyThresholds
 from services.decision.router.router import route_decision
+from shared.contracts.models import Decision, Invoice, Recommendation
 
 
 class AgentError(Exception):

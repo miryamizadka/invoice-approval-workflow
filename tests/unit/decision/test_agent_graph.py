@@ -15,9 +15,9 @@ from services.decision.accessors.mock_provider import MockProvider
 from services.decision.agent.graph import build_agent_graph
 from services.decision.agent.nodes import AgentError
 from services.decision.agent.state import AgentState
-from services.decision.models import Recommendation, RecommendationType, Route
 from services.decision.router.config import DEFAULT_THRESHOLDS
 from services.decision.router.router import route_decision
+from shared.contracts.models import Recommendation, RecommendationType, Route
 from tests.support.decision_fixtures import clean_invoice
 
 VALID_RECOMMENDATION = Recommendation(

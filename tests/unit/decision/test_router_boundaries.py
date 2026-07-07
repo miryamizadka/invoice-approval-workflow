@@ -12,7 +12,9 @@ from decimal import Decimal
 
 import pytest
 
-from services.decision.models import (
+from services.decision.router import route_decision
+from services.decision.router.config import DEFAULT_THRESHOLDS
+from shared.contracts.models import (
     Category,
     Decision,
     Invoice,
@@ -21,8 +23,6 @@ from services.decision.models import (
     RecommendationType,
     Route,
 )
-from services.decision.router import route_decision
-from services.decision.router.config import DEFAULT_THRESHOLDS
 from tests.support.decision_fixtures import clean_invoice
 
 _APPROVE_HIGH_CONFIDENCE = Recommendation(

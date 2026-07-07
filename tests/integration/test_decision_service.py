@@ -12,8 +12,8 @@ from fastapi.testclient import TestClient
 
 from services.decision.accessors.llm_provider import LLMProviderError
 from services.decision.accessors.mock_provider import MockProvider
-from services.decision.models import Recommendation, RecommendationType, Route
 from services.decision.service.app import create_app
+from shared.contracts.models import Recommendation, RecommendationType, Route
 
 VALID_RECOMMENDATION = Recommendation(
     recommendation=RecommendationType.APPROVE,

@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import pytest
 
-from services.decision.models import (
+from services.decision.router import route_decision
+from services.decision.router.config import DEFAULT_THRESHOLDS
+from shared.contracts.models import (
     Decision,
     Invoice,
     Recommendation,
     RecommendationType,
     Route,
 )
-from services.decision.router import route_decision
-from services.decision.router.config import DEFAULT_THRESHOLDS
 from tests.support.decision_fixtures import (
     RAW_FIXTURES,
     build_recommendation,

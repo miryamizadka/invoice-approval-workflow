@@ -13,9 +13,9 @@ from fastapi.responses import JSONResponse
 
 from services.decision.accessors.factory import get_llm_provider
 from services.decision.accessors.llm_provider import LLMProvider
-from services.decision.models import Decision, Invoice
 from services.decision.service.decider import Decider, build_decider
 from services.decision.service.logging_config import configure_logging
+from shared.contracts.models import Decision, Invoice
 
 
 def create_app(provider: LLMProvider | None = None) -> FastAPI:
