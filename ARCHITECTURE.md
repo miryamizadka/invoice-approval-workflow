@@ -1,6 +1,6 @@
 
 ## 1. Overview
-ApprovalFlow is a microservice-based, AI-assisted platform that automates invoice and expense approvals. It ingests submissions, uses an AI agent to judge each against a company policy, auto-approves the low-risk majority, and escalates unclear, risky, or high-value cases to a human. Approved items run through a payment saga with budget reservation and compensation, and every decision is auditable end-to-end via a correlation id. Core principle: the AI agent only recommends; a deterministic router enforces the autonomy policy — keeping the system's safety guarantees provable.
+ApprovalFlow (repo: invoice-approval-workflow) is a microservice-based, AI-assisted platform that automates invoice and expense approvals. It ingests submissions, uses an AI agent to judge each against a company policy, auto-approves the low-risk majority, and escalates unclear, risky, or high-value cases to a human. Approved items run through a payment saga with budget reservation and compensation, and every decision is auditable end-to-end via a correlation id. Core principle: the AI agent only recommends; a deterministic router enforces the autonomy policy — keeping the system's safety guarantees provable.
 
 
 ## 2. Requirements summary
