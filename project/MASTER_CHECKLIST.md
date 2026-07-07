@@ -23,34 +23,44 @@ Priority order:
 ### F1 — Async invoice submission + tracking id
 Priority: MUST HAVE
 
-- [ ] Submit invoice/expense endpoint exists
-- [ ] Immediate acknowledgement returned
-- [ ] Tracking id generated
-- [ ] Processing happens asynchronously
-- [ ] Final result delivered later
+- [x] Submit invoice/expense endpoint exists (`POST /invoices`, `services/intake/app.py`)
+- [x] Immediate acknowledgement returned (202 Accepted, before processing starts)
+- [x] Tracking id generated (UUID, also used as `correlation_id`)
+- [x] Processing happens asynchronously (FastAPI `BackgroundTasks` - explicitly documented as a
+  temporary stand-in for Dapr pub/sub, not a durable production queue; acceptable for this phase)
+- [x] Final result delivered later (retrievable via `GET /invoices/{tracking_id}`; push-style
+  delivery awaits the Notification service)
 
 Implementation:
-- API Gateway
-- Intake Service
-- Dapr Pub/Sub
+- [ ] API Gateway (not built yet - Intake currently the direct entry point)
+- [x] Intake Service
+- [ ] Dapr Pub/Sub (Intake -> Decision is plain HTTP today, by design - see ADR-worthy note in
+  PLAN.md Phase 4: swapping to Dapr is a transport change, not structural)
 
 ---
 
 ### F2 — Status + plain-language reason
 Priority: MUST HAVE
 
-- [ ] Status endpoint exists
-- [ ] User can retrieve submission status
-- [ ] Final decision includes understandable reason
+- [x] Status endpoint exists (`GET /invoices/{tracking_id}`)
+- [x] User can retrieve submission status
+- [x] Final decision includes understandable reason (`Decision.reason`, surfaced via
+  `SubmissionStatusResponse.reason`; a generic safe message on internal failure instead of
+  leaking raw error text)
 
 ---
 
 ### F3 — Duplicate prevention
 Priority: MUST HAVE
 
-- [ ] Duplicate submissions detected
-- [ ] Same invoice cannot be paid twice
-- [ ] Idempotency mechanism implemented
+- [x] Duplicate submissions detected (`compute_dedup_key`, checked against the repository in
+  `IntakeService.submit()`, `is_duplicate` passed through to Decision Service)
+- [ ] Same invoice cannot be paid twice (depends on the Payment service, not built yet)
+- [x] Idempotency mechanism implemented for business-level duplicate submissions. **Documented
+  gap**: `POST /invoices` is not idempotent at the transport level - a literal client retry
+  produces a new `tracking_id` (though F3's dedup still catches it downstream, so no
+  double-processing). A future `X-Idempotency-Key` would close this UX gap; not needed now since
+  the business-level risk is already covered.
 
 ---
 
@@ -289,8 +299,12 @@ Priority: CRITICAL
 - [ ] Tests run in CI
 - [x] Router tests (69 unit tests: fixture-driven + per-rule boundaries)
 - [x] LLM provider tests (18 unit tests: MockProvider, GroqProvider with a fake client, factory)
-- [x] Integration tests (`tests/integration/test_decision_service.py`, 7 tests: full HTTP ->
-  Decider -> agent -> router chain via `TestClient` + `MockProvider`/a stub)
+- [x] Integration tests (`tests/integration/test_decision_service.py`, 9 tests: full HTTP ->
+  Decider -> agent -> router chain via `TestClient` + `MockProvider`/a stub;
+  `tests/integration/test_intake_service.py`, 8 tests: full HTTP -> IntakeService ->
+  InMemoryInvoiceRepository via `TestClient` + a stub `DecisionServiceClient`)
+- [x] Intake unit tests (`tests/unit/intake/test_repository.py`, 5 tests: save/get roundtrip,
+  dedup-key lookup); 128 tests total in the suite
 
 
 ## M18 — README
@@ -438,7 +452,14 @@ Completed:
   implementation + tests, ruff/mypy clean)
 - [x] Decision Service (`services/decision/service/`: `Decider`/`build_decider` transport-agnostic
   core + FastAPI wrapper; structured logging, correlation-id, global exception handler;
-  implementation + 7 integration tests, ruff/mypy clean; 113 tests total in the suite)
+  implementation + integration tests, ruff/mypy clean)
+- [x] shared/contracts/ extraction (Invoice/Decision/Recommendation/enums/`compute_dedup_key` -
+  the single source both Decision and Intake depend on; pure refactor, all 113 prior tests
+  passed unmodified before Intake was built on it)
+- [x] Intake Service (`services/intake/`: `IntakeService`/`build_intake_service`
+  transport-agnostic core, `InvoiceRepository`/`InMemoryInvoiceRepository`,
+  `DecisionServiceClient`/`HttpDecisionServiceClient`, thin FastAPI wrapper; implementation +
+  13 tests, ruff/mypy clean; 128 tests total in the suite)
 
 Current:
 

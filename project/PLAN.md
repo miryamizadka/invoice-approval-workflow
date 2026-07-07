@@ -34,15 +34,22 @@ The priority is:
   smoke-test (see Phase 3 tasks below)
 - [x] Decision Service (services/decision/service/) - Phase 2 done: FastAPI wrapping the agent
   graph + router, with a clean `Decider.decide()` transport-agnostic core (see Phase 2 below)
+- [x] shared/contracts/ (Invoice, LineItem, Decision, Recommendation, enums, compute_dedup_key)
+  extracted from services/decision/models.py - both Decision and Intake depend on this single
+  canonical source, neither imports the other's codebase. Pure refactor: all 113 pre-existing
+  tests passed unmodified before Intake was built on top of it.
+- [x] Intake Service (services/intake/) - Phase 4 done: FastAPI wrapping a clean `IntakeService`
+  core, `InMemoryInvoiceRepository` behind a Protocol, `HttpDecisionServiceClient` behind a
+  Protocol (see Phase 4 below)
 
 ## Current Focus
 
-Phase 1, Phase 2 (Decision Service), and Phase 3 (AI Agent Integration) are all complete at the
-code/test level. Remaining before Phase 3 is fully "production-ready": run
-`scripts/smoke_test_groq_strict.py` manually against the real Groq API (blocked in the current
-dev sandbox by a network/SSL restriction, not by the code). Next: connect Intake -> Decision
-Service (still synchronous HTTP only; Dapr pub/sub as a second transport is explicitly deferred -
-`build_decider()` already exists as the seam it will use), or start Phase 5 (Approval Service).
+Phase 1, Phase 2 (Decision Service), Phase 3 (AI Agent Integration), and Phase 4 (Intake Service)
+are all complete at the code/test level. Remaining before Phase 3 is fully "production-ready":
+run `scripts/smoke_test_groq_strict.py` manually against the real Groq API (blocked in the
+current dev sandbox by a network/SSL restriction, not by the code). Next: Phase 5 (Approval
+Service), or wiring Dapr pub/sub as Intake<->Decision's second transport (both services already
+expose the composition seams - `build_decider()`, `build_intake_service()` - this needs).
 
 ---
 
@@ -220,12 +227,36 @@ Approval      Payment
 
 ## Tasks
 
-- [ ] Create Intake Service
-- [ ] Create invoice submission endpoint
-- [ ] Generate tracking id
-- [ ] Implement asynchronous processing
-- [ ] Persist submission state
-- [ ] Add status endpoint
+- [x] Create Intake Service (`services/intake/`: `IntakeService`/`build_intake_service`
+  transport-agnostic core + thin `app.py` FastAPI wrapper, same pattern as Decision Service)
+- [x] Create invoice submission endpoint (`POST /invoices`, 202 Accepted)
+- [x] Generate tracking id (UUID, doubles as the `correlation_id` passed to Decision Service -
+  `Invoice.id` itself is untouched, stays the caller's own business field)
+- [x] Implement asynchronous processing (FastAPI `BackgroundTasks` - explicitly documented as a
+  temporary stand-in for Dapr pub/sub, not a production queue: no durability across restarts, no
+  retry, no multi-worker scaling; accepted limitation for this phase)
+- [x] Persist submission state (`InvoiceRepository` Protocol + `InMemoryInvoiceRepository`, same
+  pattern as `LLMProvider`; a future `PostgresInvoiceRepository` swaps in without touching
+  `IntakeService`)
+- [x] Add status endpoint (`GET /invoices/{tracking_id}`, returns a slim `SubmissionStatusResponse`
+  - deliberately not the internal `Submission` record, to avoid leaking the dedup key or raw
+  internal error text to an external caller)
+
+Also required and added:
+- [x] Duplicate detection (F3): `compute_dedup_key` (from `shared.contracts.models`) checked
+  against the repository before storing; `is_duplicate` threaded through to Decision Service via
+  a new `?is_duplicate=` query param on `POST /decisions` (Decision Service's endpoint didn't
+  expose this before - additive change, verified against all pre-existing tests)
+- [x] `DecisionServiceClient` Protocol + `HttpDecisionServiceClient` - Intake talks to Decision
+  over HTTP, not a direct Python import of `Decider`, so the two remain independently deployable
+  (M3); swapping to Dapr pub/sub later is a transport change, not a structural one
+- [x] `shared/contracts/` extraction (Invoice/Decision/Recommendation/enums/`compute_dedup_key`)
+  done first, as a prerequisite - both services depend on one canonical source now instead of
+  Intake importing across the service boundary
+- Explicitly deferred, with reasons recorded: client-side retry on `HttpDecisionServiceClient`
+  (no idempotency-key support on Decision Service yet - naive retry risks double LLM invocation)
+  and transport-level idempotency for `POST /invoices` (F3's business-level dedup already
+  prevents double-processing; only a client-retry UX gap remains, not a safety one)
 
 ---
 
