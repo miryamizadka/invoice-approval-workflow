@@ -16,9 +16,9 @@ from services.decision.agent.nodes import (
     preprocess,
 )
 from services.decision.agent.state import AgentState
-from services.decision.models import Category, Recommendation, RecommendationType, Route
 from services.decision.router.config import DEFAULT_THRESHOLDS
 from services.decision.router.router import route_decision
+from shared.contracts.models import Category, Recommendation, RecommendationType, Route
 from tests.support.decision_fixtures import clean_invoice
 
 VALID_RECOMMENDATION = Recommendation(

@@ -12,8 +12,8 @@ from fastapi.testclient import TestClient
 
 from services.decision.accessors.llm_provider import LLMProviderError
 from services.decision.accessors.mock_provider import MockProvider
-from services.decision.models import Recommendation, RecommendationType, Route
 from services.decision.service.app import create_app
+from shared.contracts.models import Recommendation, RecommendationType, Route
 
 VALID_RECOMMENDATION = Recommendation(
     recommendation=RecommendationType.APPROVE,
@@ -167,3 +167,29 @@ def test_m12_ceiling_survives_optimistic_agent_through_http() -> None:
 
     assert response.status_code == 200
     assert response.json()["route"] == Route.HUMAN_REVIEW.value
+
+
+# --- (g) is_duplicate query param routes to DUPLICATE (needed by Intake) -----
+
+
+def test_is_duplicate_query_param_routes_to_duplicate() -> None:
+    """Decider.decide() already supported is_duplicate; the endpoint didn't
+    expose it. Intake needs to pass this through, so it must be reachable
+    over HTTP - additive change, default False preserves prior behavior."""
+    app = create_app(provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()))
+    client = TestClient(app)
+
+    response = client.post("/decisions?is_duplicate=true", json=_invoice_body())
+
+    assert response.status_code == 200
+    assert response.json()["route"] == Route.DUPLICATE.value
+
+
+def test_is_duplicate_defaults_to_false_when_omitted() -> None:
+    app = create_app(provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()))
+    client = TestClient(app)
+
+    response = client.post("/decisions", json=_invoice_body())
+
+    assert response.status_code == 200
+    assert response.json()["route"] == Route.AUTO_APPROVE.value

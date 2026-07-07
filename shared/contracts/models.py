@@ -1,4 +1,10 @@
-"""Data contracts for the Decision service: Invoice, Recommendation, Decision."""
+"""Data contracts shared across services: Invoice, Recommendation, Decision.
+
+These are the wire/domain shapes multiple independently-deployable services
+(Decision, Intake, and future services) must agree on. Anything that is
+specific to how one service decides or processes (e.g. the router's
+AutonomyThresholds, the agent's state) stays owned by that service instead.
+"""
 
 from __future__ import annotations
 
@@ -80,3 +86,15 @@ class Decision(BaseModel):
     reason: str
     triggered_rules: list[str]
     correlation_id: str
+
+
+def compute_dedup_key(invoice: Invoice) -> str:
+    """Pure dedup key (GLOBAL-DUP): vendor + invoice_number + total.
+
+    This is a domain rule (what makes two invoices "the same"), not a
+    generic technical helper - kept here as the single canonical copy so
+    every consuming service (Decision's router, Intake, and any future
+    service that needs duplicate detection) agrees on it by construction,
+    not by convention.
+    """
+    return f"{invoice.vendor}|{invoice.invoice_number}|{invoice.total}"

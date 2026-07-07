@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from services.decision.models import (
+from services.decision.router.config import AutonomyThresholds
+from shared.contracts.models import (
     Category,
     Decision,
     Invoice,
@@ -18,18 +19,6 @@ from services.decision.models import (
     RecommendationType,
     Route,
 )
-from services.decision.router.config import AutonomyThresholds
-
-
-def compute_dedup_key(invoice: Invoice) -> str:
-    """Pure dedup key (GLOBAL-DUP): vendor + invoice_number + total.
-
-    Computing the key is the router's concern; looking it up against
-    already-processed state is not - that belongs to whoever owns
-    durable state (Intake / an Accessor), which then passes the boolean
-    result in as `is_duplicate`.
-    """
-    return f"{invoice.vendor}|{invoice.invoice_number}|{invoice.total}"
 
 
 def _line_items_total(invoice: Invoice) -> Decimal:

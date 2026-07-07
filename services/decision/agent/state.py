@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
-from services.decision.models import Decision, Invoice, Recommendation
+from shared.contracts.models import Decision, Invoice, Recommendation
 
 
 class AgentState(BaseModel):

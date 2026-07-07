@@ -96,6 +96,12 @@ Completed
 - Decision Service - FastAPI wrapper (`services/decision/service/`) around the agent + router,
   with a transport-agnostic `Decider` core, structured logging, correlation-id, health check,
   and a global exception handler (implementation + integration tests, ruff/mypy clean)
+- shared/contracts/ - Invoice/Decision/Recommendation/enums/`compute_dedup_key` extracted from
+  Decision's models into a single source both Decision and Intake depend on (pure refactor, zero
+  behavior change)
+- Intake Service - FastAPI wrapper (`services/intake/`) around a transport-agnostic
+  `IntakeService`, with duplicate detection (F3), an in-memory repository behind a Protocol, and
+  an HTTP client to Decision Service behind a Protocol (implementation + tests, ruff/mypy clean)
 
 In Progress
 

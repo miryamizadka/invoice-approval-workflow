@@ -24,7 +24,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 from services.decision.accessors.groq_provider import GroqProvider  # noqa: E402
 from services.decision.agent.prompts import SYSTEM_PROMPT  # noqa: E402
-from services.decision.models import Recommendation  # noqa: E402
+from shared.contracts.models import Recommendation  # noqa: E402
 
 load_dotenv()
 

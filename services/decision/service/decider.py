@@ -13,10 +13,10 @@ from langgraph.graph.state import CompiledStateGraph
 
 from services.decision.accessors.llm_provider import LLMProvider
 from services.decision.agent import AgentError, AgentState, build_agent_graph
-from services.decision.models import Decision, Invoice
 from services.decision.router.config import DEFAULT_THRESHOLDS, AutonomyThresholds
 from services.decision.router.router import route_decision
 from services.decision.service.policy_loader import load_policy_text
+from shared.contracts.models import Decision, Invoice
 
 
 class Decider:
