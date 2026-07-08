@@ -143,6 +143,36 @@ class ApprovalCompletedEvent(BaseModel):
     resolution: ApprovalResolution
 
 
+class PaymentResolution(StrEnum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class PaymentCompletedEvent(BaseModel):
+    """payment.completed envelope (Dapr pub/sub) - a single topic for both
+    outcomes, the third application of the same consolidation already done
+    for decision.completed and approval.completed: this reads as "the
+    payment PROCESS completed" (successfully or not), not "it succeeded" -
+    a future Notification service filters by `resolution`, the same way
+    Payment itself filters approval.completed by `resolution == approved`.
+
+    No separate tracking_id field: decision.correlation_id already is the
+    tracking id everywhere else in the codebase (Decision, DecisionCompletedEvent,
+    ApprovalCompletedEvent - none of them duplicate it as a sibling field).
+
+    reason is new - a plain-language cause (F2-style) covering both a real
+    PaymentGatewayError message and Payment's own synthetic rejections
+    (insufficient budget, unconfigured department) that have no upstream
+    Decision text to reuse. Always populated, both on success and failure."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    invoice: Invoice
+    decision: Decision
+    resolution: PaymentResolution
+    reason: str
+
+
 class InvoiceSubmittedEvent(BaseModel):
     """Envelope Intake publishes and Decision subscribes to (invoice.submitted,
     Dapr pub/sub) - carries correlation_id, a transport concern Invoice itself

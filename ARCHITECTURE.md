@@ -31,7 +31,7 @@ ApprovalFlow
 | Intake | Accept submission, tracking id, detect duplicates | REST + pub | service invocation, pub/sub | invoices |
 | Decision | Agent recommendation + deterministic router | pub/sub (async) | pub/sub, state, secrets | decisions |
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
-| Payment | Saga: reserve budget → pay → compensate | pub/sub | pub/sub, state | payments, budgets |
+| Payment | Saga: reserve budget → pay → compensate | pub/sub | pub/sub, state | payments, budgets (Dapr state/Redis - interim; see §8/§9) |
 | Notification | Final result notification to submitter | pub (consumer) | pub/sub | — |
 | UI | Minimal interface to submit and view status; approver queue + dashboard | REST (to gateway) | — | — |
 
@@ -96,11 +96,13 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Approval | Payment | Dapr Pub/Sub | Async | Resume after human decision |
 | Payment | Notification | Dapr Pub/Sub | Async | Result notification |
 
-Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `payment.completed`, `payment.failed`.
+Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `payment.completed`.
 
 `decision.completed` carries a `DecisionCompletedEvent` (invoice + `Decision`, including `route` + the agent's `Recommendation`, which may be `None` if the agent itself failed) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`, Approval only wants `route == human_review`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography). The invoice and recommendation/confidence are what Approval needs to display for F4 - the bare `Decision` alone (route/reason/triggered_rules) isn't enough. `POST /decisions`'s external HTTP response is unaffected by this enrichment - it still returns the bare `Decision` only (D4, API stability); the enrichment only travels over the `decision.completed` event.
 
-`approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment (future) filters for `resolution == approved`; Notification (future) filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
+`approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment filters for `resolution == approved` (see below); Notification (future) filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
+
+`payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification (future) filters by `resolution`, the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
 
 
 ## 8. Data Architecture
@@ -110,8 +112,8 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `
 | Invoices | PostgreSQL (interim: Dapr state/Redis - see §9 Duplicate Detection) | Intake |
 | Decisions | PostgreSQL | Decision |
 | Approval state (paused/resume) | Redis (Dapr state) | Approval |
-| Payments | PostgreSQL | Payment |
-| Budgets | PostgreSQL | Payment |
+| Payments | Dapr state (Redis) - interim, same migration path as Invoices/Approval state above; PostgreSQL remains the eventual target, currently unused (see docker-compose.yml) | Payment |
+| Budgets | Dapr state (Redis) - interim, same as Payments; the ETag-based optimistic concurrency §9 requires (INV-1014) is a Dapr state mechanism, not a PostgreSQL one | Payment |
 | Idempotency & dedup keys | Redis (Dapr state) | All services |
 
 Each service owns its own data (database-per-service); no service reads another's store directly - data is shared only through events.
@@ -128,10 +130,10 @@ Auto-approval is gated by a single deterministic router, which is the only code 
 Because this is the sole path to auto-approval and the ceiling check always runs before it, the system is structurally incapable of auto-approving above the ceiling. This is proven by a test (M17) that forces the agent to recommend "approve" at confidence 1.0 on an above-ceiling invoice and asserts the outcome is human. The router consults only amounts, confidence, and hard-stop flags — never free-text — so payload steering such as "finance already approved this" (INV-1013) cannot flip the decision.
 
 ### Idempotency (M10)
-Every effectful operation carries a unique idempotency key (e.g. pay:INV-1012). Before acting, the service checks whether that key was already processed (stored in Dapr state); if so it skips and returns the prior result, otherwise it acts and records the key. This guarantees exactly one effect across the three cases the spec requires: duplicate submissions (F3), redelivered events, and retried payments. Because the key store is Dapr state, it survives restarts like all other state.
+Every effectful operation carries a unique idempotency key. For Payment, that key is the `tracking_id` (the same correlation id threaded end-to-end from Intake through Decision/Approval - not the invoice id, since F3's "same invoice can't be paid twice" is already guaranteed upstream by Intake's dedup check before `invoice.submitted` is even published). Before acting, the service checks whether a `PaymentRecord` already exists for that key in a terminal status (COMPLETED/FAILED); if so it skips and returns the prior result, otherwise it acts and persists the record. This guarantees exactly one effect across the three cases the spec requires: duplicate submissions (F3), redelivered events, and retried payments. Because the record store is Dapr state, it survives restarts like all other state - including a `RESERVED` (non-terminal) status, which lets a redelivered triggering event resume exactly at the charge step after a mid-saga crash, without re-reserving the budget.
 
 ### Saga & Compensation (M9)
-The payment flow is a saga orchestrated by the Payment service: it runs local steps forward — reserve department budget, then execute payment — and defines a compensating action for each (release the reservation). If any step fails, the compensations run in reverse for the steps that succeeded, so the system always reaches a consistent state: either the payment completes, or every partial effect is undone. In Journey D (INV-1012), the payment step is forced to fail; the saga compensates by releasing the reserved budget, leaving no orphaned reservation and a payment-failed status. Orchestration was chosen over choreography so the flow is easy to monitor and trace.
+The payment flow is a saga orchestrated by the Payment service: it runs local steps forward — reserve department budget, then execute payment — and defines a compensating action for each (release the reservation). If any step fails, the compensations run in reverse for the steps that succeeded, so the system always reaches a consistent state: either the payment completes, or every partial effect is undone. In Journey D (INV-1012), the payment step is forced to fail (a deterministic, configured simulated gateway decline - there is no real payment processor in this project); the saga compensates by releasing the reserved budget (crediting back exactly the amount that was reserved, never recomputed from the invoice), leaving no orphaned reservation and a payment-failed status. Orchestration was chosen over choreography so the flow is easy to monitor and trace.
 
 ### Externally Configurable Policy (M13)
 The policy and autonomy thresholds live in a Dapr configuration store, never hard-coded. The Decision service reads them at runtime, so a controller can change the ceiling, confidence, or category limits and it takes effect immediately with no code change or redeploy (F7). The numbers in the store are the same ones enforced by the router, and must match PRODUCT-DILEMMA.md.
@@ -205,6 +207,7 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG
     DONE --> NOTIFY[notify submitter]
     FAILED --> NOTIFY
 ```
+(`payment-completed`/`payment-failed` above are diagram states, not topic names - both publish to the single `payment.completed` topic with `resolution=completed`/`failed` respectively, per §7.)
 
 
 ## 12. Cross-Cutting Concerns

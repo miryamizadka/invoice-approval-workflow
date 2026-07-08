@@ -1,0 +1,8 @@
+{
+  "_about": "Department budget seeds for the Payment service (ARCHITECTURE.md §9 Budget Concurrency, INV-1014). Loaded once at Payment's create_app() startup via BudgetRepository.ensure_seeded() per department - never overwrites an in-progress (already-seeded) budget on restart. Deliberately a separate file from tests/fixtures/sample-invoices.json's `budgets` block (that file is test data; this is runtime policy configuration - CLAUDE.md: never hardcode policy values) even though the values currently match.",
+  "budgets": {
+    "marketing-2026Q2": 1000.0,
+    "engineering-2026Q2": 50000.0,
+    "sales-2026Q2": 20000.0
+  }
+}
