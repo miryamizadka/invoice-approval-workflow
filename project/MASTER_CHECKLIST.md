@@ -55,7 +55,10 @@ Priority: MUST HAVE
 
 - [x] Duplicate submissions detected (`compute_dedup_key`, checked against the repository in
   `IntakeService.submit()`, `is_duplicate` passed through to Decision Service)
-- [ ] Same invoice cannot be paid twice (depends on the Payment service, not built yet)
+- [x] Same invoice cannot be paid twice (`PaymentRecord` keyed by `tracking_id`, idempotent
+  redelivery guard in `PaymentService._run_saga()` - a redelivered `decision.completed`/
+  `approval.completed` for an already-terminal payment is a no-op. Verified live: resubmitting
+  the same triggering event does not double-charge or double-publish)
 - [x] Idempotency mechanism implemented for business-level duplicate submissions. **Documented
   gap**: `POST /invoices` is not idempotent at the transport level - a literal client retry
   produces a new `tracking_id` (though F3's dedup still catches it downstream, so no
@@ -143,7 +146,8 @@ Priority: MUST HAVE
 - [ ] Rules applied stored
 - [ ] Agent recommendation stored
 - [ ] Final decision stored
-- [ ] Payment outcome stored
+- [x] Payment outcome stored (`PaymentRecord` - status, reason, reserved_amount - persisted via
+  `DaprStatePaymentRepository`, keyed by `tracking_id`; `GET /payments/{tracking_id}`)
 
 
 ---
@@ -185,7 +189,7 @@ Priority: MUST HAVE
 
 ## M3 — Microservices
 
-- [x] At least 3 services (Intake, Decision, Approval - Payment pending Phase 6)
+- [x] At least 3 services (Intake, Decision, Approval, Payment - Notification pending)
 - [x] Each service containerized (single shared `Dockerfile`, one container per service)
 - [x] Clear service boundaries (HTTP only between Intake and Decision, no cross-service imports)
 
@@ -207,19 +211,23 @@ Priority: MUST HAVE
 
 Infra step 1 done: `daprd` sidecar per service + `placement`, `dapr/components/{pubsub,statestore}.yaml`
 backed by Redis, verified via `/v1.0/healthz` + `/v1.0/metadata` + logs (see PLAN.md Phase 7).
-Step 3 done: real pub/sub between Intake and Decision, and now Decision and Approval too, verified
-over the actual Docker network (`docker compose logs` shows `POST /events/invoice-submitted`/
-`POST /events/decision-completed`, zero direct HTTP calls between any of these three services).
-Step 4 done: Dapr state now backs both Intake's and Approval's repositories. Service invocation
-and Dapr secrets remain unused.
+Step 3 done: real pub/sub between Intake and Decision, Decision and Approval, and now Decision/
+Approval and Payment too, verified over the actual Docker network (`docker compose logs` shows
+`POST /events/invoice-submitted`/`POST /events/decision-completed`/`POST /events/approval-completed`,
+zero direct HTTP calls between any of these four services). Step 4 done: Dapr state now backs
+Intake's, Approval's, and Payment's repositories - including Payment's budget reservation via
+ETag optimistic concurrency (INV-1014), not just simple save/get. Service invocation and Dapr
+secrets remain unused.
 
 - [ ] Service invocation used
 - [x] Pub/Sub used (`invoice.submitted` published by Intake via `DaprDecisionPublisher`;
   `decision.completed` published by Decision via `DaprDecisionOutcomePublisher`; `approval.completed`
-  published by Approval via `DaprApprovalOutcomePublisher`; all subscribed to via
-  `dapr-ext-fastapi`'s `DaprApp`)
+  published by Approval via `DaprApprovalOutcomePublisher`; `payment.completed` published by
+  Payment via `DaprPaymentOutcomePublisher`; all subscribed to via `dapr-ext-fastapi`'s `DaprApp`)
 - [x] Dapr state used (`DaprStateInvoiceRepository` for Intake, `DaprStateApprovalRepository` for
-  Approval - both the same append-only-index pattern, backed by the `statestore` component)
+  Approval, `DaprStatePaymentRepository`/`DaprStateBudgetRepository` for Payment - the same
+  append-only-index pattern for records; budgets additionally use ETag-based optimistic
+  concurrency, backed by the `statestore` component)
 - [ ] Dapr secrets used
 
 
@@ -248,10 +256,18 @@ and Dapr secrets remain unused.
 
 ## M9 — Payment Saga
 
-- [ ] Payment flow implemented
-- [ ] Failure scenario handled
-- [ ] Compensation/rollback exists
-- [ ] No partial payment
+- [x] Payment flow implemented (`PaymentService` - orchestration-style saga, ADR-004: reserve
+  department budget, then execute payment; Payment is the sole coordinator)
+- [x] Failure scenario handled (`SimulatedPaymentGateway` deterministically declines
+  `PAYMENT_SIMULATE_FAILURE_IDS`-listed invoices [`INV-1012` in docker-compose.yml] - verified
+  live: `status: failed` with the decline reason, no orphaned reservation)
+- [x] Compensation/rollback exists (`BudgetRepository.release()` on gateway failure, crediting
+  back exactly the `reserved_amount` stored at reservation time - verified live via `docker
+  compose logs payment`'s `budget_reserved` → `payment_failed_compensated` sequence and the
+  department budget returning to its exact pre-submission baseline)
+- [x] No partial payment (insufficient-budget rejections happen before any gateway call at all -
+  verified `gateway.charged == []` in that path; INV-1014A/B concurrency script confirms exactly
+  one of a concurrent pair ever succeeds, budget never goes negative, across multiple iterations)
 
 
 ## M10 — Idempotency
@@ -263,7 +279,12 @@ and Dapr secrets remain unused.
   check-then-save window (documented, deferred to a future PostgreSQL unique constraint).
 - [x] Redelivered events safe - `IntakeService.complete()` is idempotent for `decision.completed`
   redelivery (already-completed tracking_id -> no-op; unknown tracking_id -> logged, not a crash)
-- [ ] Payment retries safe (depends on the Payment service, not built yet)
+- [x] Payment retries safe - `PaymentService._run_saga()` checks for an existing terminal
+  `PaymentRecord` before acting (no-op if found); a crash between reserve and charge leaves the
+  record at `RESERVED`, so a redelivery resumes exactly at the charge step instead of
+  re-reserving. Verified live via `docker compose` restart (record + budget both survived,
+  `ensure_seeded()` did not reset the in-progress budget) and via two dedicated deterministic
+  unit tests for the RESERVED-resume path (success and failure outcomes).
 
 
 ## M11 — Durable HITL
@@ -360,9 +381,9 @@ Priority: CRITICAL
 ## D1 — Architecture Documentation
 
 - [x] ARCHITECTURE.md exists
-- [ ] Sequence diagram
-- [ ] Payment flow diagram
-- [ ] Compensation flow
+- [x] Sequence diagram (§11 - Escalate and Resume, INV-1003)
+- [x] Payment flow diagram (§11 - Payment Flow with Compensation, Journey D/INV-1012)
+- [x] Compensation flow (same diagram - RES→PAY→COMP→FAILED path)
 
 
 ## D2 — ADRs
@@ -392,7 +413,9 @@ CRITICAL
 - [ ] Auto approve scenario passes
 - [ ] Human escalation passes
 - [ ] Duplicate scenario passes
-- [ ] Payment failure compensation passes
+- [x] Payment failure compensation passes (INV-1012 verified live via docker compose - see
+  PLAN.md Phase 6 "Verification"; not yet wired into a single automated verification command,
+  that's D5's still-pending "Single command runs verification" item)
 - [ ] Anti-cheese test passes
 
 

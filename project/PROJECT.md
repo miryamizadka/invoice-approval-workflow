@@ -142,6 +142,39 @@ Completed
   up -d --force-recreate approval approval-dapr` mid-flow: both an `approved` and a `waiting_info`
   item survived with correct status, and the `waiting_info` item was still fully actionable
   (approved successfully) afterward - the central proof of durable HITL (M11).
+- Payment Service (Phase 6, M9/M10, INV-1012/INV-1014) - fourth microservice, same layering
+  (`PaymentService`/`build_payment_service` transport-agnostic core + thin FastAPI `app.py`).
+  Orchestration-style saga (ADR-004): reserve department budget via Dapr state's ETag optimistic
+  concurrency, then execute payment through a `PaymentGateway` (a `SimulatedPaymentGateway` - no
+  real payment processor exists in this project, so this deterministic-decline-by-configured-id
+  behavior *is* production, not a stub). On gateway failure, compensates by releasing exactly the
+  amount reserved (never recomputed from the invoice), reaching `FAILED`; on success, reaches
+  `COMPLETED`. A `RESERVED` intermediate status makes the saga crash-recovery-aware: a redelivered
+  triggering event after a mid-saga crash resumes at the charge step rather than re-reserving,
+  proven by two dedicated deterministic unit tests, not just event-redelivery idempotency (which
+  it also has, mirroring Approval's exact fix). Resolved a real contradiction found in
+  ARCHITECTURE.md between §8 (Payments/Budgets → PostgreSQL) and §9 (budget concurrency requires
+  Dapr state with ETag) in favor of Dapr state for this phase - matches the ETag requirement
+  exactly, introduces no new untested technology (no DB driver/ORM exists anywhere in this
+  codebase yet), and follows the same InMemory→DaprState→Postgres migration path every prior
+  service already took. Consolidated `payment.completed`/`payment.failed` into a single topic with
+  a `resolution` field - the third application of the same choreography pattern already used for
+  `decision.completed`/`approval.completed`. Found a genuinely new finding while reading the
+  installed `starlette==1.3.1` source: `TestClient.__enter__` is the only place ASGI lifespan
+  startup runs - Payment is the first service with real startup work (budget seeding), so its
+  integration tests deliberately use `with TestClient(app) as client:` (every other service's
+  integration tests use a bare `TestClient(app)`, which never runs lifespan hooks at all - not a
+  bug there, since none of them have startup work to run). Verified live via `docker compose`:
+  INV-1012's simulated gateway failure correctly compensates with the budget returning to its
+  exact baseline; a real container restart of `payment`+`payment-dapr` mid-lifecycle left both the
+  payment record and the department budget intact, and confirmed `ensure_seeded()` correctly did
+  not reset the already-progressed budget back to its seed value; and
+  `scripts/verify_inv1014_concurrency.py` (real `httpx.AsyncClient`+`asyncio.gather` concurrency,
+  not sequential calls that could pass by timing luck) ran 3 iterations against the real
+  Redis-backed ETag mechanism - iteration 1 showed exactly one of the INV-1014A/B pair completing
+  and one failing on insufficient budget (matching the fixture's own expected math), and later
+  iterations correctly showed the safety invariant (budget never negative, never oversold) holding
+  even once the department's budget was too depleted for either to succeed.
 
 In Progress
 
@@ -151,11 +184,10 @@ In Progress
 
 Planned
 
-- Payment Saga
 - Notification
-- UI
+- API Gateway / UI
 - CI
-- Verification
+- Full Phase 8 verification suite (single command, all four journeys + INV-1014 + anti-cheese)
 - Demo
 
 ---

@@ -48,17 +48,19 @@ The priority is:
 - [x] Dapr state for Intake's `InvoiceRepository` (Phase 7, step 4)
 - [x] Approval Service (Phase 5) - F4 (queue + display), F5 (approve/reject/request-info), M11
   (durable pause/resume) - see Phase 5 below
+- [x] Payment Service (Phase 6) - M9 (Saga + Compensation), M10 (Idempotency), INV-1012 (payment
+  failure + compensation), INV-1014A/B (budget concurrency) - see Phase 6 below
 
 ## Current Focus
 
-Phase 1-5, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete and
+Phase 1-6, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete and
 verified. Remaining before Phase 3 is fully "production-ready": run
 `scripts/smoke_test_groq_strict.py` manually against the real Groq API from a network that isn't
 behind an SSL-intercepting proxy (confirmed blocked both on the host and inside Docker containers -
-environmental, not a code issue). Next: Phase 6 (Payment Service - INV-1012 saga/compensation),
-which will need its own Dapr sidecar + `payment.completed`/`payment.failed` topics and subscribes
-to both `decision.completed` (route=auto_approve) and `approval.completed`
-(resolution=approved) - same choreography pattern already proven twice.
+environmental, not a code issue). Next: Notification Service (pure consumer of `payment.completed`,
+notifies the submitter - F2/M8) and the API Gateway/UI (M6/M7), then Phase 8's full verification
+suite tying all four required journeys (INV-1001, INV-1003, INV-1007, INV-1012) plus INV-1014
+together into one command.
 
 ---
 
@@ -372,11 +374,109 @@ INV-1012 — payment failure + compensation.
 
 ## Tasks
 
-- [ ] Create Payment Service
-- [ ] Implement payment reservation
-- [ ] Implement failure simulation
-- [ ] Implement compensation action
-- [ ] Document Saga flow
+- [x] Create Payment Service (`services/payment/`: `PaymentService`/`build_payment_service`
+  transport-agnostic core + thin `app.py` FastAPI wrapper, same pattern as Intake/Decision/Approval.
+  Subscribes to `decision.completed` [route=auto_approve] and `approval.completed`
+  [resolution=approved], both converging on the same saga)
+- [x] Implement payment reservation (`BudgetRepository.reserve()` - atomic check-and-deduct via
+  Dapr state's ETag optimistic concurrency, confirmed against the installed `dapr==1.18.1` SDK
+  source before writing any code: `TransactionalStateOperation` accepts `etag=` directly, and an
+  ETag conflict inside `execute_state_transaction` surfaces as `DaprGrpcError` - a `grpc.RpcError`
+  subclass, matching the `except grpc.RpcError` idiom already used everywhere else. Deliberately
+  never uses `save_state()` directly for the conditional write - its ETag-conflict path raises
+  `DaprInternalError`, NOT a `grpc.RpcError` subclass, which would silently break that idiom)
+- [x] Implement failure simulation (`PaymentGateway` Protocol, mirroring `LLMProvider`/`MockProvider`
+  exactly - `FakePaymentGateway` for tests, `SimulatedPaymentGateway` as the actual production
+  default since there is no real payment processor in this project. Deterministic, not random:
+  fails only for invoice ids listed in `PAYMENT_SIMULATE_FAILURE_IDS` [set to `INV-1012` in
+  `docker-compose.yml`, so the journey is demonstrable with a plain `docker compose up`])
+- [x] Implement compensation action (`BudgetRepository.release()`, crediting back exactly the
+  `reserved_amount` stored on the `PaymentRecord` at reservation time - never recomputed from
+  `invoice.total`, so the two can never drift. Guarded against double-release/corruption: raises
+  `BudgetCorruptionError` if the credit would push `remaining` above `total`)
+- [x] Document Saga flow (ADR-004 orchestration style, Payment is the sole coordinator; see
+  ARCHITECTURE.md §9 Saga & Compensation, updated this phase, and the state machine in
+  `services/payment/models.py`)
+
+Also required and added, beyond the literal task list:
+- **Crash-recovery state machine** (not just event-redelivery idempotency): `PaymentRecord` has a
+  `RESERVED` status between reserve and charge - if the process crashes there, a redelivery of the
+  same triggering event resumes exactly at the charge step, never re-reserving. Two dedicated unit
+  tests (success and failure resume paths) prove this, marked MUST-HAVE/blocking for Definition-of-
+  Done per review. `COMPLETED`/`FAILED` are terminal; redelivery after either is a no-op (mirrors
+  `ApprovalService.handle_decision_completed`'s exact idempotency fix).
+- **Business failure vs. infra failure, deliberately separated**: `InsufficientBudgetError`/
+  `BudgetNotFoundError` are caught inside `PaymentService` and become a terminal `FAILED`
+  `PaymentRecord`. `BudgetRepositoryError` (genuine Dapr/infra failure, raised only after ETag-
+  conflict retries are exhausted) is deliberately never caught there - it propagates uncaught out
+  of the subscription handler, causing Dapr to redeliver the event later once the infra issue
+  clears, instead of silently recording a fake business failure. A global exception handler
+  (mirroring Decision's) logs these with `correlation_id` instead of a bare traceback.
+- **Topic consolidation, a third time**: `payment.completed`/`payment.failed` collapsed into a
+  single `payment.completed` topic carrying a `resolution` field - the same consolidation already
+  applied twice to `decision.completed` and `approval.completed`, reviewed and confirmed rather than
+  assumed.
+- **Budget seeding from external config**, not hardcoded (CLAUDE.md: never hardcode policy values) -
+  `policy/budgets.json` + `services/payment/budgets_loader.py` (mirrors
+  `services/decision/service/policy_loader.py`), loaded once at `create_app()`'s lifespan startup,
+  calling `ensure_seeded()` per department - never overwrites an in-progress budget on restart.
+- **Storage decision, reviewed and resolved**: ARCHITECTURE.md §8 said Payments/Budgets live in
+  PostgreSQL, but §9's Budget Concurrency mechanism explicitly required Dapr state with ETag - a
+  real contradiction, resolved in favor of Dapr state for this phase (matches §9 exactly, reuses
+  100% proven patterns, matches every prior service's InMemory→DaprState→Postgres migration path;
+  Postgres remains deferred/unused, exactly as already documented). §8 updated accordingly.
+- **Real, load-bearing finding**: Payment is the first service with genuine async startup work
+  (budget seeding via a FastAPI lifespan hook). Confirmed by reading the installed
+  `starlette==1.3.1` source that `TestClient.__enter__` is the only place that runs ASGI lifespan
+  startup - a bare `TestClient(app)` without `with`, the pattern every other integration test file
+  in this repo uses, never runs it. `tests/integration/test_payment_service.py` uses
+  `with TestClient(app) as client:` throughout, with a dedicated regression test locking in the
+  gotcha (proves the bare-`TestClient` pattern does NOT seed budgets), not just documenting it in
+  prose.
+
+## Verification (Payment Service, Phase 6)
+
+Ran for real, not just described:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - 317 tests total (94 new for
+  Payment), ruff, and mypy all pass.
+- `docker compose up --build -d` - all **11** containers (previous 9 + `payment` + `payment-dapr`)
+  came up healthy; confirmed `GET /budgets/{department}` correctly seeded from
+  `policy/budgets.json` at startup for all three configured departments.
+- **INV-1012 (payment failure + compensation)**: submitted the real fixture, confirmed it escalated
+  (HW-02, over ceiling), approved it, and confirmed via `docker compose logs payment` the exact
+  expected sequence - `budget_reserved` → `payment_failed_compensated` → `payment_event_published`,
+  with no `payment_completed` line. `GET /payments/{id}` showed `status: failed` with the simulated
+  decline reason; `GET /budgets/engineering-2026Q2` showed `remaining` back to its exact pre-
+  submission baseline - no orphaned reservation.
+- **Happy path control**: submitted an auto-approve invoice (no human review needed), confirmed
+  `status: completed` and the budget correctly deducted by exactly the invoice total - proves the
+  success path works over the real stack, not just the failure path.
+- **Restart survival (M11-equivalent for Payment)**: approved a second hardware invoice, then
+  `docker compose up -d --force-recreate payment payment-dapr` after it reached `COMPLETED`.
+  Confirmed both the `PaymentRecord` and the department budget's `remaining` survived the restart
+  unchanged, and specifically that `ensure_seeded()`'s startup call did NOT reset the already-
+  progressed budget back to its seed value - proving the "only seed if absent" guard works for
+  real, not just in a unit test. (Catching the `RESERVED` transient status live was not attempted -
+  the saga completes in milliseconds with no artificial delay, making it impractical to hit that
+  window manually; the crash-recovery-from-RESERVED logic itself is rigorously proven by the two
+  dedicated deterministic unit tests instead.)
+- **INV-1014A/B (budget concurrency) - required, not optional, run for multiple iterations**:
+  `python scripts/verify_inv1014_concurrency.py 3` - a real script using `httpx.AsyncClient` +
+  `asyncio.gather` so the two `approve` calls genuinely overlap in time (not sequential curl calls
+  that could "pass" by timing luck). Refined after review: the script resets `marketing-2026Q2`'s
+  budget to a fresh $1000 before every iteration (via `docker exec redis-cli HSET` directly on
+  Dapr's Redis-stored state - verified empirically first, not assumed, that Dapr stores state as a
+  `{app-id}||{key}` Redis HASH with `data`/`version` fields, `version` doubling as the ETag;
+  resetting only `data` leaves Dapr's own ETag bookkeeping untouched). Deliberately never exposed
+  as an HTTP endpoint - a "reset budget" API in a service that manages money would be a real
+  operational hazard, so this reset only ever happens by reaching directly into the test
+  infrastructure's own Redis, external to the app. With the reset in place, **all 3 iterations**
+  (not just the first) showed exactly one invoice `completed` and one `failed` (insufficient
+  budget), `remaining` landing at exactly $400 every time - matching the fixture's own expected
+  math on every run, not just once. Confirmed via `docker compose logs payment` that exactly one
+  `budget_reserved`+`payment_completed` pair occurred per iteration, the loser always
+  `payment_rejected_insufficient_budget` - never both succeeding, never a negative balance, across
+  every iteration.
 
 ---
 

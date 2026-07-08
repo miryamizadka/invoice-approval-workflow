@@ -21,6 +21,8 @@ from shared.contracts.models import (
     DecisionCompletedEvent,
     DecisionOutcome,
     InvoiceSubmittedEvent,
+    PaymentCompletedEvent,
+    PaymentResolution,
     Recommendation,
     RecommendationType,
     Route,
@@ -141,3 +143,43 @@ def test_approval_completed_event_is_frozen() -> None:
 
     with pytest.raises(ValidationError):
         event.resolution = ApprovalResolution.APPROVED  # type: ignore[misc]
+
+
+def test_payment_completed_event_carries_invoice_decision_resolution_and_reason() -> None:
+    invoice = clean_invoice()
+    decision = _decision()
+
+    event = PaymentCompletedEvent(
+        invoice=invoice,
+        decision=decision,
+        resolution=PaymentResolution.COMPLETED,
+        reason="payment executed successfully",
+    )
+
+    assert event.invoice == invoice
+    assert event.decision == decision
+    assert event.resolution == PaymentResolution.COMPLETED
+    assert event.reason == "payment executed successfully"
+
+
+def test_payment_completed_event_is_frozen() -> None:
+    event = PaymentCompletedEvent(
+        invoice=clean_invoice(),
+        decision=_decision(),
+        resolution=PaymentResolution.FAILED,
+        reason="insufficient department budget",
+    )
+
+    with pytest.raises(ValidationError):
+        event.resolution = PaymentResolution.COMPLETED  # type: ignore[misc]
+
+
+def test_payment_completed_event_rejects_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        PaymentCompletedEvent(
+            invoice=clean_invoice(),
+            decision=_decision(),
+            resolution=PaymentResolution.COMPLETED,
+            reason="ok",
+            tracking_id="corr-1",  # type: ignore[call-arg]
+        )
