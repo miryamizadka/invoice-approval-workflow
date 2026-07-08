@@ -326,9 +326,14 @@ Make the complete system runnable.
   a later phase; deliberately not behind `profiles:` - M4 requires the whole system, including
   not-yet-used infrastructure, to come up with one plain `docker compose up`)
 - [x] Add Redis (`redis:7-alpine`, same reasoning as Postgres above - reserved for Dapr pub/sub)
-- [ ] Configure Dapr
-- [ ] Configure Pub/Sub communication
-- [ ] Configure Dapr state
+- [x] Configure Dapr - step 1, infra only (M5): `daprd` sidecar per service (`intake-dapr`,
+  `decision-dapr`) + `placement` control-plane container, `dapr/components/{pubsub,statestore}.yaml`
+  backed by Redis. No service code changed yet - Intake and Decision still talk HTTP-direct, as
+  before. See "Verification (Dapr step 1)" below.
+- [ ] Configure Pub/Sub communication - wiring `IntakeService`/`Decider` to actually publish/
+  subscribe via the sidecar (`DaprClient`) is a separate, future step (infra is ready for it)
+- [ ] Configure Dapr state - wiring idempotency/dedup and HITL pause-resume to the `statestore`
+  component is a separate, future step (infra is ready for it)
 - [ ] Configure Dapr secrets
 
 ## Verification (done)
@@ -370,6 +375,42 @@ still passed on its own terms (it deliberately does not assert a specific route,
 pipeline completes end to end - see the script's docstring), but this run did not prove the real
 LLM call path works through Docker. That still needs `scripts/smoke_test_groq_strict.py` (or this
 smoke test) run from a network without SSL interception before Phase 3 is "production-ready".
+
+## Verification (Dapr step 1)
+
+Design decisions made and verified for real, not just described:
+- **Redis, not Postgres, backs the Dapr `statestore` component** - `ARCHITECTURE.md` §6/§8
+  explicitly separates "Redis = Dapr state store + pub/sub backend" from "PostgreSQL = business
+  data (invoices/decisions/payments/budgets), accessed directly, not via Dapr". Both
+  `dapr/components/pubsub.yaml` and `statestore.yaml` point at `redis:6379`.
+- **`placement` included, `scheduler` deliberately not** - both are Dapr control-plane services
+  that exist for actors/Workflow/Jobs API, neither of which this project uses anywhere (durable
+  pause/resume for M11 is Dapr *state*, not actors; the agent is LangGraph, not Dapr Workflow).
+  `placement` was kept (cheap, no volume, no root user, matches the original ask). `scheduler` was
+  cut - it needs a persistent etcd volume and a root user, the one real risk/complexity item in
+  this step, for a capability with no planned use. Confirmed empirically: omitting it produces
+  only a one-line benign warning (`"No scheduler host addresses provided. Scheduler disabled"`),
+  not a failure - `daprd` still reports `"dapr initialized. Status: Running."` on both sidecars.
+- **`scopes: [intake, decision]`** on both component YAMLs - Dapr-enforced least-privilege, not
+  just documentation; will need extending when Approval/Payment get their own sidecars.
+
+Ran for real:
+- `docker compose up --build -d` - all **7** containers (`intake`, `decision`, `postgres`,
+  `redis`, `placement`, `intake-dapr`, `decision-dapr`) came up `Up`/healthy; `intake`/`decision`
+  healthchecks unaffected by their sidecars (`network_mode: "service:<app>"` shares only the
+  network namespace, not the app container's process/filesystem).
+- `docker compose logs intake-dapr decision-dapr placement` - both sidecars logged
+  `Component loaded: pubsub (pubsub.redis/v1)` and `Component loaded: statestore (state.redis/v1)`
+  with no errors, and `placement` logged both `intake` and `decision` connecting successfully.
+- `GET http://localhost:3500/v1.0/healthz` from inside both app containers (via `python -c
+  urllib.request`, no `curl` in the slim images) - `204` from both.
+- `GET http://localhost:3500/v1.0/metadata` from inside both app containers - both list
+  `['pubsub', 'statestore']` under `components`, proving the components are actually registered,
+  not just "loaded without a log error".
+- `python scripts/smoke_test_compose.py` - still passes unchanged: proves the sidecars
+  (`network_mode: service:<app>`) didn't disturb the existing direct-HTTP Intake -> Decision flow.
+- Full local suite re-run: 128/128 tests, ruff, and mypy all still pass (no service code touched
+  in this step - infra-only, by design).
 
 ---
 
