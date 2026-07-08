@@ -242,9 +242,14 @@ zero direct HTTP calls between the two services). Service invocation and Dapr st
 
 ## M10 — Idempotency
 
-- [ ] Duplicate submissions safe
-- [ ] Redelivered events safe
-- [ ] Payment retries safe
+- [x] Duplicate submissions safe - `DaprStateInvoiceRepository` (Dapr state/Redis) backs the
+  dedup check, survives an Intake restart (verified via a real `docker compose` restart +
+  resubmission - see PLAN.md Phase 7 "Verification (Dapr state, step 4)"). Known, accepted gap:
+  no protection against two near-simultaneous submissions of the exact same invoice racing the
+  check-then-save window (documented, deferred to a future PostgreSQL unique constraint).
+- [x] Redelivered events safe - `IntakeService.complete()` is idempotent for `decision.completed`
+  redelivery (already-completed tracking_id -> no-op; unknown tracking_id -> logged, not a crash)
+- [ ] Payment retries safe (depends on the Payment service, not built yet)
 
 
 ## M11 — Durable HITL

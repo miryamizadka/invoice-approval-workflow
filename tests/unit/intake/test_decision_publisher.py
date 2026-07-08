@@ -8,7 +8,6 @@ in a plain test run (confirmed empirically, not assumed).
 from __future__ import annotations
 
 import json
-import time
 from typing import Any
 
 import grpc
@@ -64,11 +63,17 @@ async def test_publish_wraps_client_errors_as_decision_publisher_error() -> None
         await publisher.publish(clean_invoice(), correlation_id="corr-1")
 
 
-def test_construction_without_injected_client_does_not_block() -> None:
-    """No sidecar is running in this test process. Constructing a real
-    DaprClient() blocks for up to 60s (confirmed empirically). If
-    DaprDecisionPublisher() constructs one eagerly, this test hangs; if it's
-    lazy (only built on first publish() call), construction is near-instant."""
-    start = time.monotonic()
-    DaprDecisionPublisher()
-    assert time.monotonic() - start < 1.0
+def test_construction_does_not_call_factory_eagerly() -> None:
+    """Deterministic laziness proof (not timing-based): whatever factory
+    would build the real client, it must not be invoked just from
+    constructing DaprDecisionPublisher - only from publish()."""
+    built: list[_FakeDaprClient] = []
+
+    def factory() -> _FakeDaprClient:
+        client = _FakeDaprClient()
+        built.append(client)
+        return client
+
+    DaprDecisionPublisher(factory=factory)
+
+    assert built == []

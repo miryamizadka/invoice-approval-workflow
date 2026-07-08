@@ -9,12 +9,13 @@ the older synchronous HTTP alternative, kept but no longer wired in by default.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 import grpc
-from dapr.aio.clients import DaprClient
 
 from shared.contracts.models import Invoice, InvoiceSubmittedEvent
+from shared.dapr_client import LazyDaprClient
 
 
 class DecisionPublisherError(Exception):
@@ -41,18 +42,21 @@ class DaprDecisionPublisher:
     __init__, blocking for up to DAPR_HEALTH_TIMEOUT (60s default) if no
     sidecar is reachable - confirmed empirically, not assumed. Building it
     eagerly here would make create_app()'s default wiring (and so plain
-    pytest/local dev without Docker) hang. Built once, on first publish()
-    call, and reused after that - not a new client per call."""
+    pytest/local dev without Docker) hang. LazyDaprClient (shared/dapr_client.py)
+    builds it once, on first publish() call, and reuses it after that."""
 
-    def __init__(self, *, client: _DaprPublishClient | None = None) -> None:
-        self._client: _DaprPublishClient | None = client
+    def __init__(
+        self,
+        *,
+        client: _DaprPublishClient | None = None,
+        factory: Callable[[], _DaprPublishClient] | None = None,
+    ) -> None:
+        self._dapr = LazyDaprClient[_DaprPublishClient](client, factory=factory)
 
     async def publish(self, invoice: Invoice, *, correlation_id: str) -> None:
-        if self._client is None:
-            self._client = DaprClient()
         event = InvoiceSubmittedEvent(invoice=invoice, correlation_id=correlation_id)
         try:
-            await self._client.publish_event(
+            await self._dapr.get().publish_event(
                 pubsub_name="pubsub",
                 topic_name="invoice.submitted",
                 data=event.model_dump_json(),

@@ -117,6 +117,14 @@ Completed
   used the recommendation for duplicates anyway); `HttpDecisionServiceClient` kept as a tested,
   unwired standalone alternative. Verified over the real Docker network via `docker compose logs`
   (zero direct HTTP calls left between the two services) - not just `TestClient`.
+- Dapr state (Phase 7 step 4, M5+M10) - `DaprStateInvoiceRepository` (Dapr state/Redis) replaces
+  `InMemoryInvoiceRepository` as Intake's default, storing the full `Submission` plus a dedup
+  pointer in one atomic transaction. `LazyDaprClient` extracted to `shared/dapr_client.py` and
+  retrofitted into both Dapr publishers (third near-identical occurrence). Verified via a real
+  `docker compose` restart that both the submission record and the dedup pointer survive - and
+  found a real operational gotcha along the way: `docker compose restart <app>` alone breaks its
+  `network_mode: service:<app>` sidecar's networking; `up -d --force-recreate <app> <app>-dapr` is
+  the safe way to bring the pair back (documented in PLAN.md).
 
 In Progress
 
@@ -130,8 +138,7 @@ Planned
 - Payment Saga
 - Notification
 - UI
-- Dapr state usage (idempotency/dedup keys, HITL pause-resume via the `statestore` component -
-  infra is ready, see Completed above)
+- HITL pause-resume via the `statestore` component (needs the Approval Service, not built yet)
 - CI
 - Verification
 - Demo

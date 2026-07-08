@@ -105,7 +105,7 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.approved`, `a
 
 | Data | Storage | Owner Service |
 |---|---|---|
-| Invoices | PostgreSQL | Intake |
+| Invoices | PostgreSQL (interim: Dapr state/Redis - see §9 Duplicate Detection) | Intake |
 | Decisions | PostgreSQL | Decision |
 | Approval state (paused/resume) | Redis (Dapr state) | Approval |
 | Payments | PostgreSQL | Payment |
@@ -139,6 +139,10 @@ Budget reservation is atomic: the Payment service uses Dapr state with optimisti
 
 ### Duplicate Detection (F3)
 Before publishing an item for processing, the Intake service builds a deduplication key from vendor + invoiceNumber + total (GLOBAL-DUP) and checks it against Dapr state. If the key already exists, the item short-circuits to duplicate — no second agent call, no second payment (INV-1007). This is the same idempotency principle applied at the entry point.
+
+**Implementation note - interim repository (`DaprStateInvoiceRepository`):** Intake's `InvoiceRepository` is currently backed entirely by Dapr state (Redis) - both the dedup pointer *and* the full submission record, not just the dedup key as the Data Architecture table above literally implies. This is a deliberate interim choice, not a deviation: storing only the dedup pointer in Dapr state while the full record stayed in-memory would mean the pointer could survive an Intake restart while the record it points to did not - a worse, inconsistent state than today's fully in-memory approach. Both are written together in one Dapr state transaction (atomic), and the repository migrates to `PostgresInvoiceRepository` once Approval/Payment need real persistent business data anyway (same `InvoiceRepository` Protocol, no `IntakeService` change).
+
+**Known, accepted gap:** the dedup existence-check and the subsequent save are no longer atomic with each other now that Dapr state is real network I/O (unlike the in-memory dict's synchronous check-then-save). Two near-simultaneous submissions of the exact same invoice could both pass the check before either saves. This isn't fixable by "adding a database" in general - it's specifically that a relational store's unique constraint (atomic insert rejection) is the natural fix, and Dapr's ETag mechanism is built for update-vs-update optimistic concurrency (exactly what Budget Concurrency above needs), not "insert only if absent" on Redis. Deferred to the PostgreSQL migration above, not solved by extending Dapr state.
 
 
 ## 10. AI Architecture

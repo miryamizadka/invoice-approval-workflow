@@ -6,7 +6,6 @@ after the subscription handler runs the Decider.
 from __future__ import annotations
 
 import json
-import time
 
 import grpc
 import pytest
@@ -79,7 +78,17 @@ async def test_publish_wraps_client_errors_as_decision_outcome_publisher_error()
         await publisher.publish(_decision(Route.AUTO_APPROVE))
 
 
-def test_construction_without_injected_client_does_not_block() -> None:
-    start = time.monotonic()
-    DaprDecisionOutcomePublisher()
-    assert time.monotonic() - start < 1.0
+def test_construction_does_not_call_factory_eagerly() -> None:
+    """Deterministic laziness proof (not timing-based): whatever factory
+    would build the real client, it must not be invoked just from
+    constructing DaprDecisionOutcomePublisher - only from publish()."""
+    built: list[_FakeDaprClient] = []
+
+    def factory() -> _FakeDaprClient:
+        client = _FakeDaprClient()
+        built.append(client)
+        return client
+
+    DaprDecisionOutcomePublisher(factory=factory)
+
+    assert built == []
