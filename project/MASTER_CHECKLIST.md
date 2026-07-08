@@ -195,6 +195,10 @@ Priority: MUST HAVE
 
 ## M5 — Dapr
 
+Infra step 1 done: `daprd` sidecar per service + `placement`, `dapr/components/{pubsub,statestore}.yaml`
+backed by Redis, verified via `/v1.0/healthz` + `/v1.0/metadata` + logs (see PLAN.md Phase 7).
+None of the items below are used by service code yet - that's the next step.
+
 - [ ] Service invocation used
 - [ ] Pub/Sub used
 - [ ] Dapr state used

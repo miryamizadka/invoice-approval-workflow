@@ -105,6 +105,11 @@ Completed
 - Docker Compose (Phase 7 step 1) - single shared `Dockerfile`, 4-service `docker-compose.yml`
   (Intake, Decision, Postgres, Redis), verified end to end with a real `docker compose up --build`
   and `scripts/smoke_test_compose.py` (M3, M4)
+- Dapr sidecars (Phase 7 step 2, M5 infra) - `daprd` sidecar per service + `placement`,
+  `dapr/components/{pubsub,statestore}.yaml` backed by Redis; verified via `/v1.0/healthz`,
+  `/v1.0/metadata` (components actually registered, not just "no error in the log"), and a
+  re-run of `scripts/smoke_test_compose.py` proving the existing direct-HTTP Intake<->Decision
+  flow is untouched. No service code changed - pub/sub and state usage are separate future steps.
 
 In Progress
 
@@ -118,8 +123,8 @@ Planned
 - Payment Saga
 - Notification
 - UI
-- Dapr (pub/sub, state, secrets - Postgres/Redis already running in compose, unused, reserved
-  for this)
+- Dapr pub/sub + state usage (wiring `IntakeService`/`Decider` to the sidecars now running -
+  infra is ready, see Completed above)
 - CI
 - Verification
 - Demo

@@ -51,9 +51,78 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks: [approvalflow]
-    # Not used by any service yet - reserved for Dapr pub/sub + state (separate phase).
+    # Backs the Dapr pubsub/statestore components (dapr/components/) - see the
+    # intake-dapr/decision-dapr sidecars below. Not used by service code yet.
     # Deliberately not behind `profiles:` - see the postgres comment above (M4).
+
+  intake-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "intake"
+      - "--app-port"
+      - "8000"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:intake"
+    depends_on:
+      intake:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # Infra only, step 1 of Dapr integration (M5) - not called by any service
+    # code yet. Shares intake's network namespace so intake can later reach it
+    # at localhost:3500 with zero networking changes. Pub/sub and state wiring
+    # into IntakeService/Decider are separate, future steps.
+
+  decision-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "decision"
+      - "--app-port"
+      - "8001"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:decision"
+    depends_on:
+      decision:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # See intake-dapr comment above - same reasoning, paired with decision.
+
+  placement:
+    image: daprio/placement:1.18.1
+    command: ["./placement", "--port", "50006"]
+    networks: [approvalflow]
+    # Dapr control-plane service. Only strictly required for actors/workflows
+    # (which this project doesn't use) - included because it's the baseline
+    # piece of nearly every Dapr+Compose reference setup and costs little (no
+    # volume, no root user). The scheduler service was considered and
+    # rejected: same actors/workflow-only scope as placement, but requires a
+    # persistent etcd volume and a root user - not worth it for a capability
+    # this project has no plan to use.
 
 networks:
   approvalflow:
