@@ -175,17 +175,22 @@ Priority: MUST HAVE
 
 ## M3 — Microservices
 
-- [ ] At least 3 services
-- [ ] Each service containerized
-- [ ] Clear service boundaries
+- [ ] At least 3 services (2 so far: Intake, Decision - Approval/Payment pending Phase 5/6)
+- [x] Each service containerized (single shared `Dockerfile`, one container per service)
+- [x] Clear service boundaries (HTTP only between Intake and Decision, no cross-service imports)
 
 
 ## M4 — Docker Compose
 
-- [ ] docker compose up starts system
-- [ ] Databases included
-- [ ] Queues included
-- [ ] Infrastructure included
+- [x] docker compose up starts system (verified: `docker compose up --build`, all 4 containers
+  came up healthy; `scripts/smoke_test_compose.py` proved Intake -> Decision over the Docker
+  network end to end)
+- [x] Databases included (`postgres:16-alpine`, running, not yet consumed by a service - reserved
+  for Dapr state, a later phase)
+- [x] Queues included (`redis:7-alpine`, running, not yet consumed - reserved for Dapr pub/sub)
+- [x] Infrastructure included (both above run unconditionally in the main compose file, not
+  behind `profiles:`, per M4's literal "including queues, databases, and supporting
+  infrastructure")
 
 
 ## M5 — Dapr

@@ -41,5 +41,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 
-[tool.setuptools]
-packages = ["services", "shared"]
+[tool.setuptools.packages.find]
+include = ["services*", "shared*"]

@@ -102,10 +102,15 @@ Completed
 - Intake Service - FastAPI wrapper (`services/intake/`) around a transport-agnostic
   `IntakeService`, with duplicate detection (F3), an in-memory repository behind a Protocol, and
   an HTTP client to Decision Service behind a Protocol (implementation + tests, ruff/mypy clean)
+- Docker Compose (Phase 7 step 1) - single shared `Dockerfile`, 4-service `docker-compose.yml`
+  (Intake, Decision, Postgres, Redis), verified end to end with a real `docker compose up --build`
+  and `scripts/smoke_test_compose.py` (M3, M4)
 
 In Progress
 
-- Manual Groq strict-mode smoke-test (script ready, blocked by sandbox network access)
+- Manual Groq strict-mode smoke-test (script ready; blocked both on the host and, now confirmed,
+  inside the Docker containers by the same sandbox SSL-intercepting network egress - needs a
+  network without that restriction to fully verify Groq's strict-mode structured output)
 
 Planned
 
@@ -113,7 +118,8 @@ Planned
 - Payment Saga
 - Notification
 - UI
-- Docker Compose
+- Dapr (pub/sub, state, secrets - Postgres/Redis already running in compose, unused, reserved
+  for this)
 - CI
 - Verification
 - Demo
