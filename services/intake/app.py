@@ -1,35 +1,37 @@
-"""FastAPI transport layer - the only place in this service that knows HTTP.
+"""FastAPI transport layer - the only place in this service that knows HTTP
+(and, via DaprApp, Dapr's pub/sub subscription wiring).
 
 Endpoints only call IntakeService; all business logic lives there.
 """
 
 from __future__ import annotations
 
-import os
+from typing import Any
 
+from dapr.ext.fastapi import DaprApp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
-from services.intake.decision_client import DecisionServiceClient, HttpDecisionServiceClient
+from services.intake.decision_publisher import DaprDecisionPublisher, DecisionPublisher
 from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
-from shared.contracts.models import Invoice
+from shared.contracts.models import Decision, Invoice
 
 
 def create_app(
     repository: InvoiceRepository | None = None,
-    decision_client: DecisionServiceClient | None = None,
+    publisher: DecisionPublisher | None = None,
 ) -> FastAPI:
     configure_logging()
     intake_service = build_intake_service(
         repository or InMemoryInvoiceRepository(),
-        decision_client
-        or HttpDecisionServiceClient(os.environ.get("DECISION_SERVICE_URL", "http://localhost:8001")),
+        publisher or DaprDecisionPublisher(),
     )
 
     app = FastAPI(title="ApprovalFlow Intake Service")
     app.state.intake_service = intake_service
+    dapr_app = DaprApp(app)
 
     @app.get("/health")
     def health() -> dict[str, str]:
@@ -53,7 +55,20 @@ def create_app(
             raise HTTPException(status_code=404, detail="tracking_id not found")
         return SubmissionStatusResponse.from_submission(submission)
 
+    @dapr_app.subscribe(
+        pubsub="pubsub", topic="decision.completed", route="/events/decision-completed"
+    )
+    async def handle_decision_completed(request: Request) -> dict[str, str]:
+        # dapr-ext-fastapi's subscribe only registers the route (confirmed by
+        # reading its source) - it does not unwrap the CloudEvents envelope,
+        # so the actual payload is read from the "data" field ourselves.
+        body: dict[str, Any] = await request.json()
+        decision = Decision.model_validate(body["data"])
+        service: IntakeService = request.app.state.intake_service
+        await service.complete(decision.correlation_id, decision)
+        return {"status": "SUCCESS"}
+
     return app
 
-app = create_app()
 
+app = create_app()

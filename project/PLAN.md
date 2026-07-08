@@ -255,7 +255,11 @@ Also required and added:
   expose this before - additive change, verified against all pre-existing tests)
 - [x] `DecisionServiceClient` Protocol + `HttpDecisionServiceClient` - Intake talks to Decision
   over HTTP, not a direct Python import of `Decider`, so the two remain independently deployable
-  (M3); swapping to Dapr pub/sub later is a transport change, not a structural one
+  (M3). **Superseded as `IntakeService`'s default transport by `DecisionPublisher`/Dapr pub/sub
+  (Phase 7 step 3, below)** - turned out to be a structural change, not just a transport swap
+  (a fire-and-forget publish can't return a `Decision` the way a synchronous HTTP call could).
+  Kept, tested, and still usable standalone (ARCHITECTURE.md §7's "sync invocation only where
+  immediate response required", and for local dev without Dapr sidecars).
 - [x] `shared/contracts/` extraction (Invoice/Decision/Recommendation/enums/`compute_dedup_key`)
   done first, as a prerequisite - both services depend on one canonical source now instead of
   Intake importing across the service boundary
@@ -330,8 +334,12 @@ Make the complete system runnable.
   `decision-dapr`) + `placement` control-plane container, `dapr/components/{pubsub,statestore}.yaml`
   backed by Redis. No service code changed yet - Intake and Decision still talk HTTP-direct, as
   before. See "Verification (Dapr step 1)" below.
-- [ ] Configure Pub/Sub communication - wiring `IntakeService`/`Decider` to actually publish/
-  subscribe via the sidecar (`DaprClient`) is a separate, future step (infra is ready for it)
+- [x] Configure Pub/Sub communication - step 3: `IntakeService` publishes `invoice.submitted`
+  via `DecisionPublisher`/`DaprDecisionPublisher` (Dapr Python SDK, `dapr.aio.clients.DaprClient`);
+  Decision subscribes (`dapr-ext-fastapi`'s `DaprApp`), runs the **unmodified** `Decider`, and
+  publishes the result to `decision.completed` via `DecisionOutcomePublisher`; Intake subscribes
+  and calls `IntakeService.complete()`. Verified end to end over the real Docker network, not just
+  `TestClient` - see "Verification (Dapr pub/sub, step 3)" below.
 - [ ] Configure Dapr state - wiring idempotency/dedup and HITL pause-resume to the `statestore`
   component is a separate, future step (infra is ready for it)
 - [ ] Configure Dapr secrets
@@ -411,6 +419,64 @@ Ran for real:
   (`network_mode: service:<app>`) didn't disturb the existing direct-HTTP Intake -> Decision flow.
 - Full local suite re-run: 128/128 tests, ruff, and mypy all still pass (no service code touched
   in this step - infra-only, by design).
+
+## Verification (Dapr pub/sub, step 3)
+
+Design decisions made and verified for real, not just described (three rounds of review,
+each one genuinely reconsidered rather than rubber-stamped):
+- **Single topic `decision.completed`, not one per route.** Original plan used 4 topics
+  (`decision.approved/escalated/rejected/duplicate`) matching `ARCHITECTURE.md`'s then-literal
+  text. Reversed after confirming Dapr supports content-based routing (CEL match rules) for
+  subscribers that want to filter - so per-outcome filtering is a subscriber concern, not a
+  reason to fragment the publisher's topic space. `ARCHITECTURE.md` §7 updated to match.
+- **Official Dapr Python SDK (`dapr`, `dapr-ext-fastapi==1.18.1`, pinned to match the runtime),
+  not raw HTTP to the sidecar** - but a real finding corrected the reasoning along the way:
+  `dapr-ext-fastapi`'s `subscribe` decorator does **not** auto-unwrap CloudEvents (verified by
+  reading its installed source, `dapr/ext/fastapi/app.py`) - it only auto-registers `/dapr/subscribe`
+  and the route path. `body["data"]` is still unwrapped by hand in both subscription handlers,
+  exactly as raw HTTP would have required.
+- **`DaprClient()` is not lazy - confirmed empirically, not assumed.** Its constructor calls
+  `DaprHealth.wait_for_sidecar()` synchronously (verified by reading the installed SDK source,
+  `dapr/clients/health.py`), blocking up to `DAPR_HEALTH_TIMEOUT` (60s default) retrying a sidecar
+  health check. Building it eagerly in `DaprDecisionPublisher.__init__`/`DaprDecisionOutcomePublisher.__init__`
+  would have hung `create_app()`'s default wiring (and so plain `pytest`/local dev without a
+  sidecar) for up to a minute. Both classes construct the real client lazily, on first `publish()`
+  call, and reuse it after that - verified with a dedicated test asserting construction completes
+  in under 1 second with no sidecar present.
+- **Known duplicates short-circuit in Intake before publishing, never reaching Decision.**
+  Verified by reading `route_decision`'s gate 1: it returns immediately on `is_duplicate=True`
+  without ever touching the agent's `Recommendation` - so running the LLM for a known duplicate
+  was pure waste (confirmed, not assumed), not an audit-trail trade-off. `build_duplicate_decision()`
+  (new, in `shared/contracts/models.py`) is the single canonical source both `IntakeService.process()`
+  and the router's gate 1 use, so they can't drift apart. Consequence: `InvoiceSubmittedEvent` has
+  no `is_duplicate` field - Intake never publishes one that's `True`.
+- **`HttpDecisionServiceClient`/`DecisionServiceClient`** kept, unchanged, but no longer wired as
+  `IntakeService`'s default - its synchronous `decide() -> Decision` return can't express
+  fire-and-forget pub/sub. Test coverage backfilled (`tests/unit/intake/test_decision_client.py`)
+  since the integration test that used to exercise it was rewritten around the new transport.
+
+Ran for real:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - 160 tests total, ruff, and mypy
+  all pass.
+- `docker compose up --build -d` - all 7 containers healthy; both sidecars logged clean startup.
+- Submitted a real invoice via `curl POST http://localhost:8000/invoices` and polled
+  `GET /invoices/{id}` to `completed` - confirmed via `docker compose logs` that the entire path
+  is now event-driven with **zero direct HTTP calls between intake and decision**: `intake` logs
+  `invoice_received` -> `decision` logs `POST /events/invoice-submitted 200 OK` and
+  `decision_requested`/`decision_completed` -> `intake` logs `POST /events/decision-completed 200 OK`
+  and `processing_completed`, with the same `correlation_id` end to end (F9).
+- Submitted the same vendor/invoiceNumber/total again - completed immediately with
+  `route: duplicate`, and `decision`'s logs show no new `/events/invoice-submitted` call at all -
+  confirms the short-circuit works for real, not just in unit tests.
+- The agent fell back to `human_review` via the same known sandbox SSL restriction documented
+  since Phase 7 step 1's smoke test (Groq unreachable) - not a regression, same pre-existing
+  environmental limitation, and the fail-clean fallback handled it exactly as designed.
+
+Known gaps carried forward, documented (not fixed) - see `ARCHITECTURE.md` §12 and the router/
+service docstrings: no Transactional Outbox (state-write and publish aren't atomic), no Dapr-level
+retry/dead-letter policy configured yet, `InMemoryInvoiceRepository` doesn't survive an Intake
+restart (an in-flight `decision.completed` would then arrive for an unknown `tracking_id` -
+`IntakeService.complete()` handles that by design: logs a warning, doesn't crash).
 
 ---
 

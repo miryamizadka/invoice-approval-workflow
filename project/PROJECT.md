@@ -110,6 +110,13 @@ Completed
   `/v1.0/metadata` (components actually registered, not just "no error in the log"), and a
   re-run of `scripts/smoke_test_compose.py` proving the existing direct-HTTP Intake<->Decision
   flow is untouched. No service code changed - pub/sub and state usage are separate future steps.
+- Dapr pub/sub (Phase 7 step 3, M5) - Intake and Decision now talk over real Dapr pub/sub
+  (`invoice.submitted` / `decision.completed`), not direct HTTP. `IntakeService` restructured into
+  a two-phase `process()`/`complete()` shape to match fire-and-forget semantics; known duplicates
+  short-circuit before ever publishing (no wasted LLM call - verified the router's gate 1 never
+  used the recommendation for duplicates anyway); `HttpDecisionServiceClient` kept as a tested,
+  unwired standalone alternative. Verified over the real Docker network via `docker compose logs`
+  (zero direct HTTP calls left between the two services) - not just `TestClient`.
 
 In Progress
 
@@ -123,7 +130,7 @@ Planned
 - Payment Saga
 - Notification
 - UI
-- Dapr pub/sub + state usage (wiring `IntakeService`/`Decider` to the sidecars now running -
+- Dapr state usage (idempotency/dedup keys, HITL pause-resume via the `statestore` component -
   infra is ready, see Completed above)
 - CI
 - Verification

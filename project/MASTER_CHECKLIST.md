@@ -197,10 +197,14 @@ Priority: MUST HAVE
 
 Infra step 1 done: `daprd` sidecar per service + `placement`, `dapr/components/{pubsub,statestore}.yaml`
 backed by Redis, verified via `/v1.0/healthz` + `/v1.0/metadata` + logs (see PLAN.md Phase 7).
-None of the items below are used by service code yet - that's the next step.
+Step 3 done: real pub/sub between Intake and Decision (below), verified over the actual Docker
+network (`docker compose logs` shows `POST /events/invoice-submitted`/`POST /events/decision-completed`,
+zero direct HTTP calls between the two services). Service invocation and Dapr state remain unused.
 
 - [ ] Service invocation used
-- [ ] Pub/Sub used
+- [x] Pub/Sub used (`invoice.submitted` published by Intake via `DaprDecisionPublisher`;
+  `decision.completed` published by Decision via `DaprDecisionOutcomePublisher`, subscribed to by
+  both services via `dapr-ext-fastapi`'s `DaprApp`)
 - [ ] Dapr state used
 - [ ] Dapr secrets used
 

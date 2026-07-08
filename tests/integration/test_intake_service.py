@@ -1,7 +1,10 @@
 """Integration tests for the Intake Service HTTP API.
 
 Exercises HTTP -> IntakeService -> InMemoryInvoiceRepository, with a stub
-DecisionServiceClient - no real network call to Decision Service.
+DecisionPublisher - no real Dapr sidecar. The decision.completed subscription
+route is exercised directly via TestClient, POSTing a CloudEvent-shaped body
+(just the `data` field - that's all the handler reads) to simulate what the
+Dapr sidecar would deliver.
 """
 
 from __future__ import annotations
@@ -12,29 +15,20 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from services.intake.app import create_app
-from services.intake.decision_client import DecisionClientError, DecisionServiceClient
+from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
 from shared.contracts.models import Decision, Invoice, Route
 
 
-class _StubDecisionClient:
-    def __init__(
-        self, *, decision: Decision | None = None, error: Exception | None = None
-    ) -> None:
-        self._decision = decision
+class _StubPublisher:
+    def __init__(self, *, error: Exception | None = None) -> None:
         self._error = error
         self.calls: list[dict[str, Any]] = []
 
-    async def decide(
-        self, invoice: Invoice, *, correlation_id: str, is_duplicate: bool = False
-    ) -> Decision:
-        self.calls.append(
-            {"invoice": invoice, "correlation_id": correlation_id, "is_duplicate": is_duplicate}
-        )
+    async def publish(self, invoice: Invoice, *, correlation_id: str) -> None:
+        self.calls.append({"invoice": invoice, "correlation_id": correlation_id})
         if self._error is not None:
             raise self._error
-        assert self._decision is not None
-        return self._decision
 
 
 def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") -> Decision:
@@ -44,11 +38,9 @@ def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") ->
 
 
 def _build_app(
-    decision_client: DecisionServiceClient, repository: InvoiceRepository | None = None
+    publisher: DecisionPublisher, repository: InvoiceRepository | None = None
 ) -> FastAPI:
-    return create_app(
-        repository=repository or InMemoryInvoiceRepository(), decision_client=decision_client
-    )
+    return create_app(repository=repository or InMemoryInvoiceRepository(), publisher=publisher)
 
 
 def _invoice_body(**overrides: Any) -> dict[str, Any]:
@@ -73,11 +65,17 @@ def _invoice_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
+def _post_decision_completed(client: TestClient, decision: Decision) -> Any:
+    return client.post(
+        "/events/decision-completed", json={"data": decision.model_dump(mode="json")}
+    )
+
+
 # --- (a) submit returns tracking id immediately -------------------------------
 
 
 def test_submit_returns_tracking_id_immediately() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision()))
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     response = client.post("/invoices", json=_invoice_body())
@@ -87,44 +85,61 @@ def test_submit_returns_tracking_id_immediately() -> None:
     assert response.headers["X-Correlation-Id"] == response.json()["tracking_id"]
 
 
-# --- (b) status reflects state after background processing -------------------
+# --- (b) status is processing after publish, not completed --------------------
 
 
-def test_status_reflects_completed_after_background_processing() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision(route=Route.AUTO_APPROVE)))
+def test_status_is_processing_after_background_publish() -> None:
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
     status = client.get(f"/invoices/{tracking_id}")
 
     assert status.status_code == 200
+    assert status.json()["status"] == "processing"
+
+
+# --- (c) decision.completed event completes the submission --------------------
+
+
+def test_decision_completed_event_completes_the_submission() -> None:
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+    decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
+
+    event_response = _post_decision_completed(client, decision)
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert event_response.status_code == 200
     body = status.json()
     assert body["status"] == "completed"
     assert body["decision"]["route"] == Route.AUTO_APPROVE.value
 
 
-# --- (c) duplicate detected: is_duplicate=True passed to Decision -------------
+# --- (d) duplicate short-circuits: no publish, immediately completed ----------
 
 
-def test_duplicate_submission_passes_is_duplicate_true() -> None:
-    stub = _StubDecisionClient(decision=_decision())
-    app = _build_app(stub)
+def test_duplicate_submission_short_circuits_without_publishing() -> None:
+    publisher = _StubPublisher()
+    app = _build_app(publisher)
     client = TestClient(app)
     body = _invoice_body()
 
     client.post("/invoices", json=body)
-    client.post("/invoices", json=body)
+    second_tracking_id = client.post("/invoices", json=body).json()["tracking_id"]
 
-    assert len(stub.calls) == 2
-    assert stub.calls[0]["is_duplicate"] is False
-    assert stub.calls[1]["is_duplicate"] is True
+    assert len(publisher.calls) == 1  # only the first (non-duplicate) publish
+    status = client.get(f"/invoices/{second_tracking_id}")
+    assert status.json()["status"] == "completed"
+    assert status.json()["decision"]["route"] == Route.DUPLICATE.value
 
 
-# --- (d) invalid invoice -> 422 -----------------------------------------------
+# --- (e) invalid invoice -> 422 -----------------------------------------------
 
 
 def test_invalid_invoice_returns_422() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision()))
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     response = client.post("/invoices", json={"id": "TEST-0002"})
@@ -132,11 +147,11 @@ def test_invalid_invoice_returns_422() -> None:
     assert response.status_code == 422
 
 
-# --- (e) dedup_key not exposed in API response --------------------------------
+# --- (f) dedup_key not exposed in API response --------------------------------
 
 
 def test_dedup_key_not_exposed_in_status_response() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision()))
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
@@ -145,11 +160,11 @@ def test_dedup_key_not_exposed_in_status_response() -> None:
     assert "dedup_key" not in status.json()
 
 
-# --- (f) unknown tracking_id -> 404 -------------------------------------------
+# --- (g) unknown tracking_id -> 404 -------------------------------------------
 
 
 def test_unknown_tracking_id_returns_404() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision()))
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     response = client.get("/invoices/does-not-exist")
@@ -157,12 +172,12 @@ def test_unknown_tracking_id_returns_404() -> None:
     assert response.status_code == 404
 
 
-# --- (g) DecisionServiceClient failure -> failed, not a crash, no raw leak ----
+# --- (h) publish failure -> failed, not a crash, no raw leak ------------------
 
 
-def test_decision_client_failure_marks_status_failed_without_leaking_raw_error() -> None:
-    error = DecisionClientError("Decision Service call failed: connect to http://internal-host:8001")
-    app = _build_app(_StubDecisionClient(error=error))
+def test_publish_failure_marks_status_failed_without_leaking_raw_error() -> None:
+    error = DecisionPublisherError("Failed to publish invoice.submitted: connect to internal-host")
+    app = _build_app(_StubPublisher(error=error))
     client = TestClient(app)
 
     submit = client.post("/invoices", json=_invoice_body())
@@ -177,11 +192,23 @@ def test_decision_client_failure_marks_status_failed_without_leaking_raw_error()
     assert "internal-host" not in (body.get("reason") or "")
 
 
-# --- (h) health check ----------------------------------------------------------
+# --- (i) decision.completed for an unknown tracking_id doesn't crash ----------
+
+
+def test_decision_completed_for_unknown_tracking_id_does_not_crash() -> None:
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+
+    response = _post_decision_completed(client, _decision(correlation_id="does-not-exist"))
+
+    assert response.status_code == 200
+
+
+# --- (j) health check ----------------------------------------------------------
 
 
 def test_health_check() -> None:
-    app = _build_app(_StubDecisionClient(decision=_decision()))
+    app = _build_app(_StubPublisher())
     client = TestClient(app)
 
     response = client.get("/health")

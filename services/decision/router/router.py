@@ -18,6 +18,7 @@ from shared.contracts.models import (
     Recommendation,
     RecommendationType,
     Route,
+    build_duplicate_decision,
 )
 
 
@@ -56,15 +57,12 @@ def route_decision(
     thresholds: AutonomyThresholds,
     correlation_id: str,
 ) -> Decision:
-    # Gate 1: duplicate.
+    # Gate 1: duplicate. build_duplicate_decision is the single canonical
+    # source for this shape - Intake's pre-publish short-circuit (see
+    # IntakeService.process()) uses the exact same function, so the two
+    # can never drift apart.
     if is_duplicate:
-        return Decision(
-            route=Route.DUPLICATE,
-            reason="Duplicate of an already-processed invoice (same vendor, invoice number, "
-            "and total).",
-            triggered_rules=["GLOBAL-DUP"],
-            correlation_id=correlation_id,
-        )
+        return build_duplicate_decision(correlation_id)
 
     # Gate 2: deterministic hard stops - all structural, never LLM-derived.
     hard_stops: list[str] = []
