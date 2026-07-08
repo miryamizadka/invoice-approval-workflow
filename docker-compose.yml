@@ -1,0 +1,60 @@
+services:
+  intake:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.intake.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - DECISION_SERVICE_URL=http://decision:8001
+    depends_on:
+      decision:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+
+  decision:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.decision.service.app:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    environment:
+      - LLM_PROVIDER=groq
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=approvalflow
+      - POSTGRES_PASSWORD=approvalflow
+      - POSTGRES_DB=approvalflow
+    ports: ["5432:5432"]
+    networks: [approvalflow]
+    # Not used by any service yet - reserved for Dapr state store (separate phase).
+    # Deliberately not behind `profiles:` - M4 requires the whole system, including
+    # not-yet-used infrastructure, to come up with a single plain `docker compose up`.
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    networks: [approvalflow]
+    # Not used by any service yet - reserved for Dapr pub/sub + state (separate phase).
+    # Deliberately not behind `profiles:` - see the postgres comment above (M4).
+
+networks:
+  approvalflow:
+    driver: bridge

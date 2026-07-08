@@ -41,15 +41,21 @@ The priority is:
 - [x] Intake Service (services/intake/) - Phase 4 done: FastAPI wrapping a clean `IntakeService`
   core, `InMemoryInvoiceRepository` behind a Protocol, `HttpDecisionServiceClient` behind a
   Protocol (see Phase 4 below)
+- [x] Docker Compose environment (Phase 7, step 1) - single shared `Dockerfile`, 4-service
+  `docker-compose.yml` (intake, decision, postgres, redis), verified with a real
+  `docker compose up --build` and `scripts/smoke_test_compose.py` (see Phase 7 below)
 
 ## Current Focus
 
-Phase 1, Phase 2 (Decision Service), Phase 3 (AI Agent Integration), and Phase 4 (Intake Service)
-are all complete at the code/test level. Remaining before Phase 3 is fully "production-ready":
-run `scripts/smoke_test_groq_strict.py` manually against the real Groq API (blocked in the
-current dev sandbox by a network/SSL restriction, not by the code). Next: Phase 5 (Approval
-Service), or wiring Dapr pub/sub as Intake<->Decision's second transport (both services already
-expose the composition seams - `build_decider()`, `build_intake_service()` - this needs).
+Phase 1, Phase 2 (Decision Service), Phase 3 (AI Agent Integration), Phase 4 (Intake Service),
+and Phase 7 step 1 (Docker Compose) are all complete and verified. Remaining before Phase 3 is
+fully "production-ready": run `scripts/smoke_test_groq_strict.py` manually against the real Groq
+API from a network that isn't behind an SSL-intercepting proxy (confirmed blocked both on the
+host and now inside the Docker containers too - see Phase 7 notes; environmental, not a code
+issue). Next: Phase 5 (Approval Service), or wiring Dapr pub/sub as Intake<->Decision's second
+transport (both services already expose the composition seams - `build_decider()`,
+`build_intake_service()` - this needs; Postgres/Redis are already running in compose, unused,
+reserved for this).
 
 ---
 
@@ -311,14 +317,59 @@ Make the complete system runnable.
 
 ## Tasks
 
-- [ ] Create Docker Compose environment
-- [ ] Containerize services
-- [ ] Add PostgreSQL
-- [ ] Add Redis
+- [x] Create Docker Compose environment (`docker-compose.yml`, repo root)
+- [x] Containerize services (single shared `Dockerfile` for Intake + Decision - both share
+  `pyproject.toml`/`shared/`, differ only in the `command:` uvicorn target/port; not two
+  near-identical Dockerfiles to maintain - M3 is about containers being separate, not about
+  Dockerfiles being separate, and the two services do run as two separate containers)
+- [x] Add PostgreSQL (`postgres:16-alpine`, no volumes yet - reserved for Dapr state store,
+  a later phase; deliberately not behind `profiles:` - M4 requires the whole system, including
+  not-yet-used infrastructure, to come up with one plain `docker compose up`)
+- [x] Add Redis (`redis:7-alpine`, same reasoning as Postgres above - reserved for Dapr pub/sub)
 - [ ] Configure Dapr
 - [ ] Configure Pub/Sub communication
 - [ ] Configure Dapr state
 - [ ] Configure Dapr secrets
+
+## Verification (done)
+
+Found and fixed two real bugs during planning/implementation, before ever running Docker:
+- `[tool.setuptools] packages = ["services", "shared"]` was an explicit, incomplete list that
+  does not auto-discover subpackages (`services.decision.router`, etc.) - never exercised
+  because all 128 tests ran via pytest's `pythonpath = ["."]`, never via `pip install .`. Fixed
+  with `[tool.setuptools.packages.find]` + `include = ["services*", "shared*"]`, plus
+  `ENV PYTHONPATH=/app` in the Dockerfile as a defensive backstop (same mechanism already
+  proven by pytest).
+- Original `Dockerfile` draft did `COPY pyproject.toml ./` then immediately `RUN pip install .`,
+  before `services/`/`shared/` existed in the build context - setuptools would have had nothing
+  to discover regardless of the `packages.find` fix. Fixed by moving all `COPY` commands before
+  `RUN pip install .`, trading away a dependencies-only cache layer for build-order correctness.
+
+Ran for real (not just described):
+- `docker compose up --build -d` - both images built, all four containers (`intake`, `decision`,
+  `postgres`, `redis`) came up; `intake` correctly waited for `decision`'s healthcheck
+  (`depends_on: condition: service_healthy`) before starting.
+- `python scripts/smoke_test_compose.py` - passed: Intake received the invoice, called Decision
+  over the Docker network (`http://decision:8001`, not localhost), got back a completed decision
+  with a matching `correlation_id`. Proves service discovery, `POST /invoices` -> `BackgroundTasks`
+  processing -> `HttpDecisionServiceClient` -> Decision's `/decisions` all work end to end inside
+  containers, not just under `TestClient`.
+- Structured JSON logs on both services confirmed `correlation_id` propagation end to end
+  (M14), visible via `docker compose logs`.
+- Full local suite re-run after the `pyproject.toml` packaging fix: 128/128 tests, ruff, and
+  mypy all still pass.
+
+Known, documented limitation (not a code bug): the actual Groq API call failed inside the
+`decision` container during this smoke test run - confirmed via a direct `httpx.get("https://api.groq.com")`
+from inside the container, same `CERTIFICATE_VERIFY_FAILED: self-signed certificate in
+certificate chain` seen earlier from the host when running `scripts/smoke_test_groq_strict.py`.
+This is this sandbox's SSL-intercepting network egress, not something Docker networking fixed
+or introduced. The Decision Service's fail-clean fallback (`AgentError` -> `route_decision`
+with `recommendation=None`) handled it correctly and returned `human_review` - the smoke test
+still passed on its own terms (it deliberately does not assert a specific route, only that the
+pipeline completes end to end - see the script's docstring), but this run did not prove the real
+LLM call path works through Docker. That still needs `scripts/smoke_test_groq_strict.py` (or this
+smoke test) run from a network without SSL interception before Phase 3 is "production-ready".
 
 ---
 
