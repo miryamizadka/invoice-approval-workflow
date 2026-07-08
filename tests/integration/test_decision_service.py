@@ -13,15 +13,20 @@ from fastapi.testclient import TestClient
 from services.decision.accessors.llm_provider import LLMProviderError
 from services.decision.accessors.mock_provider import MockProvider
 from services.decision.service.app import create_app
-from shared.contracts.models import Decision, Recommendation, RecommendationType, Route
+from shared.contracts.models import (
+    DecisionCompletedEvent,
+    Recommendation,
+    RecommendationType,
+    Route,
+)
 
 
 class _StubOutcomePublisher:
     def __init__(self) -> None:
-        self.published: list[Decision] = []
+        self.published: list[DecisionCompletedEvent] = []
 
-    async def publish(self, decision: Decision) -> None:
-        self.published.append(decision)
+    async def publish(self, event: DecisionCompletedEvent) -> None:
+        self.published.append(event)
 
 VALID_RECOMMENDATION = Recommendation(
     recommendation=RecommendationType.APPROVE,
@@ -232,9 +237,9 @@ def test_invoice_submitted_event_publishes_auto_approve_decision() -> None:
 
     assert response.status_code == 200
     assert len(outcome_publisher.published) == 1
-    decision = outcome_publisher.published[0]
-    assert decision.route == Route.AUTO_APPROVE
-    assert decision.correlation_id == "corr-auto-approve"
+    event = outcome_publisher.published[0]
+    assert event.decision.route == Route.AUTO_APPROVE
+    assert event.decision.correlation_id == "corr-auto-approve"
 
 
 def test_invoice_submitted_event_publishes_human_review_decision() -> None:
@@ -250,9 +255,9 @@ def test_invoice_submitted_event_publishes_human_review_decision() -> None:
     )
 
     assert response.status_code == 200
-    decision = outcome_publisher.published[0]
-    assert decision.route == Route.HUMAN_REVIEW
-    assert decision.correlation_id == "corr-human-review"
+    event = outcome_publisher.published[0]
+    assert event.decision.route == Route.HUMAN_REVIEW
+    assert event.decision.correlation_id == "corr-human-review"
 
 
 def test_invoice_submitted_event_publishes_reject_decision() -> None:
@@ -272,9 +277,9 @@ def test_invoice_submitted_event_publishes_reject_decision() -> None:
     response = _post_invoice_submitted(client, _invoice_body(), "corr-reject")
 
     assert response.status_code == 200
-    decision = outcome_publisher.published[0]
-    assert decision.route == Route.REJECT
-    assert decision.correlation_id == "corr-reject"
+    event = outcome_publisher.published[0]
+    assert event.decision.route == Route.REJECT
+    assert event.decision.correlation_id == "corr-reject"
 
 
 def test_invoice_submitted_event_uses_the_existing_decider_unmodified() -> None:
@@ -287,4 +292,52 @@ def test_invoice_submitted_event_uses_the_existing_decider_unmodified() -> None:
     response = _post_invoice_submitted(client, _invoice_body(), "corr-fallback")
 
     assert response.status_code == 200
-    assert outcome_publisher.published[0].route == Route.HUMAN_REVIEW
+    assert outcome_publisher.published[0].decision.route == Route.HUMAN_REVIEW
+
+
+# --- (i) DecisionCompletedEvent enrichment (F4 - invoice + recommendation) ----
+
+
+def test_invoice_submitted_event_publishes_invoice_and_recommendation() -> None:
+    """F4: Approval needs the invoice and the agent's recommendation/confidence,
+    not just the final route - both must be on the published event."""
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(
+        provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()),
+        outcome_publisher=outcome_publisher,
+    )
+    client = TestClient(app)
+    invoice_body = _invoice_body()
+
+    _post_invoice_submitted(client, invoice_body, "corr-enriched")
+
+    event = outcome_publisher.published[0]
+    assert event.invoice.id == invoice_body["id"]
+    assert event.recommendation == VALID_RECOMMENDATION
+
+
+def test_agent_error_publishes_event_with_no_recommendation() -> None:
+    """recommendation is None exactly when the agent itself failed
+    (AgentError fallback) - never in the normal AUTO_APPROVE/HUMAN_REVIEW/
+    REJECT paths (see the three tests above, all with a real recommendation)."""
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(provider=_FailingProvider(), outcome_publisher=outcome_publisher)
+    client = TestClient(app)
+
+    _post_invoice_submitted(client, _invoice_body(), "corr-no-recommendation")
+
+    assert outcome_publisher.published[0].recommendation is None
+
+
+def test_post_decisions_response_does_not_leak_recommendation() -> None:
+    """Regression guard: POST /decisions must keep returning bare Decision
+    fields only (D4 API stability) - recommendation must never appear in the
+    HTTP response, even though it's now carried internally (DecisionOutcome)
+    and on the published event (DecisionCompletedEvent)."""
+    app = create_app(provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()))
+    client = TestClient(app)
+
+    response = client.post("/decisions", json=_invoice_body())
+
+    assert response.status_code == 200
+    assert set(response.json().keys()) == {"route", "reason", "triggered_rules", "correlation_id"}

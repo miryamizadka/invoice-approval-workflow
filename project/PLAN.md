@@ -44,18 +44,21 @@ The priority is:
 - [x] Docker Compose environment (Phase 7, step 1) - single shared `Dockerfile`, 4-service
   `docker-compose.yml` (intake, decision, postgres, redis), verified with a real
   `docker compose up --build` and `scripts/smoke_test_compose.py` (see Phase 7 below)
+- [x] Dapr pub/sub between Intake and Decision (Phase 7, step 3)
+- [x] Dapr state for Intake's `InvoiceRepository` (Phase 7, step 4)
+- [x] Approval Service (Phase 5) - F4 (queue + display), F5 (approve/reject/request-info), M11
+  (durable pause/resume) - see Phase 5 below
 
 ## Current Focus
 
-Phase 1, Phase 2 (Decision Service), Phase 3 (AI Agent Integration), Phase 4 (Intake Service),
-and Phase 7 step 1 (Docker Compose) are all complete and verified. Remaining before Phase 3 is
-fully "production-ready": run `scripts/smoke_test_groq_strict.py` manually against the real Groq
-API from a network that isn't behind an SSL-intercepting proxy (confirmed blocked both on the
-host and now inside the Docker containers too - see Phase 7 notes; environmental, not a code
-issue). Next: Phase 5 (Approval Service), or wiring Dapr pub/sub as Intake<->Decision's second
-transport (both services already expose the composition seams - `build_decider()`,
-`build_intake_service()` - this needs; Postgres/Redis are already running in compose, unused,
-reserved for this).
+Phase 1-5, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete and
+verified. Remaining before Phase 3 is fully "production-ready": run
+`scripts/smoke_test_groq_strict.py` manually against the real Groq API from a network that isn't
+behind an SSL-intercepting proxy (confirmed blocked both on the host and inside Docker containers -
+environmental, not a code issue). Next: Phase 6 (Payment Service - INV-1012 saga/compensation),
+which will need its own Dapr sidecar + `payment.completed`/`payment.failed` topics and subscribes
+to both `decision.completed` (route=auto_approve) and `approval.completed`
+(resolution=approved) - same choreography pattern already proven twice.
 
 ---
 
@@ -280,18 +283,80 @@ Support escalated decisions.
 
 ## Tasks
 
-- [ ] Create Approval Service
-- [ ] Create human review queue
-- [ ] Display:
-  - Invoice data
-  - Agent recommendation
-  - Confidence score
-  - Policy reasons
+- [x] Create Approval Service (`services/approval/`: `ApprovalService`/`build_approval_service`
+  transport-agnostic core + thin `app.py` FastAPI wrapper, same pattern as Intake/Decision)
+- [x] Create human review queue (`GET /approvals`, backed by `DaprStateApprovalRepository`'s
+  append-only `approval:index` - the only way to enumerate keys in a Dapr state store with no
+  Query API. Also added `GET /approvals/{tracking_id}` for a single item, matching the existing
+  Intake/Decision `GET /{id}` pattern.)
+- [x] Display:
+  - Invoice data (`PendingApproval.invoice`)
+  - Agent recommendation (`PendingApproval.recommendation` - `None` only when the agent itself
+    failed, `AgentError` fallback, always `route=HUMAN_REVIEW` in that case)
+  - Confidence score (`recommendation.confidence`, part of the same object)
+  - Policy reasons (`PendingApproval.decision.reason` / `.triggered_rules`)
 
-- [ ] Implement approve action
-- [ ] Implement reject action
-- [ ] Implement request-information action
-- [ ] Implement durable pause/resume
+  Required a real, reviewed design decision to reach: the pre-existing `decision.completed` event
+  only carried the bare `Decision` (route/reason/triggered_rules/correlation_id), not the invoice
+  or the agent's recommendation. Fixed at the source: `Decider.decide()` now returns an internal
+  `DecisionOutcome` (decision + recommendation), never crossing a service boundary itself; the
+  Decision service's `invoice.submitted` subscription handler builds an enriched
+  `DecisionCompletedEvent` (invoice + decision + recommendation) from it and publishes that.
+  `POST /decisions`'s external HTTP response is unchanged (still bare `Decision` - D4 API
+  stability; proven by a dedicated regression test asserting the response's JSON keys never
+  include `recommendation`).
+- [x] Implement approve action (`POST /approvals/{tracking_id}/approve` - PENDING/WAITING_INFO ->
+  APPROVED, publishes `approval.completed` with `resolution=approved`)
+- [x] Implement reject action (same, `resolution=rejected`)
+- [x] Implement request-information action (`POST /approvals/{tracking_id}/request-info` ->
+  WAITING_INFO, publishes nothing - per ADR-003, once escalated the human owns the decision.
+  Documented gap: there is no Gateway/UI route yet for the submitter to actually supply more
+  info and trigger a resume - the queue correctly keeps showing the item as WAITING_INFO
+  [non-terminal], but nothing currently moves it back out of that state automatically)
+- [x] Implement durable pause/resume (M11) - `DaprStateApprovalRepository`, same pattern as
+  `DaprStateInvoiceRepository`: `approval:{tracking_id}` -> full `PendingApproval` JSON,
+  `approval:index` -> append-only tracking_id list, both written in one atomic
+  `execute_state_transaction`. Verified for real: force-recreating the `approval`
+  container + its Dapr sidecar mid-flow, a PENDING-turned-APPROVED item and a WAITING_INFO item
+  both survived and remained fully actionable afterward (approved the WAITING_INFO item
+  successfully post-restart) - see "Verification (Approval Service, Phase 5)" below.
+
+Also fixed, a real bug found during design review before any code was written: idempotent
+handling of `decision.completed` in `handle_decision_completed()`. The original design would have
+let Dapr's at-least-once redelivery of that event - arriving *after* a human already
+approved/rejected the item - silently revert the status back to PENDING. Fixed to mirror
+`IntakeService.complete()`'s existing pattern: if a record already exists for the tracking_id (in
+any status), it's a no-op; a new `PendingApproval` is only ever created on first sighting.
+Proven by a dedicated regression test (`test_handle_decision_completed_is_idempotent_after_approval`).
+
+## Verification (Approval Service, Phase 5)
+
+Ran for real, not just described:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - 223 tests total (32 new for
+  Approval, plus updated Decision tests for the `DecisionOutcome`/`DecisionCompletedEvent`
+  enrichment), ruff, and mypy all pass (the two pre-existing mypy findings in
+  `scripts/run_agent.py` and `tests/unit/shared/test_models.py` predate this phase, confirmed via
+  `git stash` against the clean branch - not introduced here).
+- `docker compose up --build -d` - all **9** containers (previous 7 + `approval` + `approval-dapr`)
+  came up healthy.
+- Submitted INV-1003 (client dinner, $1820, over ceiling + missing client name - `expected.route:
+  human_review`) via `POST /invoices` - confirmed it reached `GET /approvals` with the full F4
+  payload (invoice, recommendation with confidence 0.95, decision reason/triggered_rules).
+- Submitted INV-1001 (auto_approve fixture) - confirmed it never reaches `GET /approvals` at all
+  (Approval correctly ignores non-`human_review` routes, choreography).
+- `POST /approvals/{id}/approve` - status became `approved`, confirmed via `GET
+  /approvals/{id}` and via `docker compose logs approval` (`approval_resolved` logged). Retried
+  the same approve - got `409`, and the publish count did not increase (idempotency guard against
+  double-click/retry proven live, not just in a test).
+- Submitted a second INV-1003-style item, called `POST /approvals/{id}/request-info` - status
+  became `waiting_info`, and it still appeared in `GET /approvals` (non-terminal, as designed).
+- **The M11 restart-survival test** (the central proof of durable HITL):
+  `docker compose up -d --force-recreate approval approval-dapr` (not `restart` alone - same
+  operational lesson learned in the Dapr-state-for-Intake phase) while one item was `approved` and
+  another was `waiting_info`. Both containers came back healthy; `GET /approvals` afterward showed
+  both items with their pre-restart statuses intact. Then successfully called
+  `POST /approvals/{id}/approve` on the surviving `waiting_info` item, confirming the service was
+  fully functional after the restart, not just serving stale reads.
 
 ---
 
@@ -344,8 +409,8 @@ Make the complete system runnable.
   `TestClient` - see "Verification (Dapr pub/sub, step 3)" below.
 - [x] Configure Dapr state (idempotency/dedup) - `DaprStateInvoiceRepository` replaces
   `InMemoryInvoiceRepository` as Intake's default `InvoiceRepository`, backed by the `statestore`
-  component. See "Verification (Dapr state, step 4)" below. HITL pause-resume is still a separate
-  future step (Approval Service doesn't exist yet).
+  component. See "Verification (Dapr state, step 4)" below. HITL pause-resume was the separate
+  future step below (now done, Phase 5).
 - [ ] Configure Dapr secrets
 
 ## Verification (done)

@@ -96,9 +96,11 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Approval | Payment | Dapr Pub/Sub | Async | Resume after human decision |
 | Payment | Notification | Dapr Pub/Sub | Async | Result notification |
 
-Event topics: `invoice.submitted`, `decision.completed`, `approval.approved`, `approval.rejected`, `payment.completed`, `payment.failed`.
+Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `payment.completed`, `payment.failed`.
 
-`decision.completed` carries the full `Decision` (including `route`) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography).
+`decision.completed` carries a `DecisionCompletedEvent` (invoice + `Decision`, including `route` + the agent's `Recommendation`, which may be `None` if the agent itself failed) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`, Approval only wants `route == human_review`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography). The invoice and recommendation/confidence are what Approval needs to display for F4 - the bare `Decision` alone (route/reason/triggered_rules) isn't enough. `POST /decisions`'s external HTTP response is unaffected by this enrichment - it still returns the bare `Decision` only (D4, API stability); the enrichment only travels over the `decision.completed` event.
+
+`approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment (future) filters for `resolution == approved`; Notification (future) filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
 
 
 ## 8. Data Architecture
@@ -118,8 +120,8 @@ Each service owns its own data (database-per-service); no service reads another'
 ## 9. Architectural Mechanisms
 
 ### Durable Pause/Resume (M11)
-When an item is escalated, the Approval service persists a paused-state record to a Dapr state store (Redis or PostgreSQL running as a separate container with a volume) - never in the service's own memory. The record holds the tracking id, status (pending / waiting-info), the invoice data, the agent's recommendation, confidence and cited rules (F4), and a resume point marking where the flow paused.
-Because the state lives in an external store, the Approval container is stateless and disposable: if it restarts between pause and resume, it simply re-reads the pending items from the state store - nothing is lost. When an approver acts, the service loads the record, reads the resume point, and continues from exactly there: approve → Payment, reject → Notification, send-back → status becomes waiting-info and the submitter is asked for more.
+When an item is escalated (route=human_review), the Approval service persists a `PendingApproval` record (tracking id, status - pending / waiting-info / approved / rejected, the invoice data, the decision, and the agent's recommendation with confidence and cited rules for F4) to a Dapr state store (Redis) - never in the service's own memory. An append-only index (`approval:index`) tracks which tracking ids exist, since this key-value store has no query API to enumerate keys otherwise.
+Because the state lives in an external store, the Approval container is stateless and disposable: if it restarts between pause and resume, it simply re-reads the pending items from the state store on the next request - nothing is lost (verified by force-recreating the approval container and its Dapr sidecar mid-flow). The status field itself is the resume point: when an approver acts, the service loads the record and validates the current status is still actionable (pending/waiting-info, not already terminal) before transitioning it - approve/reject update the status and publish `approval.completed`; send-back (`request-info`) moves status to waiting-info without publishing anything (documented gap: there is no UI/route yet for the submitter to actually supply more information and resume from there - out of scope until the Gateway/UI, M7, exists).
 
 ### Provable Autonomy Ceiling (M12)
 Auto-approval is gated by a single deterministic router, which is the only code path that can return AUTO_APPROVE. The agent returns a recommendation object (recommendation, confidence, cited rules) and nothing more — it has no capability to approve. The router then applies plain, ordered checks: if amount > ceiling → human, if confidence < 0.80 → human, if any hard stop → human, if not category-compliant → human; only if all pass does it return auto-approve.
@@ -179,13 +181,13 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG
     I-->>U: 202 Accepted + tracking id
     I->>D: publish invoice.submitted
     D->>D: agent recommends, router decides ESCALATE
-    D->>A: publish decision.escalated
+    D->>A: publish decision.completed (route=human_review)
     A->>A: persist paused-state (Dapr state)
     Note over A: waits for human, survives restart
     U->>G: approver approves
     G->>A: approve action
     A->>A: load paused-state, resume
-    A->>P: publish approval.approved
+    A->>P: publish approval.completed (resolution=approved)
     P->>P: reserve budget, pay
     P->>N: publish payment.completed
     N-->>U: notify approved and paid

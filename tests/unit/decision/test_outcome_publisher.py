@@ -1,5 +1,5 @@
 """Tests for DaprDecisionOutcomePublisher - Decision's counterpart to
-DaprDecisionPublisher, publishing the final Decision to decision.completed
+DaprDecisionPublisher, publishing the enriched decision.completed event
 after the subscription handler runs the Decider.
 """
 
@@ -14,7 +14,8 @@ from services.decision.service.outcome_publisher import (
     DaprDecisionOutcomePublisher,
     DecisionOutcomePublisherError,
 )
-from shared.contracts.models import Decision, Route
+from shared.contracts.models import Decision, DecisionCompletedEvent, Route
+from tests.support.decision_fixtures import clean_invoice
 
 
 class _FakeDaprClient:
@@ -43,19 +44,23 @@ def _decision(route: Route) -> Decision:
     )
 
 
-async def test_publish_sends_decision_to_decision_completed_topic() -> None:
+def _event(route: Route) -> DecisionCompletedEvent:
+    return DecisionCompletedEvent(invoice=clean_invoice(), decision=_decision(route))
+
+
+async def test_publish_sends_event_to_decision_completed_topic() -> None:
     fake_client = _FakeDaprClient()
     publisher = DaprDecisionOutcomePublisher(client=fake_client)
-    decision = _decision(Route.AUTO_APPROVE)
+    event = _event(Route.AUTO_APPROVE)
 
-    await publisher.publish(decision)
+    await publisher.publish(event)
 
     assert len(fake_client.calls) == 1
     call = fake_client.calls[0]
     assert call["pubsub_name"] == "pubsub"
     assert call["topic_name"] == "decision.completed"
     assert call["data_content_type"] == "application/json"
-    assert Decision.model_validate(json.loads(call["data"])) == decision  # type: ignore[arg-type]
+    assert DecisionCompletedEvent.model_validate(json.loads(call["data"])) == event  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -65,7 +70,7 @@ async def test_publish_always_uses_the_same_topic_regardless_of_route(route: Rou
     fake_client = _FakeDaprClient()
     publisher = DaprDecisionOutcomePublisher(client=fake_client)
 
-    await publisher.publish(_decision(route))
+    await publisher.publish(_event(route))
 
     assert fake_client.calls[0]["topic_name"] == "decision.completed"
 
@@ -75,7 +80,7 @@ async def test_publish_wraps_client_errors_as_decision_outcome_publisher_error()
     publisher = DaprDecisionOutcomePublisher(client=fake_client)
 
     with pytest.raises(DecisionOutcomePublisherError):
-        await publisher.publish(_decision(Route.AUTO_APPROVE))
+        await publisher.publish(_event(Route.AUTO_APPROVE))
 
 
 def test_construction_does_not_call_factory_eagerly() -> None:

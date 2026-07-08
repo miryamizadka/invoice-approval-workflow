@@ -22,7 +22,7 @@ from services.decision.service.outcome_publisher import (
     DaprDecisionOutcomePublisher,
     DecisionOutcomePublisher,
 )
-from shared.contracts.models import Decision, Invoice, InvoiceSubmittedEvent
+from shared.contracts.models import Decision, DecisionCompletedEvent, Invoice, InvoiceSubmittedEvent
 
 
 def create_app(
@@ -54,9 +54,10 @@ def create_app(
         correlation_id = x_correlation_id or str(uuid.uuid4())
         response.headers["X-Correlation-Id"] = correlation_id
         request_decider: Decider = request.app.state.decider
-        return await request_decider.decide(
+        outcome = await request_decider.decide(
             invoice, correlation_id=correlation_id, is_duplicate=is_duplicate
         )
+        return outcome.decision
 
     @dapr_app.subscribe(
         pubsub="pubsub", topic="invoice.submitted", route="/events/invoice-submitted"
@@ -72,10 +73,15 @@ def create_app(
         # is_duplicate is always False here: Intake never publishes for an
         # invoice it already knows is a duplicate (see IntakeService.process()'s
         # short-circuit) - reaching this handler already proves that.
-        decision = await request_decider.decide(
+        outcome = await request_decider.decide(
             event.invoice, correlation_id=event.correlation_id, is_duplicate=False
         )
-        await request_outcome_publisher.publish(decision)
+        completed_event = DecisionCompletedEvent(
+            invoice=event.invoice,
+            decision=outcome.decision,
+            recommendation=outcome.recommendation,
+        )
+        await request_outcome_publisher.publish(completed_event)
         return {"status": "SUCCESS"}
 
     @app.exception_handler(Exception)

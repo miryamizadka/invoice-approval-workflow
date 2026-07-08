@@ -90,6 +90,59 @@ class Decision(BaseModel):
     correlation_id: str
 
 
+class DecisionOutcome(BaseModel):
+    """Decider's full internal result - Decision (router's binding output)
+    plus the Recommendation that led to it. Internal to the Decision service
+    only (Decider.decide()'s return type) - never crosses a service boundary
+    itself. POST /decisions extracts just `.decision` (unchanged external API,
+    D4); the invoice.submitted subscription handler uses both to build
+    DecisionCompletedEvent, which is what actually crosses the boundary.
+    recommendation is None only when the agent itself failed (AgentError
+    fallback, which always routes to HUMAN_REVIEW)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    decision: Decision
+    recommendation: Recommendation | None = None
+
+
+class DecisionCompletedEvent(BaseModel):
+    """decision.completed envelope (Dapr pub/sub) - invoice + decision +
+    recommendation. Approval needs all three for F4 (display invoice data,
+    the agent's recommendation, its confidence, and the policy reasons) -
+    the bare Decision alone (route/reason/triggered_rules/correlation_id)
+    doesn't carry the invoice or the agent's raw recommendation/confidence."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    invoice: Invoice
+    decision: Decision
+    recommendation: Recommendation | None = None
+
+
+class ApprovalResolution(StrEnum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ApprovalCompletedEvent(BaseModel):
+    """approval.completed envelope (Dapr pub/sub) - a single topic for both
+    outcomes (mirrors decision.completed's reasoning: Approval doesn't know
+    or care who's listening; a future Payment/Notification service filters
+    by `resolution`). Carries the full Decision, not just tracking_id +
+    resolution: Payment's idempotency keys are invoice-based (M10's
+    pay:INV-1012 example), and Notification (reject path) plausibly needs
+    decision.reason for the submitter-facing plain-language message (F2) -
+    both future consumers are served by one shape, at near-zero cost since
+    everything is already in memory at publish time."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    invoice: Invoice
+    decision: Decision
+    resolution: ApprovalResolution
+
+
 class InvoiceSubmittedEvent(BaseModel):
     """Envelope Intake publishes and Decision subscribes to (invoice.submitted,
     Dapr pub/sub) - carries correlation_id, a transport concern Invoice itself

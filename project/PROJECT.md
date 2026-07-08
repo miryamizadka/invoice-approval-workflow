@@ -125,6 +125,23 @@ Completed
   found a real operational gotcha along the way: `docker compose restart <app>` alone breaks its
   `network_mode: service:<app>` sidecar's networking; `up -d --force-recreate <app> <app>-dapr` is
   the safe way to bring the pair back (documented in PLAN.md).
+- Approval Service (Phase 5, F4/F5/M11) - third microservice, same layering as Intake/Decision
+  (`ApprovalService`/`build_approval_service` transport-agnostic core + thin FastAPI `app.py`).
+  Subscribes to `decision.completed`, ignoring every route except `human_review`; publishes
+  `approval.completed` on approve/reject (not on request-info, per ADR-003). Backed by
+  `DaprStateApprovalRepository` - same append-only-index pattern as Intake's repository, needed
+  here because Approval must *enumerate* pending items (`GET /approvals`), which a plain
+  key-by-tracking_id store can't do without a Query API. Required enriching the pre-existing
+  `decision.completed` event: `Decider.decide()` now returns an internal `DecisionOutcome`
+  (decision + recommendation) so Decision's subscription handler can publish invoice + decision +
+  recommendation together (`DecisionCompletedEvent`) - `POST /decisions`'s external HTTP response
+  is untouched (still bare `Decision`, D4). Found and fixed a real bug during design review before
+  writing any code: `handle_decision_completed()` needed idempotency against Dapr's at-least-once
+  redelivery - without it, a redelivered event arriving after a human already acted would have
+  silently reverted the status back to `PENDING`. Verified via a real `docker compose
+  up -d --force-recreate approval approval-dapr` mid-flow: both an `approved` and a `waiting_info`
+  item survived with correct status, and the `waiting_info` item was still fully actionable
+  (approved successfully) afterward - the central proof of durable HITL (M11).
 
 In Progress
 
@@ -134,11 +151,9 @@ In Progress
 
 Planned
 
-- Approval Service
 - Payment Saga
 - Notification
 - UI
-- HITL pause-resume via the `statestore` component (needs the Approval Service, not built yet)
 - CI
 - Verification
 - Demo
