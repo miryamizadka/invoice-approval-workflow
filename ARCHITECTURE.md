@@ -96,7 +96,9 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Approval | Payment | Dapr Pub/Sub | Async | Resume after human decision |
 | Payment | Notification | Dapr Pub/Sub | Async | Result notification |
 
-Event topics: `invoice.submitted`, `decision.approved`, `decision.escalated`, `approval.approved`, `approval.rejected`, `payment.completed`, `payment.failed`.
+Event topics: `invoice.submitted`, `decision.completed`, `approval.approved`, `approval.rejected`, `payment.completed`, `payment.failed`.
+
+`decision.completed` carries the full `Decision` (including `route`) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography).
 
 
 ## 8. Data Architecture
@@ -203,7 +205,9 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG
 
 **Logging & correlation id (M14):** every log line carries a correlation id assigned at intake, so a single request can be traced end-to-end across all services - this is also the backbone of the auditor's decision trail (F9).
 
-**Error handling & resilience:** each service exposes a health check; the LLM provider is swappable and fails fast (never silently) on errors (M15); inter-service calls use retry and timeout.
+**Error handling & resilience:** each service exposes a health check; the LLM provider is swappable and fails fast (never silently) on errors (M15); inter-service calls use retry and timeout - for pub/sub this is a Dapr resiliency policy on the subscriber, not application code.
+
+**Known gap, not yet implemented (Transactional Outbox):** a service's own state write (e.g. Intake marking a submission PROCESSING) and its corresponding event publish are two separate operations, not one atomic transaction. A crash between them leaves the state written but the event never published (or vice versa). Closing this needs the Transactional Outbox pattern (write the event to the same transactional store as the state change, with a separate relay process publishing it) - deferred until a real transactional store (PostgreSQL) backs the affected repositories; `InMemoryInvoiceRepository` can't support it.
 
 **Security:** the API gateway enforces rate-limiting (M6); secrets (LLM keys) are held in Dapr secrets, never in code. Optional JWT auth with roles - submitter / approver / admin (N1).
 

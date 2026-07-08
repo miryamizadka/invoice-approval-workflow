@@ -13,7 +13,15 @@ from fastapi.testclient import TestClient
 from services.decision.accessors.llm_provider import LLMProviderError
 from services.decision.accessors.mock_provider import MockProvider
 from services.decision.service.app import create_app
-from shared.contracts.models import Recommendation, RecommendationType, Route
+from shared.contracts.models import Decision, Recommendation, RecommendationType, Route
+
+
+class _StubOutcomePublisher:
+    def __init__(self) -> None:
+        self.published: list[Decision] = []
+
+    async def publish(self, decision: Decision) -> None:
+        self.published.append(decision)
 
 VALID_RECOMMENDATION = Recommendation(
     recommendation=RecommendationType.APPROVE,
@@ -193,3 +201,90 @@ def test_is_duplicate_defaults_to_false_when_omitted() -> None:
 
     assert response.status_code == 200
     assert response.json()["route"] == Route.AUTO_APPROVE.value
+
+
+# --- (h) invoice.submitted subscription handler -------------------------------
+#
+# Note: DUPLICATE is never reachable through this path - Intake short-circuits
+# known duplicates itself before publishing (see IntakeService.process()), so
+# the subscription handler always calls decider.decide(..., is_duplicate=False).
+# Only AUTO_APPROVE/HUMAN_REVIEW/REJECT are exercised here.
+
+
+def _post_invoice_submitted(
+    client: TestClient, invoice_body: dict[str, Any], correlation_id: str
+) -> Any:
+    return client.post(
+        "/events/invoice-submitted",
+        json={"data": {"invoice": invoice_body, "correlation_id": correlation_id}},
+    )
+
+
+def test_invoice_submitted_event_publishes_auto_approve_decision() -> None:
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(
+        provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()),
+        outcome_publisher=outcome_publisher,
+    )
+    client = TestClient(app)
+
+    response = _post_invoice_submitted(client, _invoice_body(), "corr-auto-approve")
+
+    assert response.status_code == 200
+    assert len(outcome_publisher.published) == 1
+    decision = outcome_publisher.published[0]
+    assert decision.route == Route.AUTO_APPROVE
+    assert decision.correlation_id == "corr-auto-approve"
+
+
+def test_invoice_submitted_event_publishes_human_review_decision() -> None:
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(
+        provider=MockProvider(response=VALID_RECOMMENDATION.model_dump_json()),
+        outcome_publisher=outcome_publisher,
+    )
+    client = TestClient(app)
+
+    response = _post_invoice_submitted(
+        client, _over_ceiling_invoice_body(), "corr-human-review"
+    )
+
+    assert response.status_code == 200
+    decision = outcome_publisher.published[0]
+    assert decision.route == Route.HUMAN_REVIEW
+    assert decision.correlation_id == "corr-human-review"
+
+
+def test_invoice_submitted_event_publishes_reject_decision() -> None:
+    severe_reject = Recommendation(
+        recommendation=RecommendationType.REJECT,
+        confidence=0.95,
+        cited_rules=["MEAL-03"],
+        reasoning="alcohol-only receipt",
+    )
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(
+        provider=MockProvider(response=severe_reject.model_dump_json()),
+        outcome_publisher=outcome_publisher,
+    )
+    client = TestClient(app)
+
+    response = _post_invoice_submitted(client, _invoice_body(), "corr-reject")
+
+    assert response.status_code == 200
+    decision = outcome_publisher.published[0]
+    assert decision.route == Route.REJECT
+    assert decision.correlation_id == "corr-reject"
+
+
+def test_invoice_submitted_event_uses_the_existing_decider_unmodified() -> None:
+    """Same MockProvider/AgentError fallback behavior as POST /decisions -
+    proves the subscription handler calls the same Decider, not a copy."""
+    outcome_publisher = _StubOutcomePublisher()
+    app = create_app(provider=_FailingProvider(), outcome_publisher=outcome_publisher)
+    client = TestClient(app)
+
+    response = _post_invoice_submitted(client, _invoice_body(), "corr-fallback")
+
+    assert response.status_code == 200
+    assert outcome_publisher.published[0].route == Route.HUMAN_REVIEW

@@ -45,7 +45,9 @@ class LineItem(BaseModel):
 
 
 class Invoice(BaseModel):
-    """Structured invoice data as consumed from the invoice.submitted event."""
+    """Structured invoice data used across services - the domain shape,
+    independent of any transport. See InvoiceSubmittedEvent for the
+    envelope that carries this over the invoice.submitted pub/sub event."""
 
     model_config = ConfigDict(populate_by_name=True, frozen=True, extra="forbid")
 
@@ -86,6 +88,34 @@ class Decision(BaseModel):
     reason: str
     triggered_rules: list[str]
     correlation_id: str
+
+
+class InvoiceSubmittedEvent(BaseModel):
+    """Envelope Intake publishes and Decision subscribes to (invoice.submitted,
+    Dapr pub/sub) - carries correlation_id, a transport concern Invoice itself
+    doesn't. No is_duplicate field: Intake never publishes for an invoice it
+    already knows is a duplicate (see IntakeService.process()'s short-circuit
+    via build_duplicate_decision below) - reaching Decision through this event
+    already proves the invoice is not a known duplicate."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    invoice: Invoice
+    correlation_id: str
+
+
+def build_duplicate_decision(correlation_id: str) -> Decision:
+    """Canonical DUPLICATE decision shape (GLOBAL-DUP) - the single source
+    both the router's gate 1 and Intake's pre-publish short-circuit use, so
+    the two can never drift apart (same reasoning as compute_dedup_key below:
+    one canonical definition, not a per-service copy)."""
+    return Decision(
+        route=Route.DUPLICATE,
+        reason="Duplicate of an already-processed invoice (same vendor, invoice number, "
+        "and total).",
+        triggered_rules=["GLOBAL-DUP"],
+        correlation_id=correlation_id,
+    )
 
 
 def compute_dedup_key(invoice: Invoice) -> str:

@@ -1,8 +1,15 @@
-"""Intake's client for calling Decision Service - a Protocol, like LLMProvider.
+"""Intake's synchronous HTTP client for calling Decision Service directly -
+a Protocol, like LLMProvider.
 
-HTTP today, not a direct Python import of Decider: Intake and Decision must
-stay independently deployable (M3) - swapping this for Dapr pub/sub later
-is a transport change, not a structural one.
+No longer IntakeService's primary transport: IntakeService now depends on
+DecisionPublisher (services/intake/decision_publisher.py), which publishes
+invoice.submitted over Dapr pub/sub and does not wait for a reply - a fire-
+and-forget shape this Protocol's synchronous decide() -> Decision return
+can't express (turned out to be a structural change, not just a transport
+swap, once actually built - see PLAN.md). Kept, tested, and still usable
+standalone: matches ARCHITECTURE.md §7's "sync invocation only where an
+immediate response is required", and is convenient for local development or
+manual testing against Decision Service without needing Dapr sidecars.
 """
 
 from __future__ import annotations
