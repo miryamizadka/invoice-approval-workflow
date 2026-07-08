@@ -36,6 +36,20 @@ services:
       retries: 3
     networks: [approvalflow]
 
+  approval:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.approval.app:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -111,6 +125,30 @@ services:
       redis:
         condition: service_healthy
     # See intake-dapr comment above - same reasoning, paired with decision.
+
+  approval-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "approval"
+      - "--app-port"
+      - "8002"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:approval"
+    depends_on:
+      approval:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # See intake-dapr/decision-dapr comments above - same reasoning, paired with approval.
 
   placement:
     image: daprio/placement:1.18.1

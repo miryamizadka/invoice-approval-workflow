@@ -16,7 +16,7 @@ from services.decision.agent import AgentError, AgentState, build_agent_graph
 from services.decision.router.config import DEFAULT_THRESHOLDS, AutonomyThresholds
 from services.decision.router.router import route_decision
 from services.decision.service.policy_loader import load_policy_text
-from shared.contracts.models import Decision, Invoice
+from shared.contracts.models import DecisionOutcome, Invoice
 
 
 class Decider:
@@ -30,7 +30,7 @@ class Decider:
 
     async def decide(
         self, invoice: Invoice, *, correlation_id: str, is_duplicate: bool = False
-    ) -> Decision:
+    ) -> DecisionOutcome:
         self._logger.info(
             "decision_requested",
             extra={"correlation_id": correlation_id, "invoice_id": invoice.id},
@@ -55,6 +55,7 @@ class Decider:
                     "graph wiring bug, not an LLM failure."
                 )
             decision = final_state.decision
+            recommendation = final_state.recommendation
         except AgentError as exc:
             # Fail-clean contract from the agent design: never silently drop to
             # a partial state - log loudly, then reuse the router's own safe
@@ -74,6 +75,7 @@ class Decider:
                 thresholds=self._thresholds,
                 correlation_id=correlation_id,
             )
+            recommendation = None
         self._logger.info(
             "decision_completed",
             extra={
@@ -82,7 +84,7 @@ class Decider:
                 "route": decision.route.value,
             },
         )
-        return decision
+        return DecisionOutcome(decision=decision, recommendation=recommendation)
 
 
 def build_decider(provider: LLMProvider) -> Decider:

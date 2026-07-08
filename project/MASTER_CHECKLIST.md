@@ -34,8 +34,8 @@ Priority: MUST HAVE
 Implementation:
 - [ ] API Gateway (not built yet - Intake currently the direct entry point)
 - [x] Intake Service
-- [ ] Dapr Pub/Sub (Intake -> Decision is plain HTTP today, by design - see ADR-worthy note in
-  PLAN.md Phase 4: swapping to Dapr is a transport change, not structural)
+- [x] Dapr Pub/Sub (Intake -> Decision now goes over `invoice.submitted`/`decision.completed`,
+  not direct HTTP - see PLAN.md Phase 7 step 3)
 
 ---
 
@@ -70,11 +70,13 @@ Priority: MUST HAVE
 
 Priority: MUST HAVE
 
-- [ ] Human review queue exists
-- [ ] Only escalated items appear
-- [ ] Agent recommendation visible
-- [ ] Confidence score visible
-- [ ] Policy rules cited
+- [x] Human review queue exists (`GET /approvals`, `services/approval/app.py`)
+- [x] Only escalated items appear (`ApprovalService.handle_decision_completed()` ignores every
+  route except `human_review`; verified live - an auto_approve invoice never reaches the queue)
+- [x] Agent recommendation visible (`PendingApproval.recommendation`, required a `DecisionOutcome`/
+  `DecisionCompletedEvent` enrichment - see PLAN.md Phase 5)
+- [x] Confidence score visible (`recommendation.confidence`, same object)
+- [x] Policy rules cited (`PendingApproval.decision.reason` / `.triggered_rules`)
 
 ---
 
@@ -82,11 +84,15 @@ Priority: MUST HAVE
 
 Priority: MUST HAVE
 
-- [ ] Approver can approve
-- [ ] Approver can reject
-- [ ] Approver can request more information
-- [ ] Workflow pauses durably
-- [ ] Workflow resumes after decision
+- [x] Approver can approve (`POST /approvals/{tracking_id}/approve`)
+- [x] Approver can reject (`POST /approvals/{tracking_id}/reject`)
+- [x] Approver can request more information (`POST /approvals/{tracking_id}/request-info` ->
+  `WAITING_INFO`, non-terminal. **Documented gap**: no Gateway/UI route yet for the submitter to
+  actually supply that information and trigger a resume - accepted, out of scope until M7)
+- [x] Workflow pauses durably (`DaprStateApprovalRepository`, Dapr state/Redis - see M11 below)
+- [x] Workflow resumes after decision (approve/reject transition `PENDING`/`WAITING_INFO` ->
+  terminal and publish `approval.completed`; verified live including resuming a `WAITING_INFO`
+  item that survived a container restart)
 
 ---
 
@@ -94,8 +100,12 @@ Priority: MUST HAVE
 
 Priority: MUST HAVE
 
-- [ ] Low-risk items are automatically handled
-- [ ] Human sees only necessary cases
+- [x] Low-risk items are automatically handled (router's AUTO_APPROVE path, unchanged - Approval
+  never sees these)
+- [x] Human sees only necessary cases (only `route=human_review` items reach the queue), **and**
+  sees the reasoning behind why (confidence score + cited policy rules, F4) - the core anti-
+  rubber-stamping mechanism: without visible confidence/rules, the human can't judge whether to
+  trust or override the recommendation.
 
 ---
 
@@ -175,7 +185,7 @@ Priority: MUST HAVE
 
 ## M3 — Microservices
 
-- [ ] At least 3 services (2 so far: Intake, Decision - Approval/Payment pending Phase 5/6)
+- [x] At least 3 services (Intake, Decision, Approval - Payment pending Phase 6)
 - [x] Each service containerized (single shared `Dockerfile`, one container per service)
 - [x] Clear service boundaries (HTTP only between Intake and Decision, no cross-service imports)
 
@@ -197,15 +207,19 @@ Priority: MUST HAVE
 
 Infra step 1 done: `daprd` sidecar per service + `placement`, `dapr/components/{pubsub,statestore}.yaml`
 backed by Redis, verified via `/v1.0/healthz` + `/v1.0/metadata` + logs (see PLAN.md Phase 7).
-Step 3 done: real pub/sub between Intake and Decision (below), verified over the actual Docker
-network (`docker compose logs` shows `POST /events/invoice-submitted`/`POST /events/decision-completed`,
-zero direct HTTP calls between the two services). Service invocation and Dapr state remain unused.
+Step 3 done: real pub/sub between Intake and Decision, and now Decision and Approval too, verified
+over the actual Docker network (`docker compose logs` shows `POST /events/invoice-submitted`/
+`POST /events/decision-completed`, zero direct HTTP calls between any of these three services).
+Step 4 done: Dapr state now backs both Intake's and Approval's repositories. Service invocation
+and Dapr secrets remain unused.
 
 - [ ] Service invocation used
 - [x] Pub/Sub used (`invoice.submitted` published by Intake via `DaprDecisionPublisher`;
-  `decision.completed` published by Decision via `DaprDecisionOutcomePublisher`, subscribed to by
-  both services via `dapr-ext-fastapi`'s `DaprApp`)
-- [ ] Dapr state used
+  `decision.completed` published by Decision via `DaprDecisionOutcomePublisher`; `approval.completed`
+  published by Approval via `DaprApprovalOutcomePublisher`; all subscribed to via
+  `dapr-ext-fastapi`'s `DaprApp`)
+- [x] Dapr state used (`DaprStateInvoiceRepository` for Intake, `DaprStateApprovalRepository` for
+  Approval - both the same append-only-index pattern, backed by the `statestore` component)
 - [ ] Dapr secrets used
 
 
@@ -254,8 +268,13 @@ zero direct HTTP calls between the two services). Service invocation and Dapr st
 
 ## M11 — Durable HITL
 
-- [ ] Human approval survives restart
-- [ ] Workflow state persisted
+- [x] Human approval survives restart - verified live: `docker compose up -d --force-recreate
+  approval approval-dapr` mid-flow (one item `approved`, one `waiting_info`); both containers came
+  back healthy and `GET /approvals` showed both items with their pre-restart statuses intact
+  (see PLAN.md Phase 5 "Verification")
+- [x] Workflow state persisted (`DaprStateApprovalRepository`, Dapr state/Redis, same pattern as
+  Intake's `DaprStateInvoiceRepository`) - and proven still fully actionable post-restart, not
+  just readable: successfully called `approve` on the surviving `waiting_info` item afterward
 
 
 ---

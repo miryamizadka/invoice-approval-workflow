@@ -1,4 +1,4 @@
-"""Decision's publisher for the final Decision - the counterpart to
+"""Decision's publisher for the final decision outcome - the counterpart to
 services/intake/decision_publisher.py. A Protocol, like LLMProvider, so
 tests can inject a stub instead of a real Dapr client.
 
@@ -6,6 +6,10 @@ Single topic (decision.completed), not one per route: Decision doesn't know
 or care who's listening (choreography) - a future Approval/Payment service
 can filter by the `route` field in the payload, or via Dapr's own
 content-based routing on their own subscription, without Decision changing.
+
+Publishes the enriched DecisionCompletedEvent (invoice + decision +
+recommendation), not a bare Decision - Approval needs the invoice and the
+agent's recommendation/confidence for F4, not just the final route.
 """
 
 from __future__ import annotations
@@ -15,18 +19,18 @@ from typing import Protocol
 
 import grpc
 
-from shared.contracts.models import Decision
+from shared.contracts.models import DecisionCompletedEvent
 from shared.dapr_client import LazyDaprClient
 
 _TOPIC = "decision.completed"
 
 
 class DecisionOutcomePublisherError(Exception):
-    """Raised on any failure publishing a Decision - never caught silently."""
+    """Raised on any failure publishing a decision outcome - never caught silently."""
 
 
 class DecisionOutcomePublisher(Protocol):
-    async def publish(self, decision: Decision) -> None: ...
+    async def publish(self, event: DecisionCompletedEvent) -> None: ...
 
 
 class _DaprPublishClient(Protocol):
@@ -53,12 +57,12 @@ class DaprDecisionOutcomePublisher:
     ) -> None:
         self._dapr = LazyDaprClient[_DaprPublishClient](client, factory=factory)
 
-    async def publish(self, decision: Decision) -> None:
+    async def publish(self, event: DecisionCompletedEvent) -> None:
         try:
             await self._dapr.get().publish_event(
                 pubsub_name="pubsub",
                 topic_name=_TOPIC,
-                data=decision.model_dump_json(),
+                data=event.model_dump_json(),
                 data_content_type="application/json",
             )
         except grpc.RpcError as exc:
