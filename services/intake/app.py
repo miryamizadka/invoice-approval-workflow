@@ -11,10 +11,11 @@ from typing import Any
 from dapr.ext.fastapi import DaprApp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
+from services.intake.dapr_state_repository import DaprStateInvoiceRepository
 from services.intake.decision_publisher import DaprDecisionPublisher, DecisionPublisher
 from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
-from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
+from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
 from shared.contracts.models import Decision, Invoice
 
@@ -25,7 +26,7 @@ def create_app(
 ) -> FastAPI:
     configure_logging()
     intake_service = build_intake_service(
-        repository or InMemoryInvoiceRepository(),
+        repository or DaprStateInvoiceRepository(),
         publisher or DaprDecisionPublisher(),
     )
 

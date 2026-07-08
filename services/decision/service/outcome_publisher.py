@@ -10,12 +10,13 @@ content-based routing on their own subscription, without Decision changing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 import grpc
-from dapr.aio.clients import DaprClient
 
 from shared.contracts.models import Decision
+from shared.dapr_client import LazyDaprClient
 
 _TOPIC = "decision.completed"
 
@@ -40,17 +41,21 @@ class _DaprPublishClient(Protocol):
 class DaprDecisionOutcomePublisher:
     """Lazy client construction, same reasoning as DaprDecisionPublisher: a
     real DaprClient() blocks for up to 60s retrying a sidecar health check
-    if none is reachable - confirmed empirically. Built once, on first
-    publish() call, and reused after that."""
+    if none is reachable - confirmed empirically. LazyDaprClient
+    (shared/dapr_client.py) builds it once, on first publish() call, and
+    reuses it after that."""
 
-    def __init__(self, *, client: _DaprPublishClient | None = None) -> None:
-        self._client: _DaprPublishClient | None = client
+    def __init__(
+        self,
+        *,
+        client: _DaprPublishClient | None = None,
+        factory: Callable[[], _DaprPublishClient] | None = None,
+    ) -> None:
+        self._dapr = LazyDaprClient[_DaprPublishClient](client, factory=factory)
 
     async def publish(self, decision: Decision) -> None:
-        if self._client is None:
-            self._client = DaprClient()
         try:
-            await self._client.publish_event(
+            await self._dapr.get().publish_event(
                 pubsub_name="pubsub",
                 topic_name=_TOPIC,
                 data=decision.model_dump_json(),

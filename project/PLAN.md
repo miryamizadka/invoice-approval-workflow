@@ -242,8 +242,10 @@ Approval      Payment
   temporary stand-in for Dapr pub/sub, not a production queue: no durability across restarts, no
   retry, no multi-worker scaling; accepted limitation for this phase)
 - [x] Persist submission state (`InvoiceRepository` Protocol + `InMemoryInvoiceRepository`, same
-  pattern as `LLMProvider`; a future `PostgresInvoiceRepository` swaps in without touching
-  `IntakeService`)
+  pattern as `LLMProvider`). **Superseded as `create_app()`'s default by `DaprStateInvoiceRepository`
+  (Phase 7 step 4, below)** - `InMemoryInvoiceRepository` kept, unchanged, still the default in
+  tests (fast, no Dapr needed). A future `PostgresInvoiceRepository` swaps in the same way, without
+  touching `IntakeService`.
 - [x] Add status endpoint (`GET /invoices/{tracking_id}`, returns a slim `SubmissionStatusResponse`
   - deliberately not the internal `Submission` record, to avoid leaking the dedup key or raw
   internal error text to an external caller)
@@ -340,8 +342,10 @@ Make the complete system runnable.
   publishes the result to `decision.completed` via `DecisionOutcomePublisher`; Intake subscribes
   and calls `IntakeService.complete()`. Verified end to end over the real Docker network, not just
   `TestClient` - see "Verification (Dapr pub/sub, step 3)" below.
-- [ ] Configure Dapr state - wiring idempotency/dedup and HITL pause-resume to the `statestore`
-  component is a separate, future step (infra is ready for it)
+- [x] Configure Dapr state (idempotency/dedup) - `DaprStateInvoiceRepository` replaces
+  `InMemoryInvoiceRepository` as Intake's default `InvoiceRepository`, backed by the `statestore`
+  component. See "Verification (Dapr state, step 4)" below. HITL pause-resume is still a separate
+  future step (Approval Service doesn't exist yet).
 - [ ] Configure Dapr secrets
 
 ## Verification (done)
@@ -477,6 +481,62 @@ service docstrings: no Transactional Outbox (state-write and publish aren't atom
 retry/dead-letter policy configured yet, `InMemoryInvoiceRepository` doesn't survive an Intake
 restart (an in-flight `decision.completed` would then arrive for an unknown `tracking_id` -
 `IntakeService.complete()` handles that by design: logs a warning, doesn't crash).
+
+## Verification (Dapr state, step 4)
+
+Design decisions made and verified for real, not just described:
+- **`execute_state_transaction` confirmed present in the installed SDK, not just "per docs"** -
+  read the actual installed `dapr==1.18.1` source directly: `dapr.aio.clients.DaprClient.execute_state_transaction`
+  exists and takes `Sequence[TransactionalStateOperation]` (from `dapr.clients.grpc._request`,
+  default `operation_type=upsert`) - this was flagged as the plan's biggest risk and is now closed.
+- **Whole `Submission` (not just the dedup key) moved to Dapr state** - both written together in
+  one atomic transaction (`submission:{tracking_id}` + `dedup:{dedup_key}` -> tracking_id). Storing
+  only the dedup pointer while the full record stayed in-memory would have meant the pointer could
+  survive an Intake restart while the record it points to did not - worse than today's fully
+  in-memory approach, not better.
+- **`LazyDaprClient` (`shared/dapr_client.py`)** extracted and retrofitted into
+  `DaprDecisionPublisher`/`DaprDecisionOutcomePublisher` too (not just used for the new
+  repository) - this was the third near-identical "build a Dapr client lazily" implementation,
+  exactly the point earlier phases predicted would justify extraction. Takes a `factory:` callable
+  (not hardcoded to `DaprClient`), enabling a deterministic laziness test (assert the factory was
+  never called just from construction) instead of the earlier wall-clock-timing tests - all three
+  laziness tests (publisher, outcome publisher, repository) now use this same mechanism.
+- **Corrupted-state invariant decided explicitly**: if a dedup pointer exists but its Submission
+  record doesn't (should be structurally impossible given the atomic transaction, but not assumed
+  safe) - `find_by_dedup_key()` raises `InvoiceRepositoryError`, never returns `None` silently
+  (silent `None` here would incorrectly mean "not a duplicate").
+- **The write-time race (two near-simultaneous submits of the same invoice) is documented, not
+  fixed** - it's not a "missing database" problem in general, it's specifically that Dapr state
+  (Redis) has no native "insert only if absent" the way a PostgreSQL unique constraint does. Fix
+  is deferred to the PostgreSQL migration, not an extension of Dapr state.
+
+Ran for real:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - 171 tests total, ruff, and mypy
+  all pass.
+- `docker compose up --build -d` - all 7 containers healthy.
+- Submitted a real invoice; `GET /invoices/{id}` returned `completed` via the Dapr-state-backed
+  repository (not `InMemoryInvoiceRepository`).
+- **The restart-survival test, strengthened per review to prove both halves of the state, not just
+  one:**
+  1. `docker compose restart intake` (single service) - **broke `intake-dapr`'s networking**:
+     its logs showed repeated `dial tcp: lookup redis on 127.0.0.11:53: ... connection refused`.
+     Root cause: `intake-dapr` uses `network_mode: "service:intake"`, borrowing `intake`'s network
+     namespace (including its embedded DNS resolver) - restarting only `intake` disrupts that
+     borrowed namespace out from under the sidecar, which was never itself restarted.
+  2. Tried `docker compose restart intake intake-dapr` (both, simultaneously) - **`intake-dapr`
+     crashed** (`Exited (1)`, fatal: "could not determine host IP address"): `restart` doesn't
+     consult `depends_on`, so the sidecar can start before `intake`'s namespace is ready again.
+  3. **`docker compose up -d --force-recreate intake intake-dapr`** - recreation (not restart)
+     respects `depends_on` ordering - both came back healthy.
+  4. `GET /invoices/{id}` for the original submission - **returned the full record correctly**,
+     survived the recreation.
+  5. Resubmitted the identical vendor/invoiceNumber/total - **completed immediately with
+     `route: duplicate`, `is_duplicate: true`** - proves the dedup pointer survived too, not just
+     the primary record. `decision`'s logs showed no new event for it (short-circuit still works).
+  - **New operational finding, worth remembering**: for this `network_mode: service:X` sidecar
+    layout, `docker compose restart <app>` is unsafe - always use
+    `docker compose up -d --force-recreate <app> <app>-dapr` (or restart neither in isolation) to
+    reliably bring the pair back after a code/config change.
 
 ---
 
