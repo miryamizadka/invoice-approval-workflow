@@ -156,9 +156,16 @@ Priority: MUST HAVE
 
 Priority: MUST HAVE
 
-- [ ] Router enforces ceiling
-- [ ] Agent cannot bypass router
-- [ ] Forced approve recommendation above limit fails
+- [x] Router enforces ceiling (`services/decision/router/router.py` gate 4 -
+  `invoice.total > thresholds.ceiling` runs unconditionally, before the agent-signal gate)
+- [x] Agent cannot bypass router (`tests/unit/decision/test_router.py:66`
+  `test_m12_ceiling_survives_optimistic_agent`, `:81`
+  `test_m12_no_fixture_can_be_forced_to_auto_approve` - forced APPROVE/1.0-confidence
+  recommendation still yields `human_review`; `tests/integration/test_decision_service.py:166`
+  proves the same through real HTTP)
+- [x] Forced approve recommendation above limit fails (same tests as above, plus proven live
+  against the real, non-mocked Groq LLM by `scripts/verify_phase8.py`'s anti-cheese journey -
+  INV-1013, over-ceiling + prompt-injection `notes`, route asserted `human_review`)
 
 
 ---
