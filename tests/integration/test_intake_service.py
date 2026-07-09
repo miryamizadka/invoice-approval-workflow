@@ -18,7 +18,15 @@ from services.intake.app import create_app
 from services.intake.decision_completed_publisher import DecisionCompletedPublisher
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
-from shared.contracts.models import Decision, DecisionCompletedEvent, Invoice, Route
+from shared.contracts.models import (
+    Decision,
+    DecisionCompletedEvent,
+    Invoice,
+    Recommendation,
+    RecommendationType,
+    Route,
+)
+from tests.support.decision_fixtures import clean_invoice
 
 
 class _StubPublisher:
@@ -81,9 +89,23 @@ def _invoice_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
-def _post_decision_completed(client: TestClient, decision: Decision) -> Any:
+def _post_decision_completed(
+    client: TestClient,
+    decision: Decision,
+    *,
+    invoice: Invoice | None = None,
+    recommendation: Recommendation | None = None,
+) -> Any:
+    """Builds the real decision.completed payload shape - a DecisionCompletedEvent
+    (invoice + decision + recommendation), matching what Decision Service actually
+    publishes in production, not a bare Decision. Deliberately built via the shared
+    Pydantic model, not a hand-rolled dict, so any future drift between this and the
+    real contract fails the test instead of hiding behind a synthetic payload."""
+    event = DecisionCompletedEvent(
+        invoice=invoice or clean_invoice(), decision=decision, recommendation=recommendation
+    )
     return client.post(
-        "/events/decision-completed", json={"data": decision.model_dump(mode="json")}
+        "/events/decision-completed", json={"data": event.model_dump(mode="json")}
     )
 
 
@@ -131,6 +153,32 @@ def test_decision_completed_event_completes_the_submission() -> None:
     body = status.json()
     assert body["status"] == "completed"
     assert body["decision"]["route"] == Route.AUTO_APPROVE.value
+
+
+def test_decision_completed_event_with_recommendation_is_parsed_correctly() -> None:
+    """Regression test for a real bug found live in docker compose: Decision
+    Service publishes the enriched DecisionCompletedEvent (invoice + decision +
+    recommendation), not a bare Decision - the handler previously crashed with a
+    pydantic ValidationError on this exact shape (a `recommendation` field is
+    what triggered extra_forbidden). event.recommendation is parsed here but
+    intentionally unused by Intake's business logic - it's forwarded only
+    because it's part of the shared contract with Approval/Notification."""
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+    decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
+    recommendation = Recommendation(
+        recommendation=RecommendationType.APPROVE,
+        confidence=0.9,
+        cited_rules=[],
+        reasoning="stub: optimistic non-adversarial recommendation",
+    )
+
+    event_response = _post_decision_completed(client, decision, recommendation=recommendation)
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert event_response.status_code == 200
+    assert status.json()["status"] == "completed"
 
 
 # --- (d) duplicate short-circuits: no invoice.submitted, immediately completed,

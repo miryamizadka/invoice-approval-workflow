@@ -21,7 +21,7 @@ from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
 from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
-from shared.contracts.models import Decision, Invoice
+from shared.contracts.models import DecisionCompletedEvent, Invoice
 
 
 def create_app(
@@ -69,10 +69,15 @@ def create_app(
         # dapr-ext-fastapi's subscribe only registers the route (confirmed by
         # reading its source) - it does not unwrap the CloudEvents envelope,
         # so the actual payload is read from the "data" field ourselves.
+        # Decision publishes the enriched DecisionCompletedEvent (invoice +
+        # decision + recommendation), not a bare Decision - recommendation is
+        # parsed here but intentionally unused by Intake's own logic, only
+        # forwarded because it's part of the shared contract with Approval/
+        # Notification (same shape services/notification/app.py parses).
         body: dict[str, Any] = await request.json()
-        decision = Decision.model_validate(body["data"])
+        event = DecisionCompletedEvent.model_validate(body["data"])
         service: IntakeService = request.app.state.intake_service
-        await service.complete(decision.correlation_id, decision)
+        await service.complete(event.decision.correlation_id, event.decision)
         return {"status": "SUCCESS"}
 
     return app
