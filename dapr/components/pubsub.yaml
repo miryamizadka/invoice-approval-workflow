@@ -16,3 +16,4 @@ scopes:
   - approval
   - payment
   - notification
+  - audit

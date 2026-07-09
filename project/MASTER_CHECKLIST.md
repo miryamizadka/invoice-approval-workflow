@@ -141,13 +141,29 @@ Priority: NICE TO HAVE
 
 Priority: MUST HAVE
 
-- [ ] Correlation id exists
-- [ ] Invoice extraction stored
-- [ ] Rules applied stored
-- [ ] Agent recommendation stored
-- [ ] Final decision stored
-- [x] Payment outcome stored (`PaymentRecord` - status, reason, reserved_amount - persisted via
-  `DaprStatePaymentRepository`, keyed by `tracking_id`; `GET /payments/{tracking_id}`)
+- [x] Correlation id exists (`audit_trail.tracking_id`, primary key - `services/audit/models.py`)
+- [x] Invoice extraction stored (`invoice_json` + flattened columns - `services/audit/repository.py`)
+- [x] Rules applied stored (`triggered_rules`, from `Decision.triggered_rules`)
+- [x] Agent recommendation stored (`recommendation_*` columns - now populated for **every** route the
+  agent ran for, including `auto_approve`/`reject`, not just `human_review` - closes a real gap:
+  before this phase, `recommendation` was persisted only by Approval's `PendingApproval`, and only
+  for `human_review` items; verified live against a real `auto_approve` invoice, INV-1001)
+- [x] Final decision stored (`route`/`decision_reason`)
+- [x] Payment outcome stored (`payment_resolution`/`payment_reason` in `audit_trail`, in addition to
+  `PaymentRecord` - status, reason, reserved_amount - persisted via `DaprStatePaymentRepository`,
+  keyed by `tracking_id`; `GET /payments/{tracking_id}`)
+
+Implemented by a new **Audit service** (F9, ADR-008): a pure, observational consumer of the existing
+`decision.completed`/`approval.completed`/`payment.completed` events, projecting each into one row
+per `tracking_id` in a new PostgreSQL `audit_trail` table - the first real consumer of the
+previously-unused `postgres` container. `GET /audit/{tracking_id}` exposes the full trail, routed
+through the M6 gateway like every other service. Verified live via `docker compose up --build`:
+all four invoice journeys (auto_approve/INV-1001, human_review/INV-1003, payment-failure/INV-1012,
+duplicate) produce a correct, complete trail; `psql`-level `GROUP BY route` aggregation confirmed
+working directly against real SQL; Audit stopped mid-flow does not block Approval/Payment/
+Notification from completing, and backfills automatically once restarted (Dapr redis-streams
+redelivery) - no data lost. See `docs/adr/ADR-008-Audit-Trail-Direct-Postgres-Access.md` and
+`project/PLAN.md`'s Phase 9.
 
 
 ---
@@ -215,8 +231,8 @@ Priority: MUST HAVE
 - [x] docker compose up starts system (verified: `docker compose up --build`, all 4 containers
   came up healthy; `scripts/smoke_test_compose.py` proved Intake -> Decision over the Docker
   network end to end)
-- [x] Databases included (`postgres:16-alpine`, running, not yet consumed by a service - reserved
-  for Dapr state, a later phase)
+- [x] Databases included (`postgres:16-alpine`, running - consumed directly by the Audit service's
+  `audit_trail` table since F9, see ADR-008)
 - [x] Queues included (`redis:7-alpine`, running, not yet consumed - reserved for Dapr pub/sub)
 - [x] Infrastructure included (both above run unconditionally in the main compose file, not
   behind `profiles:`, per M4's literal "including queues, databases, and supporting
@@ -251,8 +267,8 @@ secrets remain unused.
 
 - [x] Single external entry point (Traefik, `traefik/dynamic.yml` file provider - see ADR-007
   for why not the Docker provider; PLAN.md Phase 8.5 for full verification. Intake, Approval,
-  Payment, Notification all lose their direct host port, reachable only via `localhost:8080`;
-  Decision has neither a port nor a gateway route at all, pure choreography)
+  Payment, Notification, and Audit (added in F9) all lose their direct host port, reachable only
+  via `localhost:8080`; Decision has neither a port nor a gateway route at all, pure choreography)
 - [x] Rate limiting implemented (shared per-client-IP middleware, `average=10`/`burst=50` -
   proven live with genuine concurrent load [183/300 requests hit 429], and proven **not** to
   false-positive against real usage [`verify_phase8.py`'s full run through the gateway

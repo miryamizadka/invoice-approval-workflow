@@ -50,8 +50,9 @@ def approval_completed_event(
     *,
     correlation_id: str = "corr-1",
     invoice: Invoice | None = None,
+    decision: Decision | None = None,
 ) -> ApprovalCompletedEvent:
-    decision = Decision(
+    decision = decision or Decision(
         route=Route.HUMAN_REVIEW,
         reason="test reason",
         triggered_rules=[],
@@ -68,8 +69,9 @@ def payment_completed_event(
     correlation_id: str = "corr-1",
     invoice: Invoice | None = None,
     reason: str = "test reason",
+    decision: Decision | None = None,
 ) -> PaymentCompletedEvent:
-    decision = Decision(
+    decision = decision or Decision(
         route=Route.AUTO_APPROVE,
         reason="test reason",
         triggered_rules=[],

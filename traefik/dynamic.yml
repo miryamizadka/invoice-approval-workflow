@@ -51,6 +51,11 @@ http:
       entryPoints: ["web"]
       service: notification
       middlewares: ["ratelimit"]
+    audit:
+      rule: "PathPrefix(`/audit`)"
+      entryPoints: ["web"]
+      service: audit
+      middlewares: ["ratelimit"]
     # Decision has no router here, deliberately: pure choreography, nothing
     # external ever calls it over HTTP - see ARCHITECTURE.md §7/§4.
 
@@ -71,3 +76,7 @@ http:
       loadBalancer:
         servers:
           - url: "http://notification:8004"
+    audit:
+      loadBalancer:
+        servers:
+          - url: "http://audit:8005"
