@@ -6,6 +6,7 @@ Uses InMemoryNotificationRepository and FakeNotificationChannel - no Dapr.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -192,6 +193,85 @@ async def test_redelivery_after_failed_send_succeeds_and_marks_notified() -> Non
 
     assert await repository.already_notified("corr-1") is True
     assert len(channel.sent) == 1
+
+
+class _MarkNotifiedFailsOnceRepository:
+    """Local test double proving the other half of the documented
+    already_notified/send/mark_notified race: send() succeeds but
+    mark_notified() fails to persist. A plain RuntimeError, not
+    NotificationRepositoryError (services/notification/dapr_state_repository.py)
+    - this file is deliberately Dapr-free, and _notify() propagates whatever
+    mark_notified() raises uncaught regardless of type."""
+
+    def __init__(self) -> None:
+        self._notified: set[str] = set()
+        self._fail_next = True
+
+    async def already_notified(self, tracking_id: str) -> bool:
+        return tracking_id in self._notified
+
+    async def mark_notified(self, tracking_id: str) -> None:
+        if self._fail_next:
+            self._fail_next = False
+            raise RuntimeError("simulated mark_notified failure")
+        self._notified.add(tracking_id)
+
+
+async def test_mark_notified_failure_causes_resend_on_redelivery() -> None:
+    """Covers the other branch of the race documented in service.py's
+    docstring: send() already succeeded but the mark never persisted - a
+    redelivery must resend (a safe, harmless duplicate), not silently skip
+    because already_notified is still False."""
+    repository = _MarkNotifiedFailsOnceRepository()
+    channel = FakeNotificationChannel()
+    service = build_notification_service(repository, channel)
+    event = _payment_completed_event(PaymentResolution.COMPLETED)
+
+    with pytest.raises(RuntimeError):
+        await service.handle_payment_completed(event)
+    assert len(channel.sent) == 1  # send() already happened before the mark failed
+    assert await repository.already_notified("corr-1") is False
+
+    await service.handle_payment_completed(event)  # redelivery
+
+    assert await repository.already_notified("corr-1") is True
+    assert len(channel.sent) == 2  # harmless duplicate - documented, expected
+
+
+# --- logging: event_source must be embedded in the message text ------------
+
+
+async def test_notification_sent_log_includes_event_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression-guard for the JsonFormatter Finding (extra= silently drops
+    every key except correlation_id) - source must be embedded in the
+    message text itself to be visible in production JSON logs."""
+    service, _, _ = _service()
+    event = _payment_completed_event(PaymentResolution.COMPLETED)
+
+    with caplog.at_level(logging.INFO, logger="services.notification.service"):
+        await service.handle_payment_completed(event)
+
+    sent_record = next(r for r in caplog.records if r.getMessage().startswith("notification_sent"))
+    assert "source=payment.completed" in sent_record.getMessage()
+
+
+async def test_notification_already_sent_skipping_log_includes_event_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _, _ = _service()
+    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    await service.handle_payment_completed(event)
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="services.notification.service"):
+        await service.handle_payment_completed(event)  # redelivery, already notified
+
+    skip_record = next(
+        r for r in caplog.records if r.getMessage().startswith("notification_already_sent_skipping")
+    )
+    assert "source=payment.completed" in skip_record.getMessage()
 
 
 # --- read API ---------------------------------------------------------------

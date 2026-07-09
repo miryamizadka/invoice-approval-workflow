@@ -113,12 +113,15 @@ class NotificationService:
     ) -> None:
         if await self._repository.already_notified(tracking_id):
             self._logger.info(
-                "notification_already_sent_skipping", extra={"correlation_id": tracking_id}
+                f"notification_already_sent_skipping source={source}",
+                extra={"correlation_id": tracking_id},
             )
             return
         await self._channel.send(invoice, tracking_id, message, source=source)
         await self._repository.mark_notified(tracking_id)
-        self._logger.info("notification_sent", extra={"correlation_id": tracking_id})
+        self._logger.info(
+            f"notification_sent source={source}", extra={"correlation_id": tracking_id}
+        )
 
     async def already_notified(self, tracking_id: str) -> bool:
         """Backs the debug GET /notifications/{tracking_id} endpoint."""
