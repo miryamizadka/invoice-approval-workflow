@@ -89,10 +89,15 @@ async def _service(
 # --- route/resolution filtering -------------------------------------------
 
 
-async def test_handle_decision_completed_ignores_non_auto_approve_routes() -> None:
+@pytest.mark.parametrize("route", [Route.HUMAN_REVIEW, Route.REJECT, Route.DUPLICATE])
+async def test_handle_decision_completed_ignores_non_auto_approve_routes(route: Route) -> None:
+    """Explicitly covers Route.DUPLICATE (F3): a duplicate invoice must never
+    reach payment, now that Intake publishes decision.completed directly for
+    known duplicates (previously this route only reached Payment via a
+    synthetic test event, never a real one)."""
     service, repository, _, _, gateway = await _service()
 
-    await service.handle_decision_completed(_decision_completed_event(route=Route.HUMAN_REVIEW))
+    await service.handle_decision_completed(_decision_completed_event(route=route))
 
     assert await repository.list_all() == []
     assert gateway.charged == []

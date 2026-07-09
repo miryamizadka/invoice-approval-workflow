@@ -15,9 +15,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from services.intake.app import create_app
+from services.intake.decision_completed_publisher import DecisionCompletedPublisher
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
-from shared.contracts.models import Decision, Invoice, Route
+from shared.contracts.models import Decision, DecisionCompletedEvent, Invoice, Route
 
 
 class _StubPublisher:
@@ -31,6 +32,14 @@ class _StubPublisher:
             raise self._error
 
 
+class _StubDecisionCompletedPublisher:
+    def __init__(self) -> None:
+        self.calls: list[DecisionCompletedEvent] = []
+
+    async def publish(self, event: DecisionCompletedEvent) -> None:
+        self.calls.append(event)
+
+
 def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") -> Decision:
     return Decision(
         route=route, reason="stub decision", triggered_rules=[], correlation_id=correlation_id
@@ -38,9 +47,16 @@ def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") ->
 
 
 def _build_app(
-    publisher: DecisionPublisher, repository: InvoiceRepository | None = None
+    publisher: DecisionPublisher,
+    repository: InvoiceRepository | None = None,
+    decision_completed_publisher: DecisionCompletedPublisher | None = None,
 ) -> FastAPI:
-    return create_app(repository=repository or InMemoryInvoiceRepository(), publisher=publisher)
+    return create_app(
+        repository=repository or InMemoryInvoiceRepository(),
+        publisher=publisher,
+        decision_completed_publisher=decision_completed_publisher
+        or _StubDecisionCompletedPublisher(),
+    )
 
 
 def _invoice_body(**overrides: Any) -> dict[str, Any]:
@@ -117,12 +133,14 @@ def test_decision_completed_event_completes_the_submission() -> None:
     assert body["decision"]["route"] == Route.AUTO_APPROVE.value
 
 
-# --- (d) duplicate short-circuits: no publish, immediately completed ----------
+# --- (d) duplicate short-circuits: no invoice.submitted, immediately completed,
+#         publishes decision.completed directly instead --------------------------
 
 
-def test_duplicate_submission_short_circuits_without_publishing() -> None:
+def test_duplicate_submission_completes_immediately_and_publishes_decision_completed() -> None:
     publisher = _StubPublisher()
-    app = _build_app(publisher)
+    decision_completed_publisher = _StubDecisionCompletedPublisher()
+    app = _build_app(publisher, decision_completed_publisher=decision_completed_publisher)
     client = TestClient(app)
     body = _invoice_body()
 
@@ -133,6 +151,9 @@ def test_duplicate_submission_short_circuits_without_publishing() -> None:
     status = client.get(f"/invoices/{second_tracking_id}")
     assert status.json()["status"] == "completed"
     assert status.json()["decision"]["route"] == Route.DUPLICATE.value
+    assert len(decision_completed_publisher.calls) == 1
+    assert decision_completed_publisher.calls[0].decision.route == Route.DUPLICATE
+    assert decision_completed_publisher.calls[0].decision.correlation_id == second_tracking_id
 
 
 # --- (e) invalid invoice -> 422 -----------------------------------------------

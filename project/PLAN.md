@@ -564,6 +564,23 @@ Also required and added, beyond the literal task list:
   `GET /payments/{id}`), documented explicitly as an ops/debug endpoint (not part of the
   public API contract) and as "not guaranteed to be retained forever" (so a future
   TTL/deletion policy on the underlying Dapr key stays semantically correct).
+- **A real, pre-existing gap found during live verification, fixed as part of this phase**:
+  submitting INV-1007 (duplicate) live produced **no** notification at all -
+  `GET /notifications/{tracking_id}` returned `{"notified": false}`. Root-caused (not
+  guessed) by reading `IntakeService.process()`: a known duplicate is short-circuited
+  before `invoice.submitted` is ever published, so Decision never sees it and
+  `decision.completed` never fires - a gap that predates this phase, just never exposed
+  because nothing consumed `decision.completed` for a route Decision never emits. Fixed by
+  having Intake publish `decision.completed` itself for this one case (new
+  `services/intake/decision_completed_publisher.py`, mirroring
+  `services/decision/service/outcome_publisher.py` exactly), guarded by the same
+  idempotency check Intake already uses elsewhere (`status == COMPLETED` before
+  publishing). Two things proven explicitly, not assumed: (1) Payment still ignores
+  `route == duplicate` - `test_handle_decision_completed_ignores_non_auto_approve_routes`
+  parametrized over `{HUMAN_REVIEW, REJECT, DUPLICATE}` (F3 preserved); (2) Intake's own
+  subscription to `decision.completed` receiving its own published event back
+  (self-loopback, since Intake publishes to the same topic it consumes) is a safe no-op -
+  `test_complete_is_idempotent_when_intakes_own_published_event_loops_back`.
 
 ## Verification (Notification Service, Phase 6.5)
 
@@ -578,9 +595,8 @@ Ran for real, not just described:
 - **INV-1012** (payment failure + compensation): re-verified, confirming exactly one
   notification fires from `payment.completed` [resolution=failed], with the simulated
   gateway decline reason visible in the log message text.
-- **INV-1007** (duplicate): newly verified - submitting it a second time (after INV-1001)
-  produces a `decision.completed` [route=duplicate] event; confirmed exactly one
-  notification, with the duplicate-detection reason text visible.
+- **INV-1007** (duplicate): **initially failed live** - see the gap documented above.
+  Re-verification after the Intake fix is tracked separately below.
 - **INV-1015** (reject, alcohol-only): newly verified - a `decision.completed`
   [route=reject] event produces exactly one notification, with the MEAL-03 reason text
   visible.
@@ -589,6 +605,20 @@ Ran for real, not just described:
   `notification_delivered` log line, and `GET /notifications/{tracking_id}` is unchanged.
 - Full local suite re-run after the live run, confirming no regression in the other 4
   services.
+
+## Verification (Intake duplicate-publish fix)
+
+- Full TDD cycle on `tests/unit/intake/test_service.py` and
+  `tests/integration/test_intake_service.py` (RED confirmed before GREEN) - existing tests
+  renamed for clarity where they now describe `invoice.submitted`-specific behavior
+  (`test_process_does_not_publish_invoice_submitted_for_known_duplicate`), new tests added
+  for the new publisher, the double-publish idempotency guard, the self-loopback
+  no-op, and publish-failure handling (logs, does not revert `COMPLETED` to `FAILED`).
+  `tests/unit/payment/test_service.py`'s route-filter test parametrized over
+  `{HUMAN_REVIEW, REJECT, DUPLICATE}` to prove F3 explicitly.
+- `python -m pytest`, `ruff check .`, `mypy .` - all pass (see full-suite verification below).
+- Live `docker compose` re-verification of INV-1007 with the fix in place: pending (tracked
+  in the todo list for this session - to be filled in once run).
 
 ---
 

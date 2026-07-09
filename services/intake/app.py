@@ -12,6 +12,10 @@ from dapr.ext.fastapi import DaprApp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
 from services.intake.dapr_state_repository import DaprStateInvoiceRepository
+from services.intake.decision_completed_publisher import (
+    DaprDecisionCompletedPublisher,
+    DecisionCompletedPublisher,
+)
 from services.intake.decision_publisher import DaprDecisionPublisher, DecisionPublisher
 from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
@@ -23,11 +27,13 @@ from shared.contracts.models import Decision, Invoice
 def create_app(
     repository: InvoiceRepository | None = None,
     publisher: DecisionPublisher | None = None,
+    decision_completed_publisher: DecisionCompletedPublisher | None = None,
 ) -> FastAPI:
     configure_logging()
     intake_service = build_intake_service(
         repository or DaprStateInvoiceRepository(),
         publisher or DaprDecisionPublisher(),
+        decision_completed_publisher or DaprDecisionCompletedPublisher(),
     )
 
     app = FastAPI(title="ApprovalFlow Intake Service")
