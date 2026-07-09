@@ -50,17 +50,27 @@ The priority is:
   (durable pause/resume) - see Phase 5 below
 - [x] Payment Service (Phase 6) - M9 (Saga + Compensation), M10 (Idempotency), INV-1012 (payment
   failure + compensation), INV-1014A/B (budget concurrency) - see Phase 6 below
+- [x] Notification Service (Phase 6.5) - M8 (push notification), M10 (idempotency) - pure,
+  terminal consumer of `decision.completed`/`approval.completed`/`payment.completed`, see
+  Phase 6.5 below
+- [x] Intake decision.completed fixes (predate/support Phase 6.5, see the two sections above
+  Phase 6.5 below) - Intake now publishes `decision.completed` directly for known duplicates
+  (closing a real gap where Notification could never react to one), and Intake's own
+  subscription to that topic now correctly parses the enriched `DecisionCompletedEvent`
+  (fixing a real, pre-existing bug where `GET /invoices/{id}` stayed stuck on `"processing"`
+  forever for every invoice routed through Decision)
 
 ## Current Focus
 
-Phase 1-6, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete and
-verified. Remaining before Phase 3 is fully "production-ready": run
+Phase 1-6.5, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete
+and verified, including both Intake `decision.completed` fixes found during Notification's live
+verification (duplicate-publish gap and the enriched-event parsing bug - see the two sections
+just above Phase 6.5). Remaining before Phase 3 is fully "production-ready": run
 `scripts/smoke_test_groq_strict.py` manually against the real Groq API from a network that isn't
 behind an SSL-intercepting proxy (confirmed blocked both on the host and inside Docker containers -
-environmental, not a code issue). Next: Notification Service (pure consumer of `payment.completed`,
-notifies the submitter - F2/M8) and the API Gateway/UI (M6/M7), then Phase 8's full verification
-suite tying all four required journeys (INV-1001, INV-1003, INV-1007, INV-1012) plus INV-1014
-together into one command.
+environmental, not a code issue). Next: the API Gateway/UI (M6/M7), then Phase 8's full
+verification suite tying all four required journeys (INV-1001, INV-1003, INV-1007, INV-1012) plus
+INV-1014 together into one command.
 
 ---
 
@@ -477,6 +487,247 @@ Ran for real, not just described:
   `budget_reserved`+`payment_completed` pair occurred per iteration, the loser always
   `payment_rejected_insufficient_budget` - never both succeeding, never a negative balance, across
   every iteration.
+
+---
+
+# Bugfix — Intake's decision.completed parsing (predates Phase 6.5)
+
+## Root cause
+
+Found live, not guessed, while verifying the Intake duplicate-publish fix above: submitting
+a fresh (non-duplicate) invoice, Decision correctly auto-approved it and published
+`decision.completed`, but Intake's own subscription handler
+(`services/intake/app.py::handle_decision_completed`) crashed with a `pydantic.ValidationError`.
+Timeline (`git log -p`): the handler's `Decision.model_validate(body["data"])` was written in
+commit `e4aed1e` (M5, Intake↔Decision pub/sub) expecting a bare `Decision`. Commit `7e7dfeb`
+("Add Approval Service... with decision.completed enrichment") later changed Decision's real
+publish format to the enriched `DecisionCompletedEvent` (invoice + decision + recommendation),
+since Approval needs all three for F4 - but Intake's own consumer of that same topic was never
+updated to match. Approval/Payment/Notification's handlers were all written against (or
+updated to) the enriched shape correctly; only Intake's was left behind.
+
+## Impact
+
+`GET /invoices/{tracking_id}` stayed stuck on `"processing"` forever for any invoice that goes
+through Decision for real (auto_approve/reject/human_review) - Dapr redelivers the failed
+event indefinitely, always hitting the same crash. The actual business flow (payment,
+approval, notification) was unaffected - each of those services has its own separate Dapr
+subscription with correct parsing, so this was purely Intake's own status-tracking silently
+lying, not a break in any F/M requirement. Went unnoticed because the existing integration
+test's simulated payload (`_post_decision_completed`) sent a bare `Decision`, not the real
+enriched shape Decision actually publishes - a gap between what was tested and what production
+actually sends.
+
+## Fix
+
+`services/intake/app.py::handle_decision_completed` now parses `DecisionCompletedEvent.model_validate(body["data"])`
+(identical to `services/notification/app.py`'s already-correct handler) and calls
+`service.complete(event.decision.correlation_id, event.decision)`. `IntakeService.complete()`
+itself is unchanged - it always took a bare `Decision` correctly; only the transport-layer
+parsing needed fixing. Deliberately no backward-compatibility parsing for the old bare-`Decision`
+shape and no new try/except around the parse call - see the plan file's reasoning: no
+replica-set/rolling-deploy in this docker-compose setup makes the old shape unreachable in
+practice, and every other subscription handler in this project already lets parse failures
+propagate uncaught (loud 500 + traceback, Dapr retries) rather than swallowing them quietly -
+consistency with that established, deliberate pattern over defensive coding for a scenario
+that can't happen.
+
+## Tests
+
+`tests/integration/test_intake_service.py`'s `_post_decision_completed()` rebuilt to construct
+the real `DecisionCompletedEvent` via the shared Pydantic model (not a hand-rolled dict) -
+a contract regression test by construction: any future drift between the real event shape and
+what's tested fails automatically. New test
+`test_decision_completed_event_with_recommendation_is_parsed_correctly` reproduces the exact
+crashing payload shape (a non-`None` `recommendation`, the field that triggered
+`extra_forbidden`). RED confirmed first: ran the updated tests before touching `app.py` and saw
+the identical `ValidationError` seen live, proving the test genuinely catches the bug.
+
+## Lessons learned
+
+Event schema changes must update every subscriber **and its integration tests** together, not
+just the subscribers exercised by the phase making the change. **TODO, not implemented now**:
+consider a shared `tests/support/` fixture for building
+`DecisionCompletedEvent`/`ApprovalCompletedEvent`/`PaymentCompletedEvent` test payloads -
+today each service's test file (`test_service.py` in Payment, Notification, and now Intake)
+builds its own local, ad-hoc helper, which is exactly the kind of duplication that let this
+particular drift go unnoticed.
+
+## Verification (live, docker compose)
+
+Ran for real, not just described - required a full rebuild of `intake` (shares a Dockerfile
+with `decision`, so both got recreated). **Lesson from this session's own experience**:
+`docker compose up --build -d intake` alone left `intake-dapr`'s network namespace pointing
+at the old (pre-rebuild) container, breaking its Redis DNS resolution (`lookup redis` errors)
+- fixed with `docker compose up -d --force-recreate intake-dapr decision-dapr` immediately
+after; `restart` is not sufficient, only `--force-recreate` reattaches the sidecar to the
+current container.
+- **Non-duplicate, auto-approve** (fresh invoice): `GET /invoices/{id}` reached
+  `"status": "completed"` (previously stuck forever on `"processing"`) - direct proof the
+  parsing bug is fixed.
+- **INV-1007-equivalent (fresh duplicate pair)**: Notification received the push
+  (`{"notified": true}`, log shows `source=decision.completed`); confirmed Payment's logs
+  show zero activity for the duplicate's tracking_id (F3 preserved live, not just unit-tested).
+- **INV-1003** (escalate -> approve -> pay): full journey re-run end-to-end; Payment reached
+  `"status": "completed"`, Notification `{"notified": true}`, and - the actual regression
+  target - Intake's own `GET /invoices/{id}` correctly reached `"completed"` instead of
+  staying stuck.
+- **INV-1012** (escalate -> approve -> simulated payment decline -> compensation): Payment
+  reached `"status": "failed"` with the simulated decline reason, Notification
+  `{"notified": true}`, Intake `"completed"`.
+- **Redelivery idempotency**: re-POSTed the identical `payment.completed` event body to
+  Notification's subscription route a second time (simulating Dapr redelivery) - logged
+  `notification_already_sent_skipping`, confirmed only one `notification_delivered` line
+  total across both attempts.
+- Full local suite (367 tests), `ruff check .`, `mypy .` all pass after the live run.
+
+---
+
+# Phase 6.5 — Notification Service
+
+## Goal
+
+Close the last gap in the choreography chain: every terminal outcome (auto-approved +
+paid, human-approved + paid, human-rejected, payment-failed, router-rejected, duplicate)
+reaches the submitter via a push notification, not just pull (`GET /invoices/{id}`).
+
+Required scenarios: all four already-shipped fixture journeys (INV-1003, INV-1007,
+INV-1012, INV-1015) each produce exactly one notification.
+
+## Tasks
+
+- [x] Create Notification Service (`services/notification/`: `NotificationService`/
+  `build_notification_service` transport-agnostic core + thin `app.py` FastAPI wrapper,
+  same pattern as Approval/Payment). Subscribes to three topics: `decision.completed`
+  [route in {reject, duplicate}], `approval.completed` [resolution=rejected],
+  `payment.completed` [resolution in {completed, failed} - unconditional, both act], each
+  converging on a shared `_notify()` helper.
+- [x] Implement minimal idempotency guard (`NotificationRepository` Protocol +
+  `InMemoryNotificationRepository` + `DaprStateNotificationRepository`) - point
+  lookup/point write only, deliberately no append-only index (nothing needs to enumerate
+  notified tracking_ids - no `GET /notifications` listing endpoint required by any doc,
+  unlike Approval's `list_pending()`/Payment's `list_all()`). `mark_notified()` writes via
+  `execute_state_transaction` with a single `etag=None` operation, deliberately not
+  `save_state()` - exception-handling consistency, not atomicity (same reasoning already
+  established in the Payment phase: `save_state()`'s ETag-failure path is
+  `DaprInternalError`, not a `grpc.RpcError` subclass; `execute_state_transaction`'s is
+  `DaprGrpcError`, matching the `except grpc.RpcError` idiom used everywhere else).
+- [x] Implement notification channel (`NotificationChannel` Protocol, mirroring
+  `PaymentGateway` exactly; `LoggingNotificationChannel` as the real, only production
+  implementation - there is no real email/SMS/webhook backend in this project, so
+  structured logging IS production here, the same posture as Payment having no real
+  payment processor. Named "Logging", not "Simulated" [Payment's specific choice] - it
+  never manufactures a synthetic failure; logging genuinely is the delivery mechanism.
+  `FakeNotificationChannel` for tests, supports injected failures via `fail_for` and
+  `fail_first_n_calls`).
+- [x] Business/infra failure separation (mirrors Payment): `channel.send()` failures are
+  never caught inside `NotificationService` - they propagate uncaught out of the
+  subscription handler (non-2xx, Dapr redelivers later). `send()` happens BEFORE
+  `mark_notified()` - if `send()` fails, no mark is written, so redelivery retries the
+  actual send; if `send()` succeeds but the process crashes before the mark persists, a
+  redelivery sends a harmless duplicate (safer than the alternative). Proven not just by
+  a "failure doesn't corrupt state" test but by a dedicated
+  `test_redelivery_after_failed_send_succeeds_and_marks_notified` showing the retry
+  actually recovers.
+- [x] Updated `ARCHITECTURE.md` §3 (added the missing `DEC -> NOT` edge), §4 (Notification's
+  DB column + a terminal-consumer lifecycle sentence), §7 (new Decision -> Notification
+  communication row + three-topic filter explanation, mirroring the style of the two
+  consolidations already documented there), and §8 (new Notification row in the Data
+  Architecture table - previously absent, correctly implying no state; corrected the same
+  way the Payment phase corrected that table twice).
+- [x] Added `notification`/`notification-dapr` to `docker-compose.yml` (port 8004, **with**
+  a host port mapping like every other service - an earlier planning draft incorrectly
+  assumed Approval/Payment had none; verified directly against the file before writing
+  this) and `notification` to both `dapr/components/{pubsub,statestore}.yaml` scopes.
+
+Also required and added, beyond the literal task list:
+- **A known race, documented as an accepted non-goal (same category as Payment's
+  reserve/save race)**: `_notify()`'s three steps (`already_notified` -> `send` ->
+  `mark_notified`) are not atomic together - two near-simultaneous redeliveries of the
+  same event could both observe `already_notified=False` before either sends, causing a
+  duplicate (harmless) notification. Not fixed here, documented explicitly.
+- **A real finding about the JSON log formatter**: `JsonFormatter` (duplicated across
+  every service) only ever promotes `record.correlation_id` out of `extra=` - every other
+  key passed via `extra=` is silently dropped from the emitted JSON line. This is harmless
+  for the other services (their extras are decoration), but load-bearing for Notification,
+  whose entire live-verification plan depends on `docker compose logs notification`
+  showing the human-readable message. `LoggingNotificationChannel.send()` therefore
+  interpolates the tracking id, invoice id, submitter, source topic, and message directly
+  into the primary log message string (`%s`-style), not solely via `extra=`.
+- **A genuine, documented gap in `ApprovalCompletedEvent`**: `decision.reason` is the
+  *original escalation reason* (why an item went to human review), not the approver's own
+  rationale for rejecting it - `ApprovalService.reject()` never collects a separate
+  rejection reason. The notification text for that path (`"Rejected by approver: ..."`)
+  uses the best available text, not a perfect fit - documented as a TODO in
+  `services/notification/service.py` itself, not just here, so it isn't rediscovered as a
+  mystery later. Closing it would need a new `reason` parameter on `reject()`, out of
+  scope for this phase.
+- **`GET /notifications/{tracking_id}` debug/ops endpoint** - always returns `200` (never
+  `404`; "not yet notified" is a valid state, not an error, unlike Payment's
+  `GET /payments/{id}`), documented explicitly as an ops/debug endpoint (not part of the
+  public API contract) and as "not guaranteed to be retained forever" (so a future
+  TTL/deletion policy on the underlying Dapr key stays semantically correct).
+- **A real, pre-existing gap found during live verification, fixed as part of this phase**:
+  submitting INV-1007 (duplicate) live produced **no** notification at all -
+  `GET /notifications/{tracking_id}` returned `{"notified": false}`. Root-caused (not
+  guessed) by reading `IntakeService.process()`: a known duplicate is short-circuited
+  before `invoice.submitted` is ever published, so Decision never sees it and
+  `decision.completed` never fires - a gap that predates this phase, just never exposed
+  because nothing consumed `decision.completed` for a route Decision never emits. Fixed by
+  having Intake publish `decision.completed` itself for this one case (new
+  `services/intake/decision_completed_publisher.py`, mirroring
+  `services/decision/service/outcome_publisher.py` exactly), guarded by the same
+  idempotency check Intake already uses elsewhere (`status == COMPLETED` before
+  publishing). Two things proven explicitly, not assumed: (1) Payment still ignores
+  `route == duplicate` - `test_handle_decision_completed_ignores_non_auto_approve_routes`
+  parametrized over `{HUMAN_REVIEW, REJECT, DUPLICATE}` (F3 preserved); (2) Intake's own
+  subscription to `decision.completed` receiving its own published event back
+  (self-loopback, since Intake publishes to the same topic it consumes) is a safe no-op -
+  `test_complete_is_idempotent_when_intakes_own_published_event_loops_back`.
+
+## Verification (Notification Service, Phase 6.5)
+
+Ran for real, not just described:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - ruff and mypy pass.
+- `docker compose up --build -d` - all 13 containers (previous 11 + `notification` +
+  `notification-dapr`) came up healthy.
+- **INV-1003** (escalate + approve + pay): re-verified the existing journey, confirming
+  `docker compose logs notification` shows exactly one `notification_delivered` line
+  (`source=payment.completed`) once the payment saga completes, and
+  `GET http://localhost:8004/notifications/{tracking_id}` returns `{"notified": true}`.
+- **INV-1012** (payment failure + compensation): re-verified, confirming exactly one
+  notification fires from `payment.completed` [resolution=failed], with the simulated
+  gateway decline reason visible in the log message text.
+- **INV-1007** (duplicate): **initially failed live** - see the gap documented above.
+  Re-verified successfully after both the Intake duplicate-publish fix and the
+  decision.completed parsing bugfix landed (below): a fresh duplicate pair produced
+  `GET http://localhost:8004/notifications/{tracking_id}` -> `{"notified": true}`, with
+  `docker compose logs notification` showing exactly one `notification_delivered` line
+  (`source=decision.completed`, "Invoice identified as duplicate: ..."), and confirmed live
+  that Payment never touched the duplicate's tracking_id (F3).
+- **INV-1015** (reject, alcohol-only): newly verified - a `decision.completed`
+  [route=reject] event produces exactly one notification, with the MEAL-03 reason text
+  visible.
+- **Idempotency, live**: re-POSTing the identical event body a second time directly to a
+  notification subscription route (simulating Dapr redelivery) produces **no** second
+  `notification_delivered` log line, and `GET /notifications/{tracking_id}` is unchanged.
+- Full local suite re-run after the live run, confirming no regression in the other 4
+  services.
+
+## Verification (Intake duplicate-publish fix)
+
+- Full TDD cycle on `tests/unit/intake/test_service.py` and
+  `tests/integration/test_intake_service.py` (RED confirmed before GREEN) - existing tests
+  renamed for clarity where they now describe `invoice.submitted`-specific behavior
+  (`test_process_does_not_publish_invoice_submitted_for_known_duplicate`), new tests added
+  for the new publisher, the double-publish idempotency guard, the self-loopback
+  no-op, and publish-failure handling (logs, does not revert `COMPLETED` to `FAILED`).
+  `tests/unit/payment/test_service.py`'s route-filter test parametrized over
+  `{HUMAN_REVIEW, REJECT, DUPLICATE}` to prove F3 explicitly.
+- `python -m pytest`, `ruff check .`, `mypy .` - all pass (see full-suite verification below).
+- Live `docker compose` re-verification of INV-1007 with the fix in place: **done**, see
+  above - required first fixing the decision.completed parsing bugfix (below), since
+  Notification's own live check depends on Intake correctly reaching a terminal status.
 
 ---
 

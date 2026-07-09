@@ -29,7 +29,7 @@ Priority: MUST HAVE
 - [x] Processing happens asynchronously (FastAPI `BackgroundTasks` - explicitly documented as a
   temporary stand-in for Dapr pub/sub, not a durable production queue; acceptable for this phase)
 - [x] Final result delivered later (retrievable via `GET /invoices/{tracking_id}`; push-style
-  delivery awaits the Notification service)
+  delivery via Notification Service - see M8)
 
 Implementation:
 - [ ] API Gateway (not built yet - Intake currently the direct entry point)
@@ -189,7 +189,7 @@ Priority: MUST HAVE
 
 ## M3 — Microservices
 
-- [x] At least 3 services (Intake, Decision, Approval, Payment - Notification pending)
+- [x] At least 3 services (Intake, Decision, Approval, Payment, Notification)
 - [x] Each service containerized (single shared `Dockerfile`, one container per service)
 - [x] Clear service boundaries (HTTP only between Intake and Decision, no cross-service imports)
 
@@ -250,8 +250,13 @@ secrets remain unused.
 
 ## M8 — Async Processing
 
-- [ ] Submission does not block
-- [ ] Final result delivered asynchronously
+- [x] Submission does not block (`POST /invoices` returns 202 immediately; processing continues
+  in a `BackgroundTasks` job, unchanged since M5)
+- [x] Final result delivered asynchronously (Notification Service - `decision.completed`
+  [reject/duplicate], `approval.completed` [rejected], `payment.completed` [both outcomes] all
+  converge on a push notification; every terminal outcome now reaches the submitter, not just
+  pull via `GET /invoices/{id}`. Verified live for all four fixture journeys - INV-1003, INV-1007,
+  INV-1012, INV-1015 - plus redelivery idempotency)
 
 
 ## M9 — Payment Saga
@@ -285,6 +290,11 @@ secrets remain unused.
   re-reserving. Verified live via `docker compose` restart (record + budget both survived,
   `ensure_seeded()` did not reset the in-progress budget) and via two dedicated deterministic
   unit tests for the RESERVED-resume path (success and failure outcomes).
+- [x] Notification retries safe - `NotificationService._notify()` checks a Dapr-state
+  tracking_id marker before sending (no-op if already notified); `send()` runs before
+  `mark_notified()` so a failed send is safely retried. Verified live: re-POSTing an identical
+  `payment.completed` event body a second time (simulating Dapr redelivery) logged
+  `notification_already_sent_skipping` with no second `notification_delivered` line.
 
 
 ## M11 — Durable HITL

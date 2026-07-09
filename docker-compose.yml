@@ -69,6 +69,20 @@ services:
       retries: 3
     networks: [approvalflow]
 
+  notification:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.notification.app:app --host 0.0.0.0 --port 8004
+    ports:
+      - "8004:8004"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -192,6 +206,30 @@ services:
       redis:
         condition: service_healthy
     # See intake-dapr/decision-dapr/approval-dapr comments above - same reasoning, paired with payment.
+
+  notification-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "notification"
+      - "--app-port"
+      - "8004"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:notification"
+    depends_on:
+      notification:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # See intake-dapr/decision-dapr/approval-dapr/payment-dapr comments above - same reasoning, paired with notification.
 
   placement:
     image: daprio/placement:1.18.1

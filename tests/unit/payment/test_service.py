@@ -25,7 +25,6 @@ from services.payment.service import (
     build_payment_service,
 )
 from shared.contracts.models import (
-    ApprovalCompletedEvent,
     ApprovalResolution,
     Decision,
     DecisionCompletedEvent,
@@ -34,6 +33,7 @@ from shared.contracts.models import (
     Route,
 )
 from tests.support.decision_fixtures import clean_invoice
+from tests.support.event_fixtures import approval_completed_event, decision_completed_event
 
 _DEPARTMENT = "engineering-2026Q2"
 _BUDGET_TOTAL = Decimal("50000.00")
@@ -50,20 +50,6 @@ class _StubOutcomePublisher:
 def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "corr-1") -> Decision:
     return Decision(
         route=route, reason="test reason", triggered_rules=[], correlation_id=correlation_id
-    )
-
-
-def _decision_completed_event(route: Route = Route.AUTO_APPROVE) -> DecisionCompletedEvent:
-    return DecisionCompletedEvent(
-        invoice=clean_invoice(total=Decimal("50.00")), decision=_decision(route)
-    )
-
-
-def _approval_completed_event(
-    resolution: ApprovalResolution = ApprovalResolution.APPROVED,
-) -> ApprovalCompletedEvent:
-    return ApprovalCompletedEvent(
-        invoice=clean_invoice(total=Decimal("50.00")), decision=_decision(), resolution=resolution
     )
 
 
@@ -89,10 +75,15 @@ async def _service(
 # --- route/resolution filtering -------------------------------------------
 
 
-async def test_handle_decision_completed_ignores_non_auto_approve_routes() -> None:
+@pytest.mark.parametrize("route", [Route.HUMAN_REVIEW, Route.REJECT, Route.DUPLICATE])
+async def test_handle_decision_completed_ignores_non_auto_approve_routes(route: Route) -> None:
+    """Explicitly covers Route.DUPLICATE (F3): a duplicate invoice must never
+    reach payment, now that Intake publishes decision.completed directly for
+    known duplicates (previously this route only reached Payment via a
+    synthetic test event, never a real one)."""
     service, repository, _, _, gateway = await _service()
 
-    await service.handle_decision_completed(_decision_completed_event(route=Route.HUMAN_REVIEW))
+    await service.handle_decision_completed(decision_completed_event(route=route))
 
     assert await repository.list_all() == []
     assert gateway.charged == []
@@ -101,7 +92,7 @@ async def test_handle_decision_completed_ignores_non_auto_approve_routes() -> No
 async def test_handle_approval_completed_ignores_rejected_resolution() -> None:
     service, repository, _, _, gateway = await _service()
 
-    await service.handle_approval_completed(_approval_completed_event(ApprovalResolution.REJECTED))
+    await service.handle_approval_completed(approval_completed_event(ApprovalResolution.REJECTED))
 
     assert await repository.list_all() == []
     assert gateway.charged == []
@@ -113,7 +104,7 @@ async def test_handle_approval_completed_ignores_rejected_resolution() -> None:
 async def test_handle_decision_completed_reserves_and_completes_on_success() -> None:
     service, repository, budget_repository, publisher, gateway = await _service()
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -130,7 +121,7 @@ async def test_handle_decision_completed_reserves_and_completes_on_success() -> 
 async def test_handle_approval_completed_reserves_and_completes_on_success() -> None:
     service, repository, _, publisher, _ = await _service()
 
-    await service.handle_approval_completed(_approval_completed_event())
+    await service.handle_approval_completed(approval_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -142,8 +133,8 @@ async def test_both_entrypoints_converge_on_identical_outcome_shape() -> None:
     service_a, repository_a, _, _, _ = await _service()
     service_b, repository_b, _, _, _ = await _service()
 
-    await service_a.handle_decision_completed(_decision_completed_event())
-    await service_b.handle_approval_completed(_approval_completed_event())
+    await service_a.handle_decision_completed(decision_completed_event())
+    await service_b.handle_approval_completed(approval_completed_event())
 
     record_a = await repository_a.get("corr-1")
     record_b = await repository_b.get("corr-1")
@@ -158,7 +149,7 @@ async def test_gateway_failure_triggers_compensation_and_releases_reserved_amoun
     gateway = FakePaymentGateway(fail_for={"TEST-0000"})
     service, repository, budget_repository, publisher, _ = await _service(gateway=gateway)
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -180,7 +171,7 @@ async def test_compensation_releases_exact_reserved_amount_not_recomputed_from_i
         gateway=gateway, budget_repository=budget_repository
     )
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     budget = await budget_repository.get(_DEPARTMENT)
     assert budget is not None
@@ -197,7 +188,7 @@ async def test_insufficient_budget_rejects_immediately_without_calling_gateway()
         budget_repository=budget_repository, skip_seed=True
     )
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -212,7 +203,7 @@ async def test_insufficient_budget_performs_no_compensation() -> None:
     await budget_repository.ensure_seeded(_DEPARTMENT, Decimal("10.00"))
     service, _, _, _, _ = await _service(budget_repository=budget_repository, skip_seed=True)
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     budget = await budget_repository.get(_DEPARTMENT)
     assert budget is not None
@@ -222,7 +213,7 @@ async def test_insufficient_budget_performs_no_compensation() -> None:
 async def test_missing_budget_configuration_rejects_as_failed() -> None:
     service, repository, _, publisher, gateway = await _service(skip_seed=True)  # never seeded
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -237,7 +228,7 @@ async def test_missing_budget_configuration_rejects_as_failed() -> None:
 
 async def test_redelivery_after_completed_status_is_a_noop() -> None:
     service, repository, _, publisher, gateway = await _service()
-    event = _decision_completed_event()
+    event = decision_completed_event()
     await service.handle_decision_completed(event)
 
     await service.handle_decision_completed(event)
@@ -250,7 +241,7 @@ async def test_redelivery_after_completed_status_is_a_noop() -> None:
 async def test_redelivery_after_failed_status_is_a_noop() -> None:
     gateway = FakePaymentGateway(fail_for={"TEST-0000"})
     service, repository, _, publisher, _ = await _service(gateway=gateway)
-    event = _decision_completed_event()
+    event = decision_completed_event()
     await service.handle_decision_completed(event)
 
     await service.handle_decision_completed(event)
@@ -261,8 +252,8 @@ async def test_redelivery_after_failed_status_is_a_noop() -> None:
 async def test_cross_topic_redelivery_for_the_same_tracking_id_converges_safely() -> None:
     service, repository, _, publisher, gateway = await _service()
 
-    await service.handle_decision_completed(_decision_completed_event())
-    await service.handle_approval_completed(_approval_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
+    await service.handle_approval_completed(approval_completed_event())
 
     assert len(gateway.charged) == 1
     assert len(publisher.published) == 1
@@ -294,7 +285,7 @@ async def test_crash_recovery_resumes_from_reserved_status_without_re_reserving(
         repository=repository, budget_repository=budget_repository, skip_seed=True
     )
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -329,7 +320,7 @@ async def test_crash_recovery_resume_that_then_fails_still_compensates_correctly
         repository=repository, budget_repository=budget_repository, gateway=gateway, skip_seed=True
     )
 
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     record = await repository.get("corr-1")
     assert record is not None
@@ -364,7 +355,7 @@ async def test_execute_charge_raises_runtime_error_for_non_reserved_status() -> 
 
 async def test_list_all_returns_items_in_chronological_order() -> None:
     service, _, _, _, _ = await _service()
-    await service.handle_decision_completed(_decision_completed_event(route=Route.AUTO_APPROVE))
+    await service.handle_decision_completed(decision_completed_event(route=Route.AUTO_APPROVE))
     second_event = DecisionCompletedEvent(
         invoice=clean_invoice(id="TEST-0002", total=Decimal("50.00")),
         decision=_decision(correlation_id="corr-2"),
@@ -378,7 +369,7 @@ async def test_list_all_returns_items_in_chronological_order() -> None:
 
 async def test_get_returns_payment_record() -> None:
     service, _, _, _, _ = await _service()
-    await service.handle_decision_completed(_decision_completed_event())
+    await service.handle_decision_completed(decision_completed_event())
 
     result = await service.get("corr-1")
 

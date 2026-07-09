@@ -15,9 +15,17 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from services.intake.app import create_app
+from services.intake.decision_completed_publisher import DecisionCompletedPublisher
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
-from shared.contracts.models import Decision, Invoice, Route
+from shared.contracts.models import (
+    DecisionCompletedEvent,
+    Invoice,
+    Recommendation,
+    RecommendationType,
+    Route,
+)
+from tests.support.event_fixtures import decision_completed_event
 
 
 class _StubPublisher:
@@ -31,16 +39,25 @@ class _StubPublisher:
             raise self._error
 
 
-def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") -> Decision:
-    return Decision(
-        route=route, reason="stub decision", triggered_rules=[], correlation_id=correlation_id
-    )
+class _StubDecisionCompletedPublisher:
+    def __init__(self) -> None:
+        self.calls: list[DecisionCompletedEvent] = []
+
+    async def publish(self, event: DecisionCompletedEvent) -> None:
+        self.calls.append(event)
 
 
 def _build_app(
-    publisher: DecisionPublisher, repository: InvoiceRepository | None = None
+    publisher: DecisionPublisher,
+    repository: InvoiceRepository | None = None,
+    decision_completed_publisher: DecisionCompletedPublisher | None = None,
 ) -> FastAPI:
-    return create_app(repository=repository or InMemoryInvoiceRepository(), publisher=publisher)
+    return create_app(
+        repository=repository or InMemoryInvoiceRepository(),
+        publisher=publisher,
+        decision_completed_publisher=decision_completed_publisher
+        or _StubDecisionCompletedPublisher(),
+    )
 
 
 def _invoice_body(**overrides: Any) -> dict[str, Any]:
@@ -65,9 +82,26 @@ def _invoice_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
-def _post_decision_completed(client: TestClient, decision: Decision) -> Any:
+def _post_decision_completed(
+    client: TestClient,
+    route: Route = Route.AUTO_APPROVE,
+    *,
+    correlation_id: str = "cid",
+    invoice: Invoice | None = None,
+    recommendation: Recommendation | None = None,
+) -> Any:
+    """Builds the real decision.completed payload shape via the shared
+    tests/support/event_fixtures builder - a DecisionCompletedEvent (invoice +
+    decision + recommendation), matching what Decision Service actually
+    publishes in production, not a bare Decision. Deliberately built via the
+    shared Pydantic model, not a hand-rolled dict, so any future drift between
+    this and the real contract fails the test instead of hiding behind a
+    synthetic payload."""
+    event = decision_completed_event(
+        route, correlation_id=correlation_id, invoice=invoice, recommendation=recommendation
+    )
     return client.post(
-        "/events/decision-completed", json={"data": decision.model_dump(mode="json")}
+        "/events/decision-completed", json={"data": event.model_dump(mode="json")}
     )
 
 
@@ -106,9 +140,10 @@ def test_decision_completed_event_completes_the_submission() -> None:
     app = _build_app(_StubPublisher())
     client = TestClient(app)
     tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
-    decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
 
-    event_response = _post_decision_completed(client, decision)
+    event_response = _post_decision_completed(
+        client, Route.AUTO_APPROVE, correlation_id=tracking_id
+    )
     status = client.get(f"/invoices/{tracking_id}")
 
     assert event_response.status_code == 200
@@ -117,12 +152,41 @@ def test_decision_completed_event_completes_the_submission() -> None:
     assert body["decision"]["route"] == Route.AUTO_APPROVE.value
 
 
-# --- (d) duplicate short-circuits: no publish, immediately completed ----------
+def test_decision_completed_event_with_recommendation_is_parsed_correctly() -> None:
+    """Regression test for a real bug found live in docker compose: Decision
+    Service publishes the enriched DecisionCompletedEvent (invoice + decision +
+    recommendation), not a bare Decision - the handler previously crashed with a
+    pydantic ValidationError on this exact shape (a `recommendation` field is
+    what triggered extra_forbidden). event.recommendation is parsed here but
+    intentionally unused by Intake's business logic - it's forwarded only
+    because it's part of the shared contract with Approval/Notification."""
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+    recommendation = Recommendation(
+        recommendation=RecommendationType.APPROVE,
+        confidence=0.9,
+        cited_rules=[],
+        reasoning="stub: optimistic non-adversarial recommendation",
+    )
+
+    event_response = _post_decision_completed(
+        client, Route.AUTO_APPROVE, correlation_id=tracking_id, recommendation=recommendation
+    )
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert event_response.status_code == 200
+    assert status.json()["status"] == "completed"
 
 
-def test_duplicate_submission_short_circuits_without_publishing() -> None:
+# --- (d) duplicate short-circuits: no invoice.submitted, immediately completed,
+#         publishes decision.completed directly instead --------------------------
+
+
+def test_duplicate_submission_completes_immediately_and_publishes_decision_completed() -> None:
     publisher = _StubPublisher()
-    app = _build_app(publisher)
+    decision_completed_publisher = _StubDecisionCompletedPublisher()
+    app = _build_app(publisher, decision_completed_publisher=decision_completed_publisher)
     client = TestClient(app)
     body = _invoice_body()
 
@@ -133,6 +197,9 @@ def test_duplicate_submission_short_circuits_without_publishing() -> None:
     status = client.get(f"/invoices/{second_tracking_id}")
     assert status.json()["status"] == "completed"
     assert status.json()["decision"]["route"] == Route.DUPLICATE.value
+    assert len(decision_completed_publisher.calls) == 1
+    assert decision_completed_publisher.calls[0].decision.route == Route.DUPLICATE
+    assert decision_completed_publisher.calls[0].decision.correlation_id == second_tracking_id
 
 
 # --- (e) invalid invoice -> 422 -----------------------------------------------
@@ -199,7 +266,7 @@ def test_decision_completed_for_unknown_tracking_id_does_not_crash() -> None:
     app = _build_app(_StubPublisher())
     client = TestClient(app)
 
-    response = _post_decision_completed(client, _decision(correlation_id="does-not-exist"))
+    response = _post_decision_completed(client, correlation_id="does-not-exist")
 
     assert response.status_code == 200
 

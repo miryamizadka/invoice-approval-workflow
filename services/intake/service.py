@@ -14,16 +14,32 @@ from __future__ import annotations
 import logging
 import uuid
 
+from services.intake.decision_completed_publisher import (
+    DecisionCompletedPublisher,
+    DecisionCompletedPublisherError,
+)
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.models import Submission, SubmissionStatus
 from services.intake.repository import InvoiceRepository
-from shared.contracts.models import Decision, Invoice, build_duplicate_decision, compute_dedup_key
+from shared.contracts.models import (
+    Decision,
+    DecisionCompletedEvent,
+    Invoice,
+    build_duplicate_decision,
+    compute_dedup_key,
+)
 
 
 class IntakeService:
-    def __init__(self, repository: InvoiceRepository, publisher: DecisionPublisher) -> None:
+    def __init__(
+        self,
+        repository: InvoiceRepository,
+        publisher: DecisionPublisher,
+        decision_completed_publisher: DecisionCompletedPublisher,
+    ) -> None:
         self._repository = repository
         self._publisher = publisher
+        self._decision_completed_publisher = decision_completed_publisher
         self._logger = logging.getLogger(__name__)
 
     async def submit(self, invoice: Invoice) -> str:
@@ -51,11 +67,37 @@ class IntakeService:
         reaches publish() at all: running the agent for it would be pure
         waste (the router's gate 1 never even looks at the recommendation
         for a duplicate), so it's completed immediately with the same
-        canonical DUPLICATE decision the router itself would produce."""
+        canonical DUPLICATE decision the router itself would produce - and,
+        since Decision is never invoked for this case, decision.completed
+        would otherwise never fire for it (Notification could never react to
+        a duplicate outcome), so Intake publishes it directly instead."""
         submission = await self._repository.get(tracking_id)
         assert submission is not None  # scheduled right after save(); must exist
         if submission.is_duplicate:
-            await self.complete(tracking_id, build_duplicate_decision(tracking_id))
+            if submission.status == SubmissionStatus.COMPLETED:
+                return  # idempotent no-op against a hypothetical repeat call
+            decision = build_duplicate_decision(tracking_id)
+            await self.complete(tracking_id, decision)
+            try:
+                await self._decision_completed_publisher.publish(
+                    DecisionCompletedEvent(invoice=submission.invoice, decision=decision)
+                )
+            except DecisionCompletedPublisherError as exc:
+                # The duplicate is already correctly COMPLETED above - this is
+                # a side-channel notification failure, not a failure of the
+                # duplicate detection itself, so the status is not reverted.
+                # process() is a plain BackgroundTask (no Dapr redelivery), so
+                # there is no retry for this specific publish today - accepted
+                # non-goal, same category as other undelivered-side-effect
+                # races already documented in this project.
+                self._logger.error(
+                    "failed to publish decision.completed for duplicate",
+                    extra={
+                        "correlation_id": tracking_id,
+                        "route": decision.route.value,
+                        "error": str(exc),
+                    },
+                )
             return
         # PROCESSING must be saved (awaited to completion) before publish() is
         # called: an inbound decision.completed event can arrive at any point
@@ -121,7 +163,9 @@ class IntakeService:
 
 
 def build_intake_service(
-    repository: InvoiceRepository, publisher: DecisionPublisher
+    repository: InvoiceRepository,
+    publisher: DecisionPublisher,
+    decision_completed_publisher: DecisionCompletedPublisher,
 ) -> IntakeService:
     """Composition seam, same reason as build_decider: keeps FastAPI out of this."""
-    return IntakeService(repository, publisher)
+    return IntakeService(repository, publisher, decision_completed_publisher)
