@@ -16,9 +16,10 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
     IN --> DEC[Decision Service - Agent plus Router]
     DEC --> PAY[Payment Service - Saga]
     DEC --> APP[Approval Service - HITL]
+    DEC --> NOT[Notification Service]
     APP --> PAY
-    PAY --> NOT[Notification Service]
     APP --> NOT
+    PAY --> NOT
     NOT --> UI
 ```
 
@@ -32,7 +33,7 @@ ApprovalFlow
 | Decision | Agent recommendation + deterministic router | pub/sub (async) | pub/sub, state, secrets | decisions |
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
 | Payment | Saga: reserve budget → pay → compensate | pub/sub | pub/sub, state | payments, budgets (Dapr state/Redis - interim; see §8/§9) |
-| Notification | Final result notification to submitter | pub (consumer) | pub/sub | — |
+| Notification | Final result notification to submitter | pub (consumer) | pub/sub, state | notification idempotency marker (see §8) |
 | UI | Minimal interface to submit and view status; approver queue + dashboard | REST (to gateway) | — | — |
 
 
@@ -46,7 +47,7 @@ ApprovalFlow
 
 **Payment** - Runs the payment as a saga (M9) to guarantee a consistent outcome across steps. It reserves the department budget, executes the payment, and on any failure runs compensating actions (release the reservation) so there are no orphaned reservations or partial/double payments. All steps are idempotent (M10), so a retried or redelivered payment produces exactly one effect. Budget management (§7) lives here because reserve and release are saga steps.
 
-**Notification** - Listens for the final outcome and notifies the submitter (F2, M8). It's a pure consumer - it never initiates, only reacts to the result event.
+**Notification** - Listens for the final outcome and notifies the submitter (F2, M8). It's a pure consumer - it never initiates, only reacts to the result event. It is a terminal consumer in this architecture's choreography chain - it never publishes any event of its own downstream.
 
 **UI (M7)** - A minimal web interface lets a submitter send an item and track its status with a plain-language reason (F1, F2), and lets an approver act on the escalation queue (F4, F5). It also surfaces the controller dashboard (F8) showing throughput and auto-approval vs. escalation rates, read from the decision data.
 
@@ -95,14 +96,17 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Decision | Payment | Dapr Pub/Sub | Async | Auto-approved flow |
 | Approval | Payment | Dapr Pub/Sub | Async | Resume after human decision |
 | Payment | Notification | Dapr Pub/Sub | Async | Result notification |
+| Decision | Notification | Dapr Pub/Sub | Async | Reject/duplicate result notification |
 
 Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `payment.completed`.
 
-`decision.completed` carries a `DecisionCompletedEvent` (invoice + `Decision`, including `route` + the agent's `Recommendation`, which may be `None` if the agent itself failed) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`, Approval only wants `route == human_review`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography). The invoice and recommendation/confidence are what Approval needs to display for F4 - the bare `Decision` alone (route/reason/triggered_rules) isn't enough. `POST /decisions`'s external HTTP response is unaffected by this enrichment - it still returns the bare `Decision` only (D4, API stability); the enrichment only travels over the `decision.completed` event.
+`decision.completed` carries a `DecisionCompletedEvent` (invoice + `Decision`, including `route` + the agent's `Recommendation`, which may be `None` if the agent itself failed) as a single topic, not one topic per outcome - Dapr supports content-based routing (CEL match rules) for subscribers that only want a subset (e.g. Payment only wants `route == auto_approve`, Approval only wants `route == human_review`), so per-outcome filtering is a subscriber-side concern, not a publisher-side one. Decision itself never needs to know who's listening or why (choreography). The invoice and recommendation/confidence are what Approval needs to display for F4 - the bare `Decision` alone (route/reason/triggered_rules) isn't enough. `POST /decisions`'s external HTTP response is unaffected by this enrichment - it still returns the bare `Decision` only (D4, API stability); the enrichment only travels over the `decision.completed` event. `decision.completed` gets a fourth consumer this phase: Notification filters for `route in {reject, duplicate}` - closing a real, previously undocumented gap, since these two terminal outcomes had no push-notification path at all (only pull, via `GET /invoices/{id}`).
 
-`approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment filters for `resolution == approved` (see below); Notification (future) filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
+`approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment filters for `resolution == approved` (see below); Notification filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
 
-`payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification (future) filters by `resolution`, the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
+`payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification filters by `resolution`, but acts on **both** `completed` and `failed` unconditionally (§11's flowchart already shows both the DONE and FAILED paths converging on the same NOTIFY node) - the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
+
+Notification is a pure, terminal consumer across all three subscriptions - it publishes nothing onward. Its own idempotency guard against Dapr's at-least-once redelivery (M10) is a minimal Dapr-state marker (`tracking_id` -> already-notified), not a domain record - see §8.
 
 
 ## 8. Data Architecture
@@ -115,6 +119,7 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `
 | Payments | Dapr state (Redis) - interim, same migration path as Invoices/Approval state above; PostgreSQL remains the eventual target, currently unused (see docker-compose.yml) | Payment |
 | Budgets | Dapr state (Redis) - interim, same as Payments; the ETag-based optimistic concurrency §9 requires (INV-1014) is a Dapr state mechanism, not a PostgreSQL one | Payment |
 | Idempotency & dedup keys | Redis (Dapr state) | All services |
+| Notification idempotency marker (tracking_id sent/not) | Dapr state (Redis) - point lookups/writes only, no index (nothing enumerates notified tracking_ids) | Notification |
 
 Each service owns its own data (database-per-service); no service reads another's store directly - data is shared only through events.
 

@@ -480,6 +480,118 @@ Ran for real, not just described:
 
 ---
 
+# Phase 6.5 — Notification Service
+
+## Goal
+
+Close the last gap in the choreography chain: every terminal outcome (auto-approved +
+paid, human-approved + paid, human-rejected, payment-failed, router-rejected, duplicate)
+reaches the submitter via a push notification, not just pull (`GET /invoices/{id}`).
+
+Required scenarios: all four already-shipped fixture journeys (INV-1003, INV-1007,
+INV-1012, INV-1015) each produce exactly one notification.
+
+## Tasks
+
+- [x] Create Notification Service (`services/notification/`: `NotificationService`/
+  `build_notification_service` transport-agnostic core + thin `app.py` FastAPI wrapper,
+  same pattern as Approval/Payment). Subscribes to three topics: `decision.completed`
+  [route in {reject, duplicate}], `approval.completed` [resolution=rejected],
+  `payment.completed` [resolution in {completed, failed} - unconditional, both act], each
+  converging on a shared `_notify()` helper.
+- [x] Implement minimal idempotency guard (`NotificationRepository` Protocol +
+  `InMemoryNotificationRepository` + `DaprStateNotificationRepository`) - point
+  lookup/point write only, deliberately no append-only index (nothing needs to enumerate
+  notified tracking_ids - no `GET /notifications` listing endpoint required by any doc,
+  unlike Approval's `list_pending()`/Payment's `list_all()`). `mark_notified()` writes via
+  `execute_state_transaction` with a single `etag=None` operation, deliberately not
+  `save_state()` - exception-handling consistency, not atomicity (same reasoning already
+  established in the Payment phase: `save_state()`'s ETag-failure path is
+  `DaprInternalError`, not a `grpc.RpcError` subclass; `execute_state_transaction`'s is
+  `DaprGrpcError`, matching the `except grpc.RpcError` idiom used everywhere else).
+- [x] Implement notification channel (`NotificationChannel` Protocol, mirroring
+  `PaymentGateway` exactly; `LoggingNotificationChannel` as the real, only production
+  implementation - there is no real email/SMS/webhook backend in this project, so
+  structured logging IS production here, the same posture as Payment having no real
+  payment processor. Named "Logging", not "Simulated" [Payment's specific choice] - it
+  never manufactures a synthetic failure; logging genuinely is the delivery mechanism.
+  `FakeNotificationChannel` for tests, supports injected failures via `fail_for` and
+  `fail_first_n_calls`).
+- [x] Business/infra failure separation (mirrors Payment): `channel.send()` failures are
+  never caught inside `NotificationService` - they propagate uncaught out of the
+  subscription handler (non-2xx, Dapr redelivers later). `send()` happens BEFORE
+  `mark_notified()` - if `send()` fails, no mark is written, so redelivery retries the
+  actual send; if `send()` succeeds but the process crashes before the mark persists, a
+  redelivery sends a harmless duplicate (safer than the alternative). Proven not just by
+  a "failure doesn't corrupt state" test but by a dedicated
+  `test_redelivery_after_failed_send_succeeds_and_marks_notified` showing the retry
+  actually recovers.
+- [x] Updated `ARCHITECTURE.md` §3 (added the missing `DEC -> NOT` edge), §4 (Notification's
+  DB column + a terminal-consumer lifecycle sentence), §7 (new Decision -> Notification
+  communication row + three-topic filter explanation, mirroring the style of the two
+  consolidations already documented there), and §8 (new Notification row in the Data
+  Architecture table - previously absent, correctly implying no state; corrected the same
+  way the Payment phase corrected that table twice).
+- [x] Added `notification`/`notification-dapr` to `docker-compose.yml` (port 8004, **with**
+  a host port mapping like every other service - an earlier planning draft incorrectly
+  assumed Approval/Payment had none; verified directly against the file before writing
+  this) and `notification` to both `dapr/components/{pubsub,statestore}.yaml` scopes.
+
+Also required and added, beyond the literal task list:
+- **A known race, documented as an accepted non-goal (same category as Payment's
+  reserve/save race)**: `_notify()`'s three steps (`already_notified` -> `send` ->
+  `mark_notified`) are not atomic together - two near-simultaneous redeliveries of the
+  same event could both observe `already_notified=False` before either sends, causing a
+  duplicate (harmless) notification. Not fixed here, documented explicitly.
+- **A real finding about the JSON log formatter**: `JsonFormatter` (duplicated across
+  every service) only ever promotes `record.correlation_id` out of `extra=` - every other
+  key passed via `extra=` is silently dropped from the emitted JSON line. This is harmless
+  for the other services (their extras are decoration), but load-bearing for Notification,
+  whose entire live-verification plan depends on `docker compose logs notification`
+  showing the human-readable message. `LoggingNotificationChannel.send()` therefore
+  interpolates the tracking id, invoice id, submitter, source topic, and message directly
+  into the primary log message string (`%s`-style), not solely via `extra=`.
+- **A genuine, documented gap in `ApprovalCompletedEvent`**: `decision.reason` is the
+  *original escalation reason* (why an item went to human review), not the approver's own
+  rationale for rejecting it - `ApprovalService.reject()` never collects a separate
+  rejection reason. The notification text for that path (`"Rejected by approver: ..."`)
+  uses the best available text, not a perfect fit - documented as a TODO in
+  `services/notification/service.py` itself, not just here, so it isn't rediscovered as a
+  mystery later. Closing it would need a new `reason` parameter on `reject()`, out of
+  scope for this phase.
+- **`GET /notifications/{tracking_id}` debug/ops endpoint** - always returns `200` (never
+  `404`; "not yet notified" is a valid state, not an error, unlike Payment's
+  `GET /payments/{id}`), documented explicitly as an ops/debug endpoint (not part of the
+  public API contract) and as "not guaranteed to be retained forever" (so a future
+  TTL/deletion policy on the underlying Dapr key stays semantically correct).
+
+## Verification (Notification Service, Phase 6.5)
+
+Ran for real, not just described:
+- Full TDD cycle throughout (RED confirmed before every GREEN) - ruff and mypy pass.
+- `docker compose up --build -d` - all 13 containers (previous 11 + `notification` +
+  `notification-dapr`) came up healthy.
+- **INV-1003** (escalate + approve + pay): re-verified the existing journey, confirming
+  `docker compose logs notification` shows exactly one `notification_delivered` line
+  (`source=payment.completed`) once the payment saga completes, and
+  `GET http://localhost:8004/notifications/{tracking_id}` returns `{"notified": true}`.
+- **INV-1012** (payment failure + compensation): re-verified, confirming exactly one
+  notification fires from `payment.completed` [resolution=failed], with the simulated
+  gateway decline reason visible in the log message text.
+- **INV-1007** (duplicate): newly verified - submitting it a second time (after INV-1001)
+  produces a `decision.completed` [route=duplicate] event; confirmed exactly one
+  notification, with the duplicate-detection reason text visible.
+- **INV-1015** (reject, alcohol-only): newly verified - a `decision.completed`
+  [route=reject] event produces exactly one notification, with the MEAL-03 reason text
+  visible.
+- **Idempotency, live**: re-POSTing the identical event body a second time directly to a
+  notification subscription route (simulating Dapr redelivery) produces **no** second
+  `notification_delivered` log line, and `GET /notifications/{tracking_id}` is unchanged.
+- Full local suite re-run after the live run, confirming no regression in the other 4
+  services.
+
+---
+
 # Phase 7 — Infrastructure
 
 ## Goal
