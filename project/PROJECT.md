@@ -176,6 +176,37 @@ Completed
   iterations correctly showed the safety invariant (budget never negative, never oversold) holding
   even once the department's budget was too depleted for either to succeed.
 
+- Notification Service (Phase 6.5, M8/M10) - fifth microservice, same layering
+  (`NotificationService`/`build_notification_service` transport-agnostic core + thin FastAPI
+  `app.py`). Closes a previously-undocumented gap: `decision.completed` [route in
+  {reject, duplicate}], `approval.completed` [rejected], and `payment.completed` [both
+  outcomes] all converge on push notifications - every terminal outcome now reaches the
+  submitter, not just pull via `GET /invoices/{id}`. `LoggingNotificationChannel` is the real,
+  only production channel (no email/SMS/webhook backend exists in this project, mirroring
+  Payment's `SimulatedPaymentGateway` posture). Idempotency (M10) via a minimal Dapr-state
+  tracking_id marker; `send()` before `mark_notified()` so a failed send is safely retried on
+  redelivery.
+  Live verification of INV-1007 (duplicate) initially **failed**: no notification fired at
+  all, because `IntakeService` short-circuits a known duplicate before `invoice.submitted` is
+  ever published, so Decision never sees it and `decision.completed` never fires for it - a
+  real, pre-existing gap in Intake, not a bug in Notification's own code. Fixed by having
+  Intake publish `decision.completed` directly for this one case (new
+  `services/intake/decision_completed_publisher.py`, mirroring Decision's own outcome
+  publisher), guarded against double-publish and proven live not to reach Payment (F3,
+  parametrized test over `{HUMAN_REVIEW, REJECT, DUPLICATE}`).
+  While re-verifying live, found a second, unrelated, older bug: Intake's own
+  `decision.completed` subscription handler still parsed a bare `Decision`
+  (written in M5, before Approval Service existed) instead of the enriched
+  `DecisionCompletedEvent` Decision has published since Approval needed it for F4 - Intake's
+  own consumer of that topic was never updated. Approval/Payment/Notification were unaffected
+  (each has its own correctly-parsing subscription), but Intake's own
+  `GET /invoices/{id}` silently stayed stuck on `"processing"` forever for every invoice
+  routed through Decision. Fixed by parsing `DecisionCompletedEvent` (matching Notification's
+  already-correct handler); the test fixture now builds the real payload via the shared
+  Pydantic model instead of a hand-rolled dict, closing the gap between what was tested and
+  what production actually sends. All four fixture journeys (INV-1003/1007/1012/1015) plus
+  redelivery idempotency re-verified live end-to-end after both fixes.
+
 In Progress
 
 - Manual Groq strict-mode smoke-test (script ready; blocked both on the host and, now confirmed,
@@ -184,7 +215,6 @@ In Progress
 
 Planned
 
-- Notification
 - API Gateway / UI
 - CI
 - Full Phase 8 verification suite (single command, all four journeys + INV-1014 + anti-cheese)

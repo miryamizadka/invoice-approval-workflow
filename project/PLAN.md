@@ -50,17 +50,27 @@ The priority is:
   (durable pause/resume) - see Phase 5 below
 - [x] Payment Service (Phase 6) - M9 (Saga + Compensation), M10 (Idempotency), INV-1012 (payment
   failure + compensation), INV-1014A/B (budget concurrency) - see Phase 6 below
+- [x] Notification Service (Phase 6.5) - M8 (push notification), M10 (idempotency) - pure,
+  terminal consumer of `decision.completed`/`approval.completed`/`payment.completed`, see
+  Phase 6.5 below
+- [x] Intake decision.completed fixes (predate/support Phase 6.5, see the two sections above
+  Phase 6.5 below) - Intake now publishes `decision.completed` directly for known duplicates
+  (closing a real gap where Notification could never react to one), and Intake's own
+  subscription to that topic now correctly parses the enriched `DecisionCompletedEvent`
+  (fixing a real, pre-existing bug where `GET /invoices/{id}` stayed stuck on `"processing"`
+  forever for every invoice routed through Decision)
 
 ## Current Focus
 
-Phase 1-6, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete and
-verified. Remaining before Phase 3 is fully "production-ready": run
+Phase 1-6.5, and Phase 7 steps 1/3/4 (Docker Compose, Dapr pub/sub, Dapr state) are all complete
+and verified, including both Intake `decision.completed` fixes found during Notification's live
+verification (duplicate-publish gap and the enriched-event parsing bug - see the two sections
+just above Phase 6.5). Remaining before Phase 3 is fully "production-ready": run
 `scripts/smoke_test_groq_strict.py` manually against the real Groq API from a network that isn't
 behind an SSL-intercepting proxy (confirmed blocked both on the host and inside Docker containers -
-environmental, not a code issue). Next: Notification Service (pure consumer of `payment.completed`,
-notifies the submitter - F2/M8) and the API Gateway/UI (M6/M7), then Phase 8's full verification
-suite tying all four required journeys (INV-1001, INV-1003, INV-1007, INV-1012) plus INV-1014
-together into one command.
+environmental, not a code issue). Next: the API Gateway/UI (M6/M7), then Phase 8's full
+verification suite tying all four required journeys (INV-1001, INV-1003, INV-1007, INV-1012) plus
+INV-1014 together into one command.
 
 ---
 
