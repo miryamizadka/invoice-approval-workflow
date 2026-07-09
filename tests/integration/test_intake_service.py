@@ -19,14 +19,13 @@ from services.intake.decision_completed_publisher import DecisionCompletedPublis
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
 from shared.contracts.models import (
-    Decision,
     DecisionCompletedEvent,
     Invoice,
     Recommendation,
     RecommendationType,
     Route,
 )
-from tests.support.decision_fixtures import clean_invoice
+from tests.support.event_fixtures import decision_completed_event
 
 
 class _StubPublisher:
@@ -46,12 +45,6 @@ class _StubDecisionCompletedPublisher:
 
     async def publish(self, event: DecisionCompletedEvent) -> None:
         self.calls.append(event)
-
-
-def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") -> Decision:
-    return Decision(
-        route=route, reason="stub decision", triggered_rules=[], correlation_id=correlation_id
-    )
 
 
 def _build_app(
@@ -91,18 +84,21 @@ def _invoice_body(**overrides: Any) -> dict[str, Any]:
 
 def _post_decision_completed(
     client: TestClient,
-    decision: Decision,
+    route: Route = Route.AUTO_APPROVE,
     *,
+    correlation_id: str = "cid",
     invoice: Invoice | None = None,
     recommendation: Recommendation | None = None,
 ) -> Any:
-    """Builds the real decision.completed payload shape - a DecisionCompletedEvent
-    (invoice + decision + recommendation), matching what Decision Service actually
-    publishes in production, not a bare Decision. Deliberately built via the shared
-    Pydantic model, not a hand-rolled dict, so any future drift between this and the
-    real contract fails the test instead of hiding behind a synthetic payload."""
-    event = DecisionCompletedEvent(
-        invoice=invoice or clean_invoice(), decision=decision, recommendation=recommendation
+    """Builds the real decision.completed payload shape via the shared
+    tests/support/event_fixtures builder - a DecisionCompletedEvent (invoice +
+    decision + recommendation), matching what Decision Service actually
+    publishes in production, not a bare Decision. Deliberately built via the
+    shared Pydantic model, not a hand-rolled dict, so any future drift between
+    this and the real contract fails the test instead of hiding behind a
+    synthetic payload."""
+    event = decision_completed_event(
+        route, correlation_id=correlation_id, invoice=invoice, recommendation=recommendation
     )
     return client.post(
         "/events/decision-completed", json={"data": event.model_dump(mode="json")}
@@ -144,9 +140,10 @@ def test_decision_completed_event_completes_the_submission() -> None:
     app = _build_app(_StubPublisher())
     client = TestClient(app)
     tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
-    decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
 
-    event_response = _post_decision_completed(client, decision)
+    event_response = _post_decision_completed(
+        client, Route.AUTO_APPROVE, correlation_id=tracking_id
+    )
     status = client.get(f"/invoices/{tracking_id}")
 
     assert event_response.status_code == 200
@@ -166,7 +163,6 @@ def test_decision_completed_event_with_recommendation_is_parsed_correctly() -> N
     app = _build_app(_StubPublisher())
     client = TestClient(app)
     tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
-    decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
     recommendation = Recommendation(
         recommendation=RecommendationType.APPROVE,
         confidence=0.9,
@@ -174,7 +170,9 @@ def test_decision_completed_event_with_recommendation_is_parsed_correctly() -> N
         reasoning="stub: optimistic non-adversarial recommendation",
     )
 
-    event_response = _post_decision_completed(client, decision, recommendation=recommendation)
+    event_response = _post_decision_completed(
+        client, Route.AUTO_APPROVE, correlation_id=tracking_id, recommendation=recommendation
+    )
     status = client.get(f"/invoices/{tracking_id}")
 
     assert event_response.status_code == 200
@@ -268,7 +266,7 @@ def test_decision_completed_for_unknown_tracking_id_does_not_crash() -> None:
     app = _build_app(_StubPublisher())
     client = TestClient(app)
 
-    response = _post_decision_completed(client, _decision(correlation_id="does-not-exist"))
+    response = _post_decision_completed(client, correlation_id="does-not-exist")
 
     assert response.status_code == 200
 

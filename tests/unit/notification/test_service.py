@@ -15,51 +15,12 @@ from services.notification.accessors.fake_channel import FakeNotificationChannel
 from services.notification.accessors.notification_channel import NotificationChannelError
 from services.notification.repository import InMemoryNotificationRepository
 from services.notification.service import NotificationService, build_notification_service
-from shared.contracts.models import (
-    ApprovalCompletedEvent,
-    ApprovalResolution,
-    Decision,
-    DecisionCompletedEvent,
-    PaymentCompletedEvent,
-    PaymentResolution,
-    Route,
+from shared.contracts.models import ApprovalResolution, PaymentResolution, Route
+from tests.support.event_fixtures import (
+    approval_completed_event,
+    decision_completed_event,
+    payment_completed_event,
 )
-from tests.support.decision_fixtures import clean_invoice
-
-
-def _decision(route: Route = Route.REJECT, correlation_id: str = "corr-1") -> Decision:
-    return Decision(
-        route=route, reason="test reason", triggered_rules=[], correlation_id=correlation_id
-    )
-
-
-def _decision_completed_event(
-    route: Route, correlation_id: str = "corr-1"
-) -> DecisionCompletedEvent:
-    return DecisionCompletedEvent(
-        invoice=clean_invoice(), decision=_decision(route, correlation_id)
-    )
-
-
-def _approval_completed_event(
-    resolution: ApprovalResolution, correlation_id: str = "corr-1"
-) -> ApprovalCompletedEvent:
-    return ApprovalCompletedEvent(
-        invoice=clean_invoice(),
-        decision=_decision(Route.HUMAN_REVIEW, correlation_id),
-        resolution=resolution,
-    )
-
-
-def _payment_completed_event(
-    resolution: PaymentResolution, correlation_id: str = "corr-1"
-) -> PaymentCompletedEvent:
-    return PaymentCompletedEvent(
-        invoice=clean_invoice(),
-        decision=_decision(Route.AUTO_APPROVE, correlation_id),
-        resolution=resolution,
-        reason="test reason",
-    )
 
 
 def _service(
@@ -77,7 +38,7 @@ def _service(
 async def test_decision_completed_reject_route_sends_notification() -> None:
     service, _, channel = _service()
 
-    await service.handle_decision_completed(_decision_completed_event(Route.REJECT))
+    await service.handle_decision_completed(decision_completed_event(Route.REJECT))
 
     assert len(channel.sent) == 1
     assert channel.sent[0][3] == "decision.completed"
@@ -86,7 +47,7 @@ async def test_decision_completed_reject_route_sends_notification() -> None:
 async def test_decision_completed_duplicate_route_sends_notification() -> None:
     service, _, channel = _service()
 
-    await service.handle_decision_completed(_decision_completed_event(Route.DUPLICATE))
+    await service.handle_decision_completed(decision_completed_event(Route.DUPLICATE))
 
     assert len(channel.sent) == 1
     assert "duplicate" in channel.sent[0][2].lower()
@@ -95,7 +56,7 @@ async def test_decision_completed_duplicate_route_sends_notification() -> None:
 async def test_decision_completed_auto_approve_route_ignored() -> None:
     service, _, channel = _service()
 
-    await service.handle_decision_completed(_decision_completed_event(Route.AUTO_APPROVE))
+    await service.handle_decision_completed(decision_completed_event(Route.AUTO_APPROVE))
 
     assert channel.sent == []
 
@@ -106,7 +67,7 @@ async def test_escalation_to_human_review_does_not_notify_submitter() -> None:
     via approval.completed/payment.completed instead."""
     service, _, channel = _service()
 
-    await service.handle_decision_completed(_decision_completed_event(Route.HUMAN_REVIEW))
+    await service.handle_decision_completed(decision_completed_event(Route.HUMAN_REVIEW))
 
     assert channel.sent == []
 
@@ -117,7 +78,7 @@ async def test_escalation_to_human_review_does_not_notify_submitter() -> None:
 async def test_approval_completed_rejected_sends_notification() -> None:
     service, _, channel = _service()
 
-    await service.handle_approval_completed(_approval_completed_event(ApprovalResolution.REJECTED))
+    await service.handle_approval_completed(approval_completed_event(ApprovalResolution.REJECTED))
 
     assert len(channel.sent) == 1
     assert channel.sent[0][3] == "approval.completed"
@@ -128,7 +89,7 @@ async def test_approval_approved_does_not_notify_because_payment_will() -> None:
     which will send the eventual notification once the saga finishes."""
     service, _, channel = _service()
 
-    await service.handle_approval_completed(_approval_completed_event(ApprovalResolution.APPROVED))
+    await service.handle_approval_completed(approval_completed_event(ApprovalResolution.APPROVED))
 
     assert channel.sent == []
 
@@ -139,7 +100,7 @@ async def test_approval_approved_does_not_notify_because_payment_will() -> None:
 async def test_payment_completed_completed_sends_notification() -> None:
     service, _, channel = _service()
 
-    await service.handle_payment_completed(_payment_completed_event(PaymentResolution.COMPLETED))
+    await service.handle_payment_completed(payment_completed_event(PaymentResolution.COMPLETED))
 
     assert len(channel.sent) == 1
     assert channel.sent[0][3] == "payment.completed"
@@ -148,7 +109,7 @@ async def test_payment_completed_completed_sends_notification() -> None:
 async def test_payment_completed_failed_sends_notification_with_reason() -> None:
     service, _, channel = _service()
 
-    await service.handle_payment_completed(_payment_completed_event(PaymentResolution.FAILED))
+    await service.handle_payment_completed(payment_completed_event(PaymentResolution.FAILED))
 
     assert len(channel.sent) == 1
     assert "test reason" in channel.sent[0][2]
@@ -159,7 +120,7 @@ async def test_payment_completed_failed_sends_notification_with_reason() -> None
 
 async def test_idempotency_guard_redelivery_of_same_event_does_not_call_send_twice() -> None:
     service, _, channel = _service()
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
 
     await service.handle_payment_completed(event)
     await service.handle_payment_completed(event)
@@ -171,7 +132,7 @@ async def test_send_failure_propagates_uncaught_and_mark_notified_never_called()
     channel = FakeNotificationChannel(fail_for={"TEST-0000"})
     service, repository, _ = _service(channel=channel)
 
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
     with pytest.raises(NotificationChannelError):
         await service.handle_payment_completed(event)
 
@@ -183,7 +144,7 @@ async def test_redelivery_after_failed_send_succeeds_and_marks_notified() -> Non
     the retry actually recovers, not just that a failure doesn't corrupt state."""
     channel = FakeNotificationChannel(fail_first_n_calls=1)
     service, repository, _ = _service(channel=channel)
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
 
     with pytest.raises(NotificationChannelError):
         await service.handle_payment_completed(event)
@@ -225,7 +186,7 @@ async def test_mark_notified_failure_causes_resend_on_redelivery() -> None:
     repository = _MarkNotifiedFailsOnceRepository()
     channel = FakeNotificationChannel()
     service = build_notification_service(repository, channel)
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
 
     with pytest.raises(RuntimeError):
         await service.handle_payment_completed(event)
@@ -248,7 +209,7 @@ async def test_notification_sent_log_includes_event_source(
     every key except correlation_id) - source must be embedded in the
     message text itself to be visible in production JSON logs."""
     service, _, _ = _service()
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
 
     with caplog.at_level(logging.INFO, logger="services.notification.service"):
         await service.handle_payment_completed(event)
@@ -261,7 +222,7 @@ async def test_notification_already_sent_skipping_log_includes_event_source(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     service, _, _ = _service()
-    event = _payment_completed_event(PaymentResolution.COMPLETED)
+    event = payment_completed_event(PaymentResolution.COMPLETED)
     await service.handle_payment_completed(event)
 
     caplog.clear()
@@ -282,6 +243,6 @@ async def test_already_notified_helper_reflects_repository_state() -> None:
 
     assert await service.already_notified("corr-1") is False
 
-    await service.handle_payment_completed(_payment_completed_event(PaymentResolution.COMPLETED))
+    await service.handle_payment_completed(payment_completed_event(PaymentResolution.COMPLETED))
 
     assert await service.already_notified("corr-1") is True
