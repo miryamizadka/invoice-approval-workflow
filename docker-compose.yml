@@ -35,6 +35,8 @@ services:
         condition: service_healthy
       notification:
         condition: service_healthy
+      audit:
+        condition: service_healthy
     # Unlike the Docker provider, the file provider has no independent way to
     # notice new backends coming up - its routes are static from the start,
     # so there's no benefit to letting gateway start before its backends are
@@ -129,6 +131,35 @@ services:
     networks: [approvalflow]
     # No host port mapping - see intake's comment above.
 
+  audit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.audit.app:app --host 0.0.0.0 --port 8005
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=approvalflow
+      - POSTGRES_PASSWORD=approvalflow
+      - POSTGRES_DB=approvalflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+    # No host port mapping - see intake's comment above. F9's audit trail:
+    # consumes decision.completed/approval.completed/payment.completed
+    # (pure choreography, no service calls it directly), reachable externally
+    # only via the gateway's /audit route. Deliberately the one service that
+    # talks to Postgres directly instead of Dapr state (ADR-008) - the app
+    # itself creates its own schema at startup (ensure_schema(), no migration
+    # framework), which is why it needs postgres healthy first (nothing else
+    # in this file depended on postgres being ready until now).
+
   postgres:
     image: postgres:16-alpine
     environment:
@@ -136,10 +167,15 @@ services:
       - POSTGRES_PASSWORD=approvalflow
       - POSTGRES_DB=approvalflow
     ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U approvalflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks: [approvalflow]
-    # Not used by any service yet - reserved for Dapr state store (separate phase).
-    # Deliberately not behind `profiles:` - M4 requires the whole system, including
-    # not-yet-used infrastructure, to come up with a single plain `docker compose up`.
+    # Now backs the Audit service's `audit_trail` table (F9, ADR-008) via direct
+    # asyncpg access - no longer unused. Deliberately not behind `profiles:` -
+    # M4 requires the whole system to come up with a single plain `docker compose up`.
 
   redis:
     image: redis:7-alpine
@@ -276,6 +312,33 @@ services:
       redis:
         condition: service_healthy
     # See intake-dapr/decision-dapr/approval-dapr/payment-dapr comments above - same reasoning, paired with notification.
+
+  audit-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "audit"
+      - "--app-port"
+      - "8005"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:audit"
+    depends_on:
+      audit:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    # See intake-dapr/decision-dapr/approval-dapr/payment-dapr/notification-dapr
+    # comments above - same reasoning, paired with audit. Only for pub/sub
+    # (audit is in dapr/components/pubsub.yaml's scopes, deliberately NOT in
+    # statestore.yaml's - it uses Postgres directly instead, see ADR-008).
 
   placement:
     image: daprio/placement:1.18.1

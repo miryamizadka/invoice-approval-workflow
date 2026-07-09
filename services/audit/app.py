@@ -1,0 +1,103 @@
+"""FastAPI transport layer - the only place in this service that knows HTTP
+(and, via DaprApp, Dapr's pub/sub subscription wiring) or Postgres startup.
+Endpoints only call AuditService; all business logic lives there.
+
+Audit is the first service with genuine async startup work of its own
+(schema creation via the lifespan hook below) other than Payment's budget
+seeding - same `asynccontextmanager` pattern.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+
+from dapr.ext.fastapi import DaprApp
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from services.audit.postgres_repository import PostgresAuditRepository
+from services.audit.repository import AuditRepository
+from services.audit.service import AuditService, build_audit_service
+from shared.contracts.models import (
+    ApprovalCompletedEvent,
+    DecisionCompletedEvent,
+    PaymentCompletedEvent,
+)
+
+
+def create_app(repository: AuditRepository | None = None) -> FastAPI:
+    resolved_repository = repository or PostgresAuditRepository()
+    audit_service = build_audit_service(resolved_repository)
+
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        await resolved_repository.ensure_schema()
+        yield
+
+    app = FastAPI(title="ApprovalFlow Audit Service", lifespan=_lifespan)
+    app.state.audit_service = audit_service
+    dapr_app = DaprApp(app)
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok", "service": "audit-service"}
+
+    @app.get("/audit/{tracking_id}")
+    async def get_audit_trail(tracking_id: str, request: Request) -> Any:
+        service: AuditService = request.app.state.audit_service
+        trail = await service.get_trail(tracking_id)
+        if trail is None:
+            return JSONResponse(status_code=404, content={"error": "not_found"})
+        return trail.model_dump(mode="json")
+
+    @dapr_app.subscribe(
+        pubsub="pubsub", topic="decision.completed", route="/events/decision-completed"
+    )
+    async def handle_decision_completed(request: Request) -> dict[str, str]:
+        body: dict[str, Any] = await request.json()
+        event = DecisionCompletedEvent.model_validate(body["data"])
+        service: AuditService = request.app.state.audit_service
+        await service.record_decision_completed(event)
+        return {"status": "SUCCESS"}
+
+    @dapr_app.subscribe(
+        pubsub="pubsub", topic="approval.completed", route="/events/approval-completed"
+    )
+    async def handle_approval_completed(request: Request) -> dict[str, str]:
+        body: dict[str, Any] = await request.json()
+        event = ApprovalCompletedEvent.model_validate(body["data"])
+        service: AuditService = request.app.state.audit_service
+        await service.record_approval_completed(event)
+        return {"status": "SUCCESS"}
+
+    @dapr_app.subscribe(
+        pubsub="pubsub", topic="payment.completed", route="/events/payment-completed"
+    )
+    async def handle_payment_completed(request: Request) -> dict[str, str]:
+        body: dict[str, Any] = await request.json()
+        event = PaymentCompletedEvent.model_validate(body["data"])
+        service: AuditService = request.app.state.audit_service
+        await service.record_payment_completed(event)
+        return {"status": "SUCCESS"}
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        # Catches infra failures deliberately never caught inside AuditService
+        # (AuditRepositoryError) - logs with correlation_id when available,
+        # returns a structured 500. Dapr still sees a non-2xx and retries later.
+        correlation_id = request.headers.get("X-Correlation-Id", "unknown")
+        logging.getLogger(__name__).exception(
+            "unhandled_exception", extra={"correlation_id": correlation_id}
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_error", "correlation_id": correlation_id},
+        )
+
+    return app
+
+
+app = create_app()  # module-level singleton for `uvicorn services.audit.app:app`

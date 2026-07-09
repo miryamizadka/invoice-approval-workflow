@@ -1140,6 +1140,101 @@ surfaced the incompatibility; once against the working file-provider implementat
 
 ---
 
+# Phase 8.6 — Audit Trail (F9)
+
+## Goal
+
+F9 ("Complete decision trail", Priority: MUST HAVE) was not satisfied: direct inspection of
+`PaymentRecord`/`PendingApproval`/`Submission` confirmed `recommendation` was persisted only by
+Approval, and only for `human_review`-routed items - for `auto_approve`/`reject`/`duplicate` (the
+majority of invoices), the agent's recommendation and reasoning were never stored anywhere
+retrievable. There was also no single queryable source: reconstructing a tracking id's full
+journey meant querying up to three services' endpoints by hand. F8 (Dashboard, NICE TO HAVE)
+depends on this data existing in aggregate form, so F9 was built first.
+
+## Tasks
+
+- [x] New **Audit service** (`services/audit/`), IDesign-layered exactly like Notification
+  (`app.py` → `service.py` → `repository.py` Protocol → `postgres_repository.py`): a pure,
+  observational consumer of the three *existing* choreography events -
+  `decision.completed`/`approval.completed`/`payment.completed` - no new event introduced.
+- [x] Built strictly TDD: `tests/unit/audit/test_service.py` (14 unit tests against
+  `InMemoryAuditRepository`, covering monotonic enrichment, order-independence, and the exact
+  recommendation-for-auto_approve gap) written and watched fail before any production code;
+  `tests/integration/test_audit_service.py` (HTTP → `AuditService` → in-memory repository, no
+  real Postgres/Dapr) added the same way.
+- [x] **Order-independence, not assumed** - a real risk raised in review: any of the three
+  events can create the `audit_trail` row from scratch (all three carry a full `invoice` +
+  `decision` copy), not just `decision.completed`. `decision_completed_at` made nullable (was
+  originally `NOT NULL`, would have broken an out-of-order `INSERT`) - caught and fixed before
+  implementation, not after.
+- [x] **Deliberate architectural exception, documented in `docs/adr/ADR-008-Audit-Trail-Direct-Postgres-Access.md`**:
+  Audit accesses PostgreSQL directly via `asyncpg` (wrapped behind the same `AuditRepository`
+  Protocol pattern every other Accessor uses), not through Dapr state - the one service in this
+  project that doesn't. Reason: Dapr state is a key→blob store, fine for point lookups, not for
+  the aggregation F8 will eventually need (`SUM`/`GROUP BY`); `ARCHITECTURE.md` §8 already
+  earmarked Postgres for exactly this. Schema created via a plain `CREATE TABLE IF NOT EXISTS`
+  at startup (`ensure_schema()`, FastAPI lifespan hook) - no migration framework, same posture
+  as Payment's startup budget-seeding.
+- [x] `docker-compose.yml`: `postgres` gained a `pg_isready` healthcheck (nothing depended on it
+  being ready before); new `audit`/`audit-dapr` service pair (port `8005`, no host port mapping);
+  `audit` added to `dapr/components/pubsub.yaml`'s scopes - deliberately **not** added to
+  `statestore.yaml` (it doesn't use Dapr state at all).
+- [x] `traefik/dynamic.yml`: new `/audit` router + service, same shared `ratelimit` middleware as
+  every other route; `gateway`'s `depends_on` gained `audit: condition: service_healthy`.
+- [x] `tests/support/event_fixtures.py` extended: `approval_completed_event`/
+  `payment_completed_event` gained an optional `decision:` override, so a test can chain all
+  three events for one tracking_id using the *same* `Decision` object - what Approval/Payment
+  actually relay in production. Needed because no earlier test chained all three events for one
+  tracking_id; without it, two of the new unit tests would have passed by coincidence (the shared
+  fixtures' independently-hardcoded routes happened to match) rather than actually proving
+  non-overwrite - caught and fixed before treating those tests as meaningful.
+- [x] `ARCHITECTURE.md` updated: §3 diagram gained the Audit fan-in node; §4 gained an Audit row
+  + description; §7 gained the Gateway→Audit row, the subscription paragraph, and the gateway
+  paragraph now lists five routed services; §8's data table gained the `audit_trail` row and
+  dropped the stale "PostgreSQL... currently unused" wording; §12 rewritten to state F9 is now
+  backed by a real queryable store, not just structured logs.
+- [x] `MASTER_CHECKLIST.md`: F9's five previously-unchecked sub-items all checked with concrete
+  evidence; M4's "Databases included" line updated (postgres is no longer unused); M6's entry
+  point line now lists Audit among the five gateway-routed services.
+
+## Verification
+
+Ran live against `docker compose up --build -d` (all containers healthy, `audit` included):
+- All four invoice journeys re-run through the gateway with unique invoice numbers and checked
+  against `GET /audit/{tracking_id}`:
+  - INV-1001 (`auto_approve`) - **the critical check**: `recommendation_type`/`confidence`/
+    `reasoning` all present. This is exactly the gap that didn't exist before this phase - an
+    auto-approved invoice's agent reasoning is now durably stored.
+  - INV-1003 (`human_review` → approved → paid) - full trail: `route`, `approval_resolution`,
+    `payment_resolution` all correct.
+  - INV-1012 (`human_review` → approved → payment fails, saga compensates) - `payment_resolution:
+    failed` with the exact simulated-decline reason captured.
+  - A genuine duplicate (same invoice submitted twice) - `route: duplicate`,
+    `recommendation_type: null` (Decision never ran for it), confirming the design doesn't force
+    a recommendation where none exists.
+- `docker exec <postgres> psql -c "SELECT route, COUNT(*), SUM(total) FROM audit_trail GROUP BY
+  route"` - real SQL aggregation confirmed working directly (98 rows accumulated across the whole
+  dev session's traffic, via Dapr's redis-streams backlog replay for Audit's first-ever
+  subscription - not a bug, expected behavior for a brand-new consumer group against a
+  long-lived Redis instance).
+- `GET /audit/does-not-exist` → clean `{"error": "not_found"}`, 404 - not a raw error leak.
+- **Idempotency/recovery**: `docker compose up -d --force-recreate audit` then `--force-recreate
+  audit-dapr` (sequential, the established fix for the sidecar-netns issue) - a fresh invoice
+  submitted immediately after was captured correctly.
+- **Failure isolation, the point of the design, proven not assumed**: `docker compose stop audit
+  audit-dapr`, then ran a full human_review → approve → pay → notify journey - completed
+  identically to normal (`GET /payments/{id}` and `GET /notifications/{id}` both confirmed).
+  Restarting `audit` afterward auto-backfilled the missed event via Dapr's at-least-once
+  redelivery - no data lost, not just "no crash."
+- **Real friction hit and noted**: adding the `/audit` route to `traefik/dynamic.yml` while
+  `gateway` was already running did not take effect until `docker compose restart gateway` -
+  Traefik's file provider did not hot-reload the new router in this environment. Not a bug in
+  this phase's code; worth knowing for any future route addition.
+- Full local suite (384 tests), `ruff check .`, `mypy .` all pass.
+
+---
+
 # Phase 9 — Quality
 
 ## Tasks

@@ -21,6 +21,9 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
     APP --> NOT
     PAY --> NOT
     NOT --> UI
+    DEC --> AUD[Audit Service - decision trail]
+    APP --> AUD
+    PAY --> AUD
 ```
 
 
@@ -34,6 +37,7 @@ ApprovalFlow
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
 | Payment | Saga: reserve budget → pay → compensate | pub/sub | pub/sub, state | payments, budgets (Dapr state/Redis - interim; see §8/§9) |
 | Notification | Final result notification to submitter | pub (consumer) | pub/sub, state | notification idempotency marker (see §8) |
+| Audit | Cross-service decision trail projection (F9) | REST (read) + pub (consumer) | pub/sub | audit_trail (PostgreSQL - see §8) |
 | UI | Minimal interface to submit and view status; approver queue + dashboard | REST (to gateway) | — | — |
 
 
@@ -48,6 +52,8 @@ ApprovalFlow
 **Payment** - Runs the payment as a saga (M9) to guarantee a consistent outcome across steps. It reserves the department budget, executes the payment, and on any failure runs compensating actions (release the reservation) so there are no orphaned reservations or partial/double payments. All steps are idempotent (M10), so a retried or redelivered payment produces exactly one effect. Budget management (§7) lives here because reserve and release are saga steps.
 
 **Notification** - Listens for the final outcome and notifies the submitter (F2, M8). It's a pure consumer - it never initiates, only reacts to the result event. It is a terminal consumer in this architecture's choreography chain - it never publishes any event of its own downstream.
+
+**Audit** - Builds the complete decision trail required by F9: a pure, observational consumer of `decision.completed`/`approval.completed`/`payment.completed`, projecting each into one row per tracking id in PostgreSQL (the `audit_trail` table), exposed for retrieval via `GET /audit/{tracking_id}`. It is a read model, not a source of truth - every business service keeps owning its own operational state; Audit only makes the cross-service history queryable in one place. It never blocks or influences a decision and publishes nothing onward; a failure of Audit cannot prevent Approval/Payment/Notification from completing (verified live - see ADR-008 and PLAN.md's Phase 9). Unlike every other service, Audit accesses PostgreSQL directly instead of through Dapr state - a deliberate, documented exception (ADR-008), since F8-style aggregation (rates, money totals) needs real SQL, not a key-value blob store.
 
 **UI (M7)** - A minimal web interface lets a submitter send an item and track its status with a plain-language reason (F1, F2), and lets an approver act on the escalation queue (F4, F5). It also surfaces the controller dashboard (F8) showing throughput and auto-approval vs. escalation rates, read from the decision data.
 
@@ -74,7 +80,7 @@ Dependencies flow strictly downward (Manager → Engine → Accessor → Resourc
 | LLM | Free-tier (Groq/Gemini) via provider interface | Swappable + fail-fast (M15); stub in CI |
 | Runtime / integration | Dapr | Pub/sub, state, secrets, config (M5) |
 | State + broker | Redis | Dapr state store + pub/sub backend |
-| Business data | PostgreSQL | ACID for invoices, decisions, payments |
+| Business data | PostgreSQL | ACID for invoices, decisions, payments; also backs the Audit trail (F9, ADR-008) |
 | API Gateway | Traefik | Single entry point + rate-limiting (M6) - implemented; see §7 |
 | Testing | pytest | Unit + integration + e2e (M17, N6) |
 | CI/CD | GitHub Actions | Quality gates on every push (M16) |
@@ -94,6 +100,7 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Gateway | Approval | REST | Sync | Escalation queue + approve/reject/request-info (F4/F5) |
 | Gateway | Payment | REST | Sync | Payment/budget status (ops/debug, not part of the choreography) |
 | Gateway | Notification | REST | Sync | Notification status (ops/debug) |
+| Gateway | Audit | REST | Sync | Decision trail retrieval (F9) |
 | Intake | Decision | Dapr Pub/Sub | Async | Loose coupling |
 | Decision | Approval | Dapr Pub/Sub | Async | Escalation flow |
 | Decision | Payment | Dapr Pub/Sub | Async | Auto-approved flow |
@@ -101,6 +108,7 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Payment | Notification | Dapr Pub/Sub | Async | Result notification |
 | Decision | Notification | Dapr Pub/Sub | Async | Reject result notification |
 | Intake | Notification | Dapr Pub/Sub | Async | Duplicate result notification (via `decision.completed`, see below) |
+| Decision/Approval/Payment | Audit | Dapr Pub/Sub | Async | Decision trail projection (F9) - via `decision.completed`/`approval.completed`/`payment.completed`, the same three topics Notification already consumes |
 
 Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `payment.completed`.
 
@@ -114,7 +122,9 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `
 
 Notification is a pure, terminal consumer across all three subscriptions - it publishes nothing onward. Its own idempotency guard against Dapr's at-least-once redelivery (M10) is a minimal Dapr-state marker (`tracking_id` -> already-notified), not a domain record - see §8.
 
-**M6 implementation (API Gateway)**: Traefik, configured via a static file (`traefik/dynamic.yml`), matching this document's own "logic free" mandate for the gateway (§4) - it is routing + rate-limiting only, never business logic. **Not** Traefik's Docker-label provider - that was the original plan, implemented and then reverted after it proved empirically incompatible with this environment's Docker Engine version (bare `400 Bad Request` from the daemon, reproduced across two Traefik releases ~15 months apart; see ADR-007 for the full diagnosis). The file provider sidesteps this entirely: it never talks to the Docker API, so there's no Docker socket mount at all - a smaller footprint than the original plan, not just a workaround. Path-prefix routing fronts **Intake** (`/invoices`), **Approval** (`/approvals`), **Payment** (`/payments`, `/budgets`), and **Notification** (`/notifications`) - all four lose their direct host port mapping, reachable only through the gateway (port `8080`); backend addresses (`http://intake:8000`, etc.) resolve through Docker Compose's own internal DNS, which transparently re-resolves when a container is recreated (verified live). A single shared rate-limit middleware (per-client-IP, `average=10`, `burst=50`) is applied to every router, matching "the single external entry point" reading literally: there is no carve-out for endpoints that happen to be operational/debug rather than customer-facing (Payment's `GET /payments` list-all and `GET /budgets/{department}` are, if anything, more sensitive than Notification's boolean-only endpoint, not less - a reason to route them, not exempt them). **Decision gets neither a port nor a gateway route** - it is pure choreography (consumes `invoice.submitted`, publishes `decision.completed`); nothing external ever calls it over HTTP, so giving its `/decisions` testing endpoint a public route would be the opposite of "hide internal structure", not an application of it. `postgres`/`redis` keep their host ports - they are infrastructure resources (M4's "databases/queues"), not REST API surface, so they sit outside M6's scope entirely.
+**Audit (F9)** subscribes to the same three topics `decision.completed`/`approval.completed`/`payment.completed` - no new event was introduced. Unlike Payment/Notification, Audit never filters by `route`/`resolution`: F9 requires the trail to be complete, including `reject`/`duplicate` outcomes. Each of the three events already carries a full `invoice` + `decision` copy, so any one of them can create the row for a given tracking id if it is the first to arrive - the design does not assume `decision.completed` is always first, even though in practice it almost always is. Later events only enrich columns the earlier one left empty ("monotonic enrichment"), never overwrite what's already there. See ADR-008 for why Audit is the one service that talks to PostgreSQL directly instead of through Dapr state.
+
+**M6 implementation (API Gateway)**: Traefik, configured via a static file (`traefik/dynamic.yml`), matching this document's own "logic free" mandate for the gateway (§4) - it is routing + rate-limiting only, never business logic. **Not** Traefik's Docker-label provider - that was the original plan, implemented and then reverted after it proved empirically incompatible with this environment's Docker Engine version (bare `400 Bad Request` from the daemon, reproduced across two Traefik releases ~15 months apart; see ADR-007 for the full diagnosis). The file provider sidesteps this entirely: it never talks to the Docker API, so there's no Docker socket mount at all - a smaller footprint than the original plan, not just a workaround. Path-prefix routing fronts **Intake** (`/invoices`), **Approval** (`/approvals`), **Payment** (`/payments`, `/budgets`), **Notification** (`/notifications`), and **Audit** (`/audit`) - all five lose their direct host port mapping, reachable only through the gateway (port `8080`); backend addresses (`http://intake:8000`, etc.) resolve through Docker Compose's own internal DNS, which transparently re-resolves when a container is recreated (verified live). A single shared rate-limit middleware (per-client-IP, `average=10`, `burst=50`) is applied to every router, matching "the single external entry point" reading literally: there is no carve-out for endpoints that happen to be operational/debug rather than customer-facing (Payment's `GET /payments` list-all and `GET /budgets/{department}` are, if anything, more sensitive than Notification's boolean-only endpoint, not less - a reason to route them, not exempt them). **Decision gets neither a port nor a gateway route** - it is pure choreography (consumes `invoice.submitted`, publishes `decision.completed`); nothing external ever calls it over HTTP, so giving its `/decisions` testing endpoint a public route would be the opposite of "hide internal structure", not an application of it. `postgres`/`redis` keep their host ports - they are infrastructure resources (M4's "databases/queues"), not REST API surface, so they sit outside M6's scope entirely.
 
 
 ## 8. Data Architecture
@@ -124,10 +134,11 @@ Notification is a pure, terminal consumer across all three subscriptions - it pu
 | Invoices | PostgreSQL (interim: Dapr state/Redis - see §9 Duplicate Detection) | Intake |
 | Decisions | PostgreSQL | Decision |
 | Approval state (paused/resume) | Redis (Dapr state) | Approval |
-| Payments | Dapr state (Redis) - interim, same migration path as Invoices/Approval state above; PostgreSQL remains the eventual target, currently unused (see docker-compose.yml) | Payment |
+| Payments | Dapr state (Redis) - interim, same migration path as Invoices/Approval state above | Payment |
 | Budgets | Dapr state (Redis) - interim, same as Payments; the ETag-based optimistic concurrency §9 requires (INV-1014) is a Dapr state mechanism, not a PostgreSQL one | Payment |
 | Idempotency & dedup keys | Redis (Dapr state) | All services |
 | Notification idempotency marker (tracking_id sent/not) | Dapr state (Redis) - point lookups/writes only, no index (nothing enumerates notified tracking_ids) | Notification |
+| Audit trail (F9 - cross-service decision history, one row per tracking id) | PostgreSQL, direct `asyncpg` access (ADR-008) - no longer unused; first real consumer of this container | Audit |
 
 Each service owns its own data (database-per-service); no service reads another's store directly - data is shared only through events.
 
@@ -225,7 +236,7 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG
 
 ## 12. Cross-Cutting Concerns
 
-**Logging & correlation id (M14):** every log line carries a correlation id assigned at intake, so a single request can be traced end-to-end across all services - this is also the backbone of the auditor's decision trail (F9).
+**Logging & correlation id (M14):** every log line carries a correlation id assigned at intake, so a single request can be traced end-to-end across all services. **F9 (complete decision trail)** is implemented by the Audit service (§4/§7, ADR-008) - a dedicated, queryable PostgreSQL projection keyed by the same correlation id, not just structured logs. Before Audit existed, `recommendation` was persisted only by Approval, and only for `human_review`-routed items - for `auto_approve`/`reject`/`duplicate` (the majority), the agent's reasoning was never stored anywhere retrievable after the request completed; Audit closes that gap for every route.
 
 **Error handling & resilience:** each service exposes a health check; the LLM provider is swappable and fails fast (never silently) on errors (M15); inter-service calls use retry and timeout - for pub/sub this is a Dapr resiliency policy on the subscriber, not application code.
 
