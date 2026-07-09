@@ -38,10 +38,15 @@ import httpx
 
 import scripts.verify_inv1014_concurrency as concurrency_check
 
-INTAKE_URL = "http://localhost:8000"
-APPROVAL_URL = "http://localhost:8002"
-PAYMENT_URL = "http://localhost:8003"
-NOTIFICATION_URL = "http://localhost:8004"
+# All four services are fronted by the Traefik gateway now (M6) - no direct
+# host ports. Path-prefix routing means the same base URL works for all of
+# them; kept as four separate constants (not one GATEWAY_URL) so the rest of
+# this file's call sites don't need to change.
+GATEWAY_URL = "http://localhost:8080"
+INTAKE_URL = GATEWAY_URL
+APPROVAL_URL = GATEWAY_URL
+PAYMENT_URL = GATEWAY_URL
+NOTIFICATION_URL = GATEWAY_URL
 HEALTH_TIMEOUT_SECONDS = 60
 POLL_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 2
@@ -79,18 +84,26 @@ def _ok(label: str, tracking_id: str, elapsed: float) -> None:
 # --- HTTP helpers -------------------------------------------------------------
 
 
-async def _wait_for_health(client: httpx.AsyncClient, url: str, name: str) -> None:
+async def _wait_for_reachable(client: httpx.AsyncClient, url: str, path: str, name: str) -> None:
+    """Same deadline-loop pattern as a direct /health check, but probes a
+    real route through the gateway instead - none of the services expose
+    /health directly to the host anymore now that Traefik fronts them (M6).
+    Any HTTP response (even 404 for a nonexistent id) proves the
+    Traefik -> service routing itself is working, not just that the
+    process is alive."""
     deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            response = await client.get(f"{url}/health", timeout=3)
-            if response.status_code == 200:
-                print(f"[ok] {name} healthy")
+            response = await client.get(f"{url}{path}", timeout=3)
+            if response.status_code < 500:
+                print(f"[ok] {name} reachable")
                 return
         except httpx.HTTPError:
             pass
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-    raise SystemExit(f"FAIL: {name} did not become healthy within {HEALTH_TIMEOUT_SECONDS}s")
+    raise SystemExit(
+        f"FAIL: {name} not reachable through the gateway within {HEALTH_TIMEOUT_SECONDS}s"
+    )
 
 
 async def _submit_invoice(client: httpx.AsyncClient, body: dict[str, Any]) -> str:
@@ -353,14 +366,14 @@ async def verify_inv_1014_concurrency() -> None:
 async def _main_impl() -> None:
     overall_start = time.perf_counter()
     async with httpx.AsyncClient() as client:
-        print("Waiting for services to become healthy...")
-        for url, name in (
-            (INTAKE_URL, "intake"),
-            (APPROVAL_URL, "approval"),
-            (PAYMENT_URL, "payment"),
-            (NOTIFICATION_URL, "notification"),
+        print("Waiting for services to become reachable through the gateway...")
+        for url, path, name in (
+            (INTAKE_URL, "/invoices/__probe__", "intake"),
+            (APPROVAL_URL, "/approvals/__probe__", "approval"),
+            (PAYMENT_URL, "/payments/__probe__", "payment"),
+            (NOTIFICATION_URL, "/notifications/__probe__", "notification"),
         ):
-            await _wait_for_health(client, url, name)
+            await _wait_for_reachable(client, url, path, name)
 
         await verify_auto_approve(client)
         await verify_inv_1003(client)

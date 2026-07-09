@@ -1,0 +1,73 @@
+# Static routing config for the API Gateway (M6) - Traefik's file provider.
+#
+# Not the Docker provider (label-based auto-discovery): empirically confirmed
+# incompatible with this environment's Docker Engine (29.0.1, API 1.52,
+# minimum 1.44) - Traefik's vendored Docker client gets a bare "400 Bad
+# Request" from the daemon regardless of Traefik version (tried v3.1.2 and
+# v3.5.6, plus forcing DOCKER_API_VERSION=1.44 - all failed identically).
+# See ADR-007 for the full reasoning.
+#
+# This file is still "logic free" per ARCHITECTURE.md's own mandate for the
+# gateway - static routing + rate-limit declaration, no code. The one real
+# trade-off versus the Docker provider: backend addresses are fixed here,
+# not dynamically discovered - a non-issue for this project's static
+# docker-compose topology (no scaling/rescheduling to react to).
+
+http:
+  middlewares:
+    ratelimit:
+      rateLimit:
+        average: 10
+        burst: 50
+        # Shared by every router below (not one middleware per service) -
+        # one per-client-IP budget across the whole gateway, matching "the
+        # single external entry point" more closely than independent budgets
+        # per route. burst=50 (not a stricter default) gives real headroom
+        # for verify_phase8.py's own submit/poll/approve traffic pattern.
+
+  routers:
+    intake:
+      rule: "PathPrefix(`/invoices`)"
+      entryPoints: ["web"]
+      service: intake
+      middlewares: ["ratelimit"]
+    approval:
+      rule: "PathPrefix(`/approvals`)"
+      entryPoints: ["web"]
+      service: approval
+      middlewares: ["ratelimit"]
+    payment:
+      rule: "PathPrefix(`/payments`)"
+      entryPoints: ["web"]
+      service: payment
+      middlewares: ["ratelimit"]
+    budgets:
+      rule: "PathPrefix(`/budgets`)"
+      entryPoints: ["web"]
+      service: payment   # same backend as the payment router above
+      middlewares: ["ratelimit"]
+    notification:
+      rule: "PathPrefix(`/notifications`)"
+      entryPoints: ["web"]
+      service: notification
+      middlewares: ["ratelimit"]
+    # Decision has no router here, deliberately: pure choreography, nothing
+    # external ever calls it over HTTP - see ARCHITECTURE.md §7/§4.
+
+  services:
+    intake:
+      loadBalancer:
+        servers:
+          - url: "http://intake:8000"
+    approval:
+      loadBalancer:
+        servers:
+          - url: "http://approval:8002"
+    payment:
+      loadBalancer:
+        servers:
+          - url: "http://payment:8003"
+    notification:
+      loadBalancer:
+        servers:
+          - url: "http://notification:8004"

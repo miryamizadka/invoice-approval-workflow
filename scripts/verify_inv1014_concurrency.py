@@ -10,8 +10,9 @@ asyncio.gather so the two `approve` calls actually overlap in time, and runs
 several iterations (not once) to build real confidence rather than a single
 lucky run.
 
-Requires `docker compose up --build -d` already running (9+2 = 11
-containers, including `payment`/`payment-dapr`). Each iteration submits a
+Requires `docker compose up --build -d` already running, including
+`payment`/`payment-dapr` and the `gateway` (Traefik) - Approval/Payment are
+fronted by the gateway now (M6), no direct host ports. Each iteration submits a
 fresh INV-1014-style pair (unique invoice numbers, to dodge F3 dedup)
 against the real `marketing-2026Q2` department budget. Before each
 iteration, the script resets that budget directly in Redis (via `docker
@@ -44,9 +45,13 @@ from typing import Any
 
 import httpx
 
-INTAKE_URL = "http://localhost:8000"
-APPROVAL_URL = "http://localhost:8002"
-PAYMENT_URL = "http://localhost:8003"
+# Intake/Approval/Payment are fronted by the Traefik gateway now (M6) - no
+# direct host ports. Path-prefix routing means the same base URL works for
+# all of them.
+GATEWAY_URL = "http://localhost:8080"
+INTAKE_URL = GATEWAY_URL
+APPROVAL_URL = GATEWAY_URL
+PAYMENT_URL = GATEWAY_URL
 HEALTH_TIMEOUT_SECONDS = 60
 POLL_TIMEOUT_SECONDS = 120
 POLL_INTERVAL_SECONDS = 2
@@ -100,18 +105,25 @@ def _invoice_body(suffix: str, invoice_number_suffix: str) -> dict[str, Any]:
     }
 
 
-async def _wait_for_health(client: httpx.AsyncClient, url: str, name: str) -> None:
+async def _wait_for_reachable(client: httpx.AsyncClient, url: str, path: str, name: str) -> None:
+    """Same deadline-loop pattern as a direct /health check, but probes a
+    real route through the gateway instead - none of the services expose
+    /health directly to the host anymore now that Traefik fronts them (M6).
+    Any HTTP response (even 404) proves the Traefik -> service routing
+    itself is working, not just that the process is alive."""
     deadline = time.monotonic() + HEALTH_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         try:
-            response = await client.get(f"{url}/health", timeout=3)
-            if response.status_code == 200:
-                print(f"[ok] {name} healthy")
+            response = await client.get(f"{url}{path}", timeout=3)
+            if response.status_code < 500:
+                print(f"[ok] {name} reachable")
                 return
         except httpx.HTTPError:
             pass
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
-    raise SystemExit(f"FAIL: {name} did not become healthy within {HEALTH_TIMEOUT_SECONDS}s")
+    raise SystemExit(
+        f"FAIL: {name} not reachable through the gateway within {HEALTH_TIMEOUT_SECONDS}s"
+    )
 
 
 async def _submit_invoice(client: httpx.AsyncClient, body: dict[str, Any]) -> str:
@@ -202,9 +214,9 @@ async def _run_iteration(client: httpx.AsyncClient, iteration: int) -> None:
 
 async def main(iterations: int) -> None:
     async with httpx.AsyncClient() as client:
-        print("Waiting for services to become healthy...")
-        await _wait_for_health(client, APPROVAL_URL, "approval")
-        await _wait_for_health(client, PAYMENT_URL, "payment")
+        print("Waiting for services to become reachable through the gateway...")
+        await _wait_for_reachable(client, APPROVAL_URL, "/approvals/__probe__", "approval")
+        await _wait_for_reachable(client, PAYMENT_URL, "/payments/__probe__", "payment")
 
         for i in range(1, iterations + 1):
             await _run_iteration(client, i)

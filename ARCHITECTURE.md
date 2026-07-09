@@ -37,7 +37,7 @@ ApprovalFlow
 | UI | Minimal interface to submit and view status; approver queue + dashboard | REST (to gateway) | — | — |
 
 
-**API Gateway** - Single entry point, routes requests for services, enforce rate limiting, hide internal structure, logic free.
+**API Gateway** - Single entry point, routes requests for services, enforce rate limiting, hide internal structure, logic free. It is the only externally supported entry point; internal service-to-service traffic remains direct over the Docker network (Dapr pub/sub) - the gateway never sits between internal services, only at the system's outer boundary. See §7 for the concrete implementation (Traefik).
 
 **Intake** - Receives the submission, returns a tracking id immediately (F1, non-blocking), and checks for duplicates (F3) before anything else. If it's a duplicate, it short-circuits without invoking Decision - no second agent call, no second payment. Otherwise it publishes an event for processing. Its single responsibility is intake and de-duplication.
 
@@ -75,7 +75,7 @@ Dependencies flow strictly downward (Manager → Engine → Accessor → Resourc
 | Runtime / integration | Dapr | Pub/sub, state, secrets, config (M5) |
 | State + broker | Redis | Dapr state store + pub/sub backend |
 | Business data | PostgreSQL | ACID for invoices, decisions, payments |
-| API Gateway | Traefik / NGINX | Single entry point + rate-limiting (M6) |
+| API Gateway | Traefik | Single entry point + rate-limiting (M6) - implemented; see §7 |
 | Testing | pytest | Unit + integration + e2e (M17, N6) |
 | CI/CD | GitHub Actions | Quality gates on every push (M16) |
 | Deployment | Docker Compose | One-command startup (M4) |
@@ -91,6 +91,9 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 |---|---|---|---|---|
 | UI | API Gateway | REST | Sync | Public API |
 | Gateway | Intake | REST | Sync | Immediate acknowledgment (tracking id) |
+| Gateway | Approval | REST | Sync | Escalation queue + approve/reject/request-info (F4/F5) |
+| Gateway | Payment | REST | Sync | Payment/budget status (ops/debug, not part of the choreography) |
+| Gateway | Notification | REST | Sync | Notification status (ops/debug) |
 | Intake | Decision | Dapr Pub/Sub | Async | Loose coupling |
 | Decision | Approval | Dapr Pub/Sub | Async | Escalation flow |
 | Decision | Payment | Dapr Pub/Sub | Async | Auto-approved flow |
@@ -110,6 +113,8 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `
 `payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification filters by `resolution`, but acts on **both** `completed` and `failed` unconditionally (§11's flowchart already shows both the DONE and FAILED paths converging on the same NOTIFY node) - the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
 
 Notification is a pure, terminal consumer across all three subscriptions - it publishes nothing onward. Its own idempotency guard against Dapr's at-least-once redelivery (M10) is a minimal Dapr-state marker (`tracking_id` -> already-notified), not a domain record - see §8.
+
+**M6 implementation (API Gateway)**: Traefik, configured via a static file (`traefik/dynamic.yml`), matching this document's own "logic free" mandate for the gateway (§4) - it is routing + rate-limiting only, never business logic. **Not** Traefik's Docker-label provider - that was the original plan, implemented and then reverted after it proved empirically incompatible with this environment's Docker Engine version (bare `400 Bad Request` from the daemon, reproduced across two Traefik releases ~15 months apart; see ADR-007 for the full diagnosis). The file provider sidesteps this entirely: it never talks to the Docker API, so there's no Docker socket mount at all - a smaller footprint than the original plan, not just a workaround. Path-prefix routing fronts **Intake** (`/invoices`), **Approval** (`/approvals`), **Payment** (`/payments`, `/budgets`), and **Notification** (`/notifications`) - all four lose their direct host port mapping, reachable only through the gateway (port `8080`); backend addresses (`http://intake:8000`, etc.) resolve through Docker Compose's own internal DNS, which transparently re-resolves when a container is recreated (verified live). A single shared rate-limit middleware (per-client-IP, `average=10`, `burst=50`) is applied to every router, matching "the single external entry point" reading literally: there is no carve-out for endpoints that happen to be operational/debug rather than customer-facing (Payment's `GET /payments` list-all and `GET /budgets/{department}` are, if anything, more sensitive than Notification's boolean-only endpoint, not less - a reason to route them, not exempt them). **Decision gets neither a port nor a gateway route** - it is pure choreography (consumes `invoice.submitted`, publishes `decision.completed`); nothing external ever calls it over HTTP, so giving its `/decisions` testing endpoint a public route would be the opposite of "hide internal structure", not an application of it. `postgres`/`redis` keep their host ports - they are infrastructure resources (M4's "databases/queues"), not REST API surface, so they sit outside M6's scope entirely.
 
 
 ## 8. Data Architecture
