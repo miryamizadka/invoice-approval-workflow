@@ -1027,6 +1027,119 @@ just a single lucky pass):
 
 ---
 
+# Phase 8.5 — API Gateway (M6)
+
+## Goal
+
+Single external entry point + rate-limiting, per `ARCHITECTURE.md`'s own literal wording:
+"must be **the single** external entry point... hide internal structure" - no carve-out for
+"operational/debug" endpoints.
+
+## Tasks
+
+- [x] Added `gateway` service to `docker-compose.yml` - Traefik (`traefik:v3.1.2`, exact patch
+  pin, matching `daprio/daprd:1.18.1`/`daprio/placement:1.18.1`'s precedent in this same file).
+- [x] **Provider mechanism pivoted mid-implementation, based on empirical failure, not
+  preference**: originally implemented with Traefik's **Docker provider** (`traefik.*` labels
+  on each service, auto-discovery via the Docker socket) - brought up live and found it
+  couldn't talk to this environment's Docker Engine (29.0.1) at all: every request failed with
+  a bare `400 Bad Request`. Diagnosed properly before reacting: confirmed the socket itself
+  works fine (official `docker:cli` image, same mount, `docker version` succeeded); tried two
+  Traefik releases 15 months apart (`v3.1.2`, `v3.5.6`) - identical failure on both; tried
+  forcing `DOCKER_API_VERSION=1.44` (the daemon's own stated minimum) - no change. This is a
+  genuine Traefik-vendored-client/Docker-Engine incompatibility, not a config mistake - full
+  diagnosis in ADR-007. **Switched to Traefik's file provider**: a static
+  `traefik/dynamic.yml` declares the same routers/services/rate-limit middleware directly, no
+  Docker API calls at all - sidesteps the incompatibility rather than working around it, and
+  removes the Docker socket mount entirely (smaller attack surface than the original plan, not
+  just a fallback).
+- [x] Intake (`/invoices`), Approval (`/approvals`), Payment (`/payments`, `/budgets` - two
+  routers, one backend), and Notification (`/notifications`) all lose their direct host port
+  mapping, routed via `traefik/dynamic.yml` - reachable only through the gateway
+  (`localhost:8080`) from now on. Backend addresses (`http://intake:8000`, etc.) resolve
+  through Docker Compose's own internal DNS, confirmed live to re-resolve automatically when a
+  container is recreated (see Verification).
+- [x] **Decision gets neither a port nor a gateway route** - a design correction made during
+  planning after review: initially planned to leave Payment/Notification's "operational"
+  endpoints directly exposed (reasoning: not real public API), but `ARCHITECTURE.md`'s literal
+  wording doesn't carve out an exception for debug endpoints - if it's reachable from the
+  host, there's more than one entry point, period. Verified no technical reason existed to
+  keep any of them exposed (rate-limiting a read-only GET doesn't hurt the scripts' existing
+  2-second polling cadence; internal healthchecks hit `localhost` inside their own container,
+  unaffected by host-port removal; nothing needs direct HTTP access for the Redis budget
+  reset). Decision specifically differs from the other four: it's pure choreography, nothing
+  external ever calls `/decisions` over HTTP (verified: no script/test does), so giving it a
+  public route with zero consumers would be the opposite of "hide internal structure", not an
+  application of it.
+- [x] A single shared rate-limit middleware (`average=10`, `burst=50` per-client-IP) applied
+  to every router in `traefik/dynamic.yml` - one declaration, referenced by name from each
+  router, not redeclared per-service. `burst` raised from an initial `20` to `50` after review
+  flagged a real risk: all five services now share one budget, and `verify_phase8.py` fires
+  many submit/poll/approve calls in sequence from the same host IP - **confirmed live** (see
+  Verification) that the script completes with zero 429s.
+- [x] `postgres`/`redis` keep their host ports unchanged - infrastructure resources (M4's
+  "databases/queues"), not REST API surface, outside M6's scope.
+- [x] Updated `scripts/verify_phase8.py`, `scripts/verify_inv1014_concurrency.py`,
+  `scripts/smoke_test_compose.py`: URL constants now point at the gateway
+  (`http://localhost:8080`) instead of each service's old direct port; `_wait_for_health`
+  (which polled `/health` directly) replaced by `_wait_for_reachable` (probes a real route
+  through the gateway - any HTTP response, even 404, proves the Traefik → service path works,
+  since none of the fronted services expose `/health` to the host anymore).
+- [x] Fixed a **pre-existing** mypy gap found while re-running the full suite: `scripts/`
+  had no `__init__.py`, so mypy saw `verify_inv1014_concurrency.py` under two different module
+  identities once `verify_phase8.py`'s existing `import scripts.verify_inv1014_concurrency`
+  was resolved (confirmed via `git stash` that this predates this phase entirely). Fixed with
+  an empty `scripts/__init__.py`, matching the same convention already used for `tests/`.
+- [x] `ARCHITECTURE.md` updated: §4 (gateway is the external boundary only, never
+  inter-service), §6 (Traefik firmed up, no longer "Traefik / NGINX"), §7 (Communication table
+  gains the three new Gateway rows; new paragraph describing the file-provider implementation,
+  the Docker-provider incompatibility, and the Decision/postgres/redis exclusions with
+  reasoning). `docs/adr/ADR-007-API-Gateway-via-Traefik.md` updated with the full provider-pivot
+  diagnosis.
+
+## Verification
+
+Ran for real, twice over (once against the abandoned Docker-provider attempt, which is what
+surfaced the incompatibility; once against the working file-provider implementation):
+- `docker compose up --build -d` - `gateway` came up healthy; `docker compose ps` confirmed
+  none of Intake/Approval/Payment/Notification/Decision have a host port anymore, only
+  `gateway` (`8080`), `postgres` (`5432`), `redis` (`6379`).
+- **Real infra hiccup hit and fixed along the way**: recreating `intake`/`approval`/`payment`/
+  `notification`/`decision` (to pick up the new labels-then-later-removed-labels config) left
+  their Dapr sidecars pointing at stale network namespaces - the exact `network_mode:
+  service:X` issue already documented earlier in this project. Fixed the same way: `docker
+  compose up -d --force-recreate <app>-dapr` for each. `payment` additionally surfaced this via
+  a failed healthcheck (its startup budget-seeding blocks on Dapr) - the other three looked
+  "healthy" regardless (their own `/health` doesn't depend on Dapr), which would have been a
+  silent choreography failure if not caught.
+- Routing verified directly for all five routes: `POST /invoices`, `GET /invoices/{id}`, `GET
+  /approvals`, `GET /payments`, `GET /budgets/{department}`, `GET /notifications/{id}` all
+  reached the correct backend through `localhost:8080` - confirmed both by response content and
+  by Traefik's own access logs (`--accesslog=true`), which name the exact router/backend used
+  per request (e.g. `"budgets@file" "http://payment:8003"`).
+- All five old ports (`8000`-`8004`) confirmed connection-refused directly via `curl`.
+- Rate-limiting proven live, correctly, after an initial false negative: a naive test firing
+  100 backgrounded `curl` processes via bash produced zero 429s - not because the limiter
+  wasn't working, but because OS process-spawn overhead spread those 100 requests out enough to
+  stay under the budget. Redone with genuine concurrency (`httpx.AsyncClient` +
+  `asyncio.gather`, 300 requests fired together in one process) - 183/300 got 429, confirming
+  the limiter is real. Separately, the full `verify_phase8.py` run through the gateway
+  completed with **zero** 429s end to end, confirming `burst=50` gives real headroom for actual
+  usage while still stopping genuine abuse.
+- `GET /does-not-exist` → 404 (`exposedbydefault=false`-equivalent for the file provider: only
+  explicitly-declared routers exist at all).
+- Route isolation confirmed via access logs - each request went to exactly the router/backend
+  its path prefix names, no cross-talk.
+- Recovery: `docker compose up -d --force-recreate intake` (+ its Dapr sidecar) mid-session,
+  then `POST /invoices` through the gateway immediately after - worked with no gateway restart
+  or config change, confirming Docker Compose's internal DNS re-resolves `http://intake:8000`
+  to the new container transparently.
+- All three updated scripts (`smoke_test_compose.py`, `verify_inv1014_concurrency.py`,
+  `verify_phase8.py`) re-run end-to-end through the gateway - all passed.
+- Full local suite (370 tests), `ruff check .`, `mypy .` all pass.
+
+---
+
 # Phase 9 — Quality
 
 ## Tasks

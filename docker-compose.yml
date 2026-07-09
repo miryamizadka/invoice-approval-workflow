@@ -1,11 +1,52 @@
 services:
+  gateway:
+    image: traefik:v3.1.2
+    # Pinned to an exact patch version, not the floating v3.1 tag - consistent
+    # with daprio/daprd:1.18.1 / daprio/placement:1.18.1 below (both exact-pinned,
+    # unlike redis:7-alpine/postgres:16-alpine which are deliberately major-only).
+    # Traefik is infra-critical like Dapr here, not a "dumb" resource container.
+    command:
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--entrypoints.web.address=:80"
+      - "--ping=true"
+      - "--accesslog=true"
+    # File provider, not Docker provider: empirically confirmed the Docker
+    # provider is incompatible with this environment's Docker Engine (29.0.1) -
+    # see ADR-007 and traefik/dynamic.yml's own header comment for the full
+    # story (tried two Traefik versions + forcing DOCKER_API_VERSION, all
+    # failed identically with a bare "400 Bad Request" from the daemon).
+    # Static file-based routing sidesteps the incompatibility entirely and,
+    # as a side benefit, needs no Docker socket access at all.
+    ports:
+      - "8080:80"
+    volumes:
+      - "./traefik/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    depends_on:
+      intake:
+        condition: service_healthy
+      approval:
+        condition: service_healthy
+      payment:
+        condition: service_healthy
+      notification:
+        condition: service_healthy
+    # Unlike the Docker provider, the file provider has no independent way to
+    # notice new backends coming up - its routes are static from the start,
+    # so there's no benefit to letting gateway start before its backends are
+    # ready (nothing to "discover" later). depends_on here just gives cleaner
+    # startup ordering, matching every other service in this file.
+    networks: [approvalflow]
+
   intake:
     build:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.intake.app:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
     environment:
       - DECISION_SERVICE_URL=http://decision:8001
     depends_on:
@@ -17,14 +58,15 @@ services:
       timeout: 3s
       retries: 3
     networks: [approvalflow]
+    # No host port mapping anymore - gateway is the only external entry point
+    # (M6). Routed via traefik/dynamic.yml (file provider), not labels here -
+    # see the gateway service's comment above for why.
 
   decision:
     build:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.decision.service.app:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
     environment:
       - LLM_PROVIDER=groq
     env_file:
@@ -35,28 +77,31 @@ services:
       timeout: 3s
       retries: 3
     networks: [approvalflow]
+    # No host port mapping and no gateway route: Decision is pure choreography -
+    # nothing external (no script, no test, no future UI) ever calls it over
+    # HTTP; /decisions is a testing/dev artifact only. Giving it a public
+    # gateway route with zero consumers would be the opposite of "hide internal
+    # structure" (M6) - it stays reachable only via Dapr pub/sub and the
+    # internal Docker network.
 
   approval:
     build:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.approval.app:app --host 0.0.0.0 --port 8002
-    ports:
-      - "8002:8002"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 10s
       timeout: 3s
       retries: 3
     networks: [approvalflow]
+    # No host port mapping - see intake's comment above.
 
   payment:
     build:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.payment.app:app --host 0.0.0.0 --port 8003
-    ports:
-      - "8003:8003"
     environment:
       # Deliberate, unconditional: makes the INV-1012 payment-failure +
       # compensation journey demonstrable with a plain `docker compose up`,
@@ -68,20 +113,21 @@ services:
       timeout: 3s
       retries: 3
     networks: [approvalflow]
+    # No host port mapping - see intake's comment above. Exposes two path
+    # prefixes through the gateway (/payments, /budgets) - see traefik/dynamic.yml.
 
   notification:
     build:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.notification.app:app --host 0.0.0.0 --port 8004
-    ports:
-      - "8004:8004"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
       interval: 10s
       timeout: 3s
       retries: 3
     networks: [approvalflow]
+    # No host port mapping - see intake's comment above.
 
   postgres:
     image: postgres:16-alpine

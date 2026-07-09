@@ -24,7 +24,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-INTAKE_URL = "http://localhost:8000"
+# Intake is fronted by the Traefik gateway now (M6) - no direct host port.
+INTAKE_URL = "http://localhost:8080"
 HEALTH_TIMEOUT_SECONDS = 60
 PROCESSING_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 2
@@ -48,18 +49,26 @@ TEST_INVOICE = {
 }
 
 
-def _wait_for_health(url: str, name: str, timeout: int) -> None:
+def _wait_for_reachable(url: str, path: str, name: str, timeout: int) -> None:
+    """Same deadline-loop pattern as a direct /health check, but probes a
+    real route through the gateway instead - Intake no longer exposes
+    /health directly to the host now that Traefik fronts it (M6). Any HTTP
+    response (even 404) proves the Traefik -> service routing works."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"{url}/health", timeout=3) as response:
-                if response.status == 200:
-                    print(f"[ok] {name} healthy")
+            with urllib.request.urlopen(f"{url}{path}", timeout=3) as response:
+                if response.status < 500:
+                    print(f"[ok] {name} reachable")
                     return
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                print(f"[ok] {name} reachable")
+                return
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(POLL_INTERVAL_SECONDS)
-    raise SystemExit(f"FAIL: {name} did not become healthy within {timeout}s")
+    raise SystemExit(f"FAIL: {name} not reachable through the gateway within {timeout}s")
 
 
 def _post_json(url: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -77,11 +86,13 @@ def _get_json(url: str) -> tuple[int, dict[str, Any]]:
 
 
 def main() -> None:
-    print("Waiting for services to become healthy...")
-    _wait_for_health(INTAKE_URL, "intake", HEALTH_TIMEOUT_SECONDS)
+    print("Waiting for services to become reachable through the gateway...")
+    _wait_for_reachable(INTAKE_URL, "/invoices/__probe__", "intake", HEALTH_TIMEOUT_SECONDS)
     # Decision's health isn't polled directly from the host here on purpose:
     # this script proves Intake can reach Decision *through the compose
-    # network*, not merely that Decision is independently reachable.
+    # network*, not merely that Decision is independently reachable. Decision
+    # has no gateway route at all (M6) - it's pure choreography, no external
+    # consumer ever calls it over HTTP.
 
     print("Submitting a test invoice through Intake...")
     status, body = _post_json(f"{INTAKE_URL}/invoices", TEST_INVOICE)

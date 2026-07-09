@@ -32,7 +32,7 @@ Priority: MUST HAVE
   delivery via Notification Service - see M8)
 
 Implementation:
-- [ ] API Gateway (not built yet - Intake currently the direct entry point)
+- [x] API Gateway (Traefik - see M6)
 - [x] Intake Service
 - [x] Dapr Pub/Sub (Intake -> Decision now goes over `invoice.submitted`/`decision.completed`,
   not direct HTTP - see PLAN.md Phase 7 step 3)
@@ -249,8 +249,14 @@ secrets remain unused.
 
 ## M6 — API Gateway
 
-- [ ] Single external entry point
-- [ ] Rate limiting implemented
+- [x] Single external entry point (Traefik, `traefik/dynamic.yml` file provider - see ADR-007
+  for why not the Docker provider; PLAN.md Phase 8.5 for full verification. Intake, Approval,
+  Payment, Notification all lose their direct host port, reachable only via `localhost:8080`;
+  Decision has neither a port nor a gateway route at all, pure choreography)
+- [x] Rate limiting implemented (shared per-client-IP middleware, `average=10`/`burst=50` -
+  proven live with genuine concurrent load [183/300 requests hit 429], and proven **not** to
+  false-positive against real usage [`verify_phase8.py`'s full run through the gateway
+  completed with zero 429s])
 
 
 ## M7 — Minimal UI
