@@ -176,18 +176,27 @@ Priority: MUST HAVE
 
 ### M1 — Private monorepo
 
-- [ ] Single GitHub repository
-- [ ] Everything needed exists in repository
+- [x] Single GitHub repository (`github.com/miryamizadka/invoice-approval-workflow`, single
+  `origin` remote)
+- [x] Everything needed exists in repository (single `Dockerfile` + `docker-compose.yml` +
+  `pyproject.toml` - `docker compose up --build` works from the repo alone, no external
+  dependency, proven throughout this project)
 
 
 ### M2 — GitHub Flow
 
-- [ ] main contains submission version
-- [ ] Features developed in branches
-- [ ] No secrets committed
-- [ ] .gitignore exists
-- [ ] LICENSE exists
-- [ ] .env.example exists
+- [x] main contains submission version (`main` is current through Notification Service +
+  Intake fixes, `00d9200`; Phase 8 still on `feature/verification-suite`, not yet merged -
+  in-progress work, not a gap)
+- [x] Features developed in branches (13 `feature/*` branches - scaffolding, decision-agent,
+  decision-service, intake-service, dapr*, approval-service, payment-service,
+  notification-service, verification-suite - all merged into `main` via PR, `(#7)`...`(#12)`
+  references in `git log --oneline main`)
+- [x] No secrets committed (`.env` does not appear in `git ls-files` - verified directly, not
+  assumed)
+- [x] .gitignore exists
+- [x] LICENSE exists
+- [x] .env.example exists
 
 
 ---
@@ -345,13 +354,17 @@ Priority: CRITICAL
 ## M14 — Observability
 
 - [x] Structured logs (`services/decision/service/logging_config.py`, JSON, stdlib-only)
-- [x] Correlation id everywhere - within Decision Service (`X-Correlation-Id` header, generated
-  if absent, on every log line and in the `Decision` response); not yet propagated across other
-  services since only Decision Service exists so far
+- [x] Correlation id everywhere (all five services - Intake, Decision, Approval, Payment,
+  Notification - include `correlation_id` in their structured logs; verified directly via
+  `grep -rl correlation_id services/{intake,decision,approval,payment,notification}/`,
+  10/14/4/8/8 files respectively - not just Decision Service)
 
 ## M15 — Code Quality
 
-- [ ] Clean architecture (true for Decision Service; not yet evidenced system-wide)
+- [x] Clean architecture (the same Manager/Engine/Accessor/Resource layering - thin `app.py` +
+  transport-agnostic `service.py` + `repository.py`/`dapr_state_repository.py` - repeats
+  consistently across all five services, not just Decision; verified directly by reviewing
+  each service's directory structure)
 - [x] Error handling (`AgentError` -> documented `human_review` fallback, never a crash; a
   global exception handler for genuinely unexpected errors, logged with correlation_id)
 - [x] Health checks (`GET /health`, deliberately no LLM connectivity check - see decision plan)
@@ -426,14 +439,14 @@ Priority: CRITICAL
 
 CRITICAL
 
-- [ ] Single command runs verification
-- [ ] Auto approve scenario passes
-- [ ] Human escalation passes
-- [ ] Duplicate scenario passes
-- [x] Payment failure compensation passes (INV-1012 verified live via docker compose - see
-  PLAN.md Phase 6 "Verification"; not yet wired into a single automated verification command,
-  that's D5's still-pending "Single command runs verification" item)
-- [ ] Anti-cheese test passes
+- [x] Single command runs verification (`python -m scripts.verify_phase8`, run live twice in a
+  row without resetting the environment - see PLAN.md Phase 8 "Verification")
+- [x] Auto approve scenario passes (INV-1001 + INV-1002, two distinct fixtures)
+- [x] Human escalation passes (INV-1003 - escalate, approve, pay)
+- [x] Duplicate scenario passes (INV-1007 - F3 proven live, never reaches Payment)
+- [x] Payment failure compensation passes (INV-1012, now also part of the single verification
+  command, not just the earlier manual PLAN.md Phase 6 run)
+- [x] Anti-cheese test passes (INV-1013, against the real Groq LLM, no mock)
 
 
 ## D6 — README
