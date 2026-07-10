@@ -118,8 +118,14 @@ Priority: MUST HAVE
 
 Priority: MUST HAVE
 
-- [ ] Policy is external configuration
-- [ ] Thresholds can change without redeployment
+- [x] Policy is external configuration (`services/decision/service/dapr_config_loader.py` -
+  policy text read from a Dapr `configuration.redis` store at startup, falling back to
+  `policy/policy.md` if unset/unreachable - see ADR-009)
+- [x] Thresholds can change without redeployment (`AutonomyThresholds`' 8 fields, same mechanism -
+  verified live: `redis-cli SET ceiling 500` + `docker compose restart decision`, no image
+  rebuild, flipped a $300 invoice's `AUTONOMY-CEILING` gate from firing to not firing; reverted
+  and confirmed the original behavior - including `verify_phase8`'s full suite, INV-1013's
+  anti-cheese ceiling test included - still passes)
 
 ---
 
@@ -373,9 +379,16 @@ Priority: CRITICAL
 
 ## M13 — External Configuration
 
-- [ ] Policy configurable
-- [ ] Threshold configurable
-- [ ] No hardcoded limits
+- [x] Policy configurable (Dapr `configuration.redis` store, fetch-once at Decision startup -
+  see F7 above and ADR-009)
+- [x] Threshold configurable (same mechanism, all 8 `AutonomyThresholds` fields independently
+  overridable; per-field validation - an invalid value falls back to the default for that field
+  only, logged as a warning, doesn't invalidate the rest)
+- [x] No hardcoded limits (`DEFAULT_THRESHOLDS`/`policy.md` remain only as the resilience
+  fallback if the store is empty/unreachable - the runtime source of truth is the config store
+  whenever it has a value; a real client-construction failure mode was found and fixed during
+  live verification - see ADR-009's "Resilience" section - the service now provably starts on
+  defaults rather than crashing when Dapr's sidecar isn't ready)
 
 
 ---

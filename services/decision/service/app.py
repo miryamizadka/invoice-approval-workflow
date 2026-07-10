@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
@@ -16,12 +18,15 @@ from fastapi.responses import JSONResponse
 
 from services.decision.accessors.factory import get_llm_provider
 from services.decision.accessors.llm_provider import LLMProvider
+from services.decision.router.config import DEFAULT_THRESHOLDS
+from services.decision.service.dapr_config_loader import load_policy_and_thresholds
 from services.decision.service.decider import Decider, build_decider
 from services.decision.service.logging_config import configure_logging
 from services.decision.service.outcome_publisher import (
     DaprDecisionOutcomePublisher,
     DecisionOutcomePublisher,
 )
+from services.decision.service.policy_loader import load_policy_text
 from shared.contracts.models import Decision, DecisionCompletedEvent, Invoice, InvoiceSubmittedEvent
 
 
@@ -30,12 +35,26 @@ def create_app(
     outcome_publisher: DecisionOutcomePublisher | None = None,
 ) -> FastAPI:
     configure_logging()
-    decider = build_decider(provider or get_llm_provider())
+    resolved_provider = provider or get_llm_provider()
+    fallback_policy = load_policy_text()  # read once, reused below - not twice
+    decider = build_decider(resolved_provider, DEFAULT_THRESHOLDS, fallback_policy)
     resolved_outcome_publisher = outcome_publisher or DaprDecisionOutcomePublisher()
 
-    app = FastAPI(title="ApprovalFlow Decision Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # F7/M13: overrides DEFAULT_THRESHOLDS/policy.md with whatever is
+        # configured in Dapr's configuration store, if anything - fetch-once,
+        # not live hot-reload (see ADR-009). Falls back silently to the
+        # already-built `decider` above if the store is empty/unreachable -
+        # the service must work correctly even if never configured.
+        policy, thresholds = await load_policy_and_thresholds(fallback_policy, DEFAULT_THRESHOLDS)
+        if policy != fallback_policy or thresholds != DEFAULT_THRESHOLDS:
+            app.state.decider = build_decider(resolved_provider, thresholds, policy)
+        yield
+
+    app = FastAPI(title="ApprovalFlow Decision Service", lifespan=_lifespan)
     # Single source of truth - endpoints read it back via request.app.state, not a closure.
-    app.state.decider = decider
+    app.state.decider = decider  # fallback; _lifespan may replace it once Dapr config is read
     app.state.outcome_publisher = resolved_outcome_publisher
     dapr_app = DaprApp(app)
 

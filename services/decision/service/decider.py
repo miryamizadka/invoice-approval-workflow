@@ -13,9 +13,8 @@ from langgraph.graph.state import CompiledStateGraph
 
 from services.decision.accessors.llm_provider import LLMProvider
 from services.decision.agent import AgentError, AgentState, build_agent_graph
-from services.decision.router.config import DEFAULT_THRESHOLDS, AutonomyThresholds
+from services.decision.router.config import AutonomyThresholds
 from services.decision.router.router import route_decision
-from services.decision.service.policy_loader import load_policy_text
 from shared.contracts.models import DecisionOutcome, Invoice
 
 
@@ -87,12 +86,18 @@ class Decider:
         return DecisionOutcome(decision=decision, recommendation=recommendation)
 
 
-def build_decider(provider: LLMProvider) -> Decider:
+def build_decider(provider: LLMProvider, thresholds: AutonomyThresholds, policy: str) -> Decider:
     """Composition, not transport: resolves everything a Decider needs.
 
     Lives outside create_app() on purpose - the planned Dapr pub/sub
     transport will need a Decider too, and it must not have to import
     FastAPI or reach into app.state to get one. Both transports call this.
+
+    thresholds/policy are supplied by the caller (F7/M13) - same principle
+    RouterNode already applies: "not a hardcoded import of DEFAULT_THRESHOLDS
+    ... the caller decides which thresholds this graph run enforces."
+    create_app() resolves them (Dapr configuration override, or the
+    DEFAULT_THRESHOLDS/policy.md fallback) before calling this.
     """
-    graph = build_agent_graph(provider, DEFAULT_THRESHOLDS)
-    return Decider(graph, DEFAULT_THRESHOLDS, load_policy_text())
+    graph = build_agent_graph(provider, thresholds)
+    return Decider(graph, thresholds, policy)
