@@ -14,12 +14,17 @@ State machine (see ApprovalService for the transitions this enforces):
        │
        ├──reject────────────► REJECTED
        │
-       └──request_info──────► WAITING_INFO ──approve──► APPROVED
-                                            └─reject──► REJECTED
+       └──request_info──────► WAITING_INFO ──approve────────────► APPROVED
+                                            ├─reject──────────────► REJECTED
+                                            └─additional_info─────► PENDING
 
 APPROVED/REJECTED are terminal. WAITING_INFO is not - it can still resolve
 either way once more information comes back to the approver (ADR-003: once
-escalated, the human owns the decision - not the AI).
+escalated, the human owns the decision - not the AI). additional_info
+(F5) is an addition, not a replacement: approve/reject on WAITING_INFO are
+unchanged - a submitter's response just gives the approver a second way
+back to PENDING (a visible signal "new info, look again"), it doesn't
+remove the ability to resolve directly from WAITING_INFO.
 """
 
 from __future__ import annotations
@@ -49,3 +54,5 @@ class PendingApproval(BaseModel):
     decision: Decision
     recommendation: Recommendation | None = None
     status: ApprovalStatus
+    additional_info: str | None = None  # set once, by add_additional_info (F5) -
+    # never cleared by a later approve/reject, stays visible to the approver

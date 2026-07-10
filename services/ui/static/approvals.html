@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ApprovalFlow - Approval Queue</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav>
+  <a href="index.html">Submit Invoice</a>
+  <a href="approvals.html">Approval Queue</a>
+</nav>
+
+<h1>Approval Queue</h1>
+
+<p id="queue-message" class="message" hidden aria-live="polite"></p>
+
+<div id="queue-list" aria-live="polite">Loading...</div>
+
+<script src="api.js"></script>
+<script src="approver.js"></script>
+</body>
+</html>

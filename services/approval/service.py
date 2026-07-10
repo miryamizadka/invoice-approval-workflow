@@ -43,6 +43,13 @@ class ApprovalAlreadyResolvedError(Exception):
     downstream), not just a "nice" error message."""
 
 
+class ApprovalNotAwaitingInfoError(Exception):
+    """Raised by add_additional_info() when the item isn't currently
+    WAITING_INFO (maps to 409) - this endpoint's purpose is responding to a
+    specific request_info, not general note-taking on a PENDING item, and
+    it's meaningless once APPROVED/REJECTED."""
+
+
 class ApprovalService:
     def __init__(self, repository: ApprovalRepository, publisher: ApprovalOutcomePublisher) -> None:
         self._repository = repository
@@ -126,6 +133,23 @@ class ApprovalService:
         approval = await self._require_actionable(tracking_id)
         updated = approval.model_copy(update={"status": ApprovalStatus.WAITING_INFO})
         await self._repository.save(updated)
+        return updated
+
+    async def add_additional_info(self, tracking_id: str, info: str) -> PendingApproval:
+        """F5: the submitter's response to a request_info. Valid only from
+        WAITING_INFO - transitions back to PENDING (a visible signal to the
+        approver that new information is available, not just a silent note)
+        without touching approve/reject's own direct WAITING_INFO transitions."""
+        approval = await self._repository.get(tracking_id)
+        if approval is None:
+            raise ApprovalNotFoundError(tracking_id)
+        if approval.status != ApprovalStatus.WAITING_INFO:
+            raise ApprovalNotAwaitingInfoError(tracking_id)
+        updated = approval.model_copy(
+            update={"status": ApprovalStatus.PENDING, "additional_info": info}
+        )
+        await self._repository.save(updated)
+        self._logger.info("additional_info_received", extra={"correlation_id": tracking_id})
         return updated
 
     async def _require_actionable(self, tracking_id: str) -> PendingApproval:

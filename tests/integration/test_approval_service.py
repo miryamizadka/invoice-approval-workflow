@@ -159,3 +159,50 @@ def test_request_info_keeps_item_in_queue_without_publishing() -> None:
     assert len(queue) == 1
     assert queue[0]["status"] == ApprovalStatus.WAITING_INFO.value
     assert publisher.published == []
+
+
+# --- additional-info (F5) ----------------------------------------------------
+
+
+def test_additional_info_after_request_info_returns_to_pending() -> None:
+    client, _, _ = _app()
+    _post_decision_completed(client)
+    client.post("/approvals/corr-1/request-info")
+
+    response = client.post("/approvals/corr-1/additional-info", json={"info": "Client: Acme"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == ApprovalStatus.PENDING.value
+    assert body["additional_info"] == "Client: Acme"
+    assert client.get("/approvals/corr-1").json()["additional_info"] == "Client: Acme"
+
+
+def test_additional_info_returns_409_when_not_waiting_info() -> None:
+    client, _, _ = _app()
+    _post_decision_completed(client)  # still PENDING, never requested info
+
+    response = client.post("/approvals/corr-1/additional-info", json={"info": "unsolicited"})
+
+    assert response.status_code == 409
+
+
+def test_additional_info_returns_404_when_unknown() -> None:
+    client, _, _ = _app()
+
+    response = client.post("/approvals/missing/additional-info", json={"info": "info"})
+
+    assert response.status_code == 404
+
+
+def test_additional_info_still_visible_after_later_approve() -> None:
+    client, _, _ = _app()
+    _post_decision_completed(client)
+    client.post("/approvals/corr-1/request-info")
+    client.post("/approvals/corr-1/additional-info", json={"info": "Client: Acme"})
+
+    client.post("/approvals/corr-1/approve")
+
+    approval = client.get("/approvals/corr-1").json()
+    assert approval["status"] == ApprovalStatus.APPROVED.value
+    assert approval["additional_info"] == "Client: Acme"

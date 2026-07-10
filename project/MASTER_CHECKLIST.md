@@ -90,12 +90,20 @@ Priority: MUST HAVE
 - [x] Approver can approve (`POST /approvals/{tracking_id}/approve`)
 - [x] Approver can reject (`POST /approvals/{tracking_id}/reject`)
 - [x] Approver can request more information (`POST /approvals/{tracking_id}/request-info` ->
-  `WAITING_INFO`, non-terminal. **Documented gap**: no Gateway/UI route yet for the submitter to
-  actually supply that information and trigger a resume - accepted, out of scope until M7)
+  `WAITING_INFO`, non-terminal)
 - [x] Workflow pauses durably (`DaprStateApprovalRepository`, Dapr state/Redis - see M11 below)
 - [x] Workflow resumes after decision (approve/reject transition `PENDING`/`WAITING_INFO` ->
   terminal and publish `approval.completed`; verified live including resuming a `WAITING_INFO`
   item that survived a container restart)
+- [x] **Submitter can supply the requested information and resume** - previously a documented
+  gap; closing it turned out to need only a small addition, since `approve`/`reject` already
+  worked on `WAITING_INFO`: `PendingApproval.additional_info` field + `POST
+  /approvals/{tracking_id}/additional-info` (409 unless status is `WAITING_INFO`) transitions
+  back to `PENDING` - a visible signal to the approver that new information has arrived, not a
+  new resolution mechanism. Exposed via the M7 UI's submitter page (polls `GET
+  /approvals/{tracking_id}` alongside its normal status polling). Verified live end to end:
+  `request-info` -> submitter sees `waiting_info` -> `additional-info` -> back to `pending` with
+  the text visible -> `approve` -> payment completed. See ADR-010.
 
 ---
 
@@ -283,9 +291,16 @@ secrets remain unused.
 
 ## M7 — Minimal UI
 
-- [ ] Submit invoice
-- [ ] View status
-- [ ] View decision
+- [x] Submit invoice (`services/ui/static/index.html` form -> `POST /invoices` through the
+  gateway's `/ui` + `/invoices` routes; static HTML/CSS/vanilla JS, no framework - see ADR-010)
+- [x] View status (polls `GET /invoices/{tracking_id}` every 2s, stops on terminal status)
+- [x] View decision (route + plain-language reason rendered once available; errors mapped to
+  plain language, not raw fetch failures)
+- [x] Approver escalation queue + actions (`services/ui/static/approvals.html` - beyond M7's
+  literal 3 bullets, but committed to explicitly by `ARCHITECTURE.md` §4's "UI (M7)" description;
+  approve/reject/request-info, polls every 5s)
+- [x] F5 fully closed via this UI (see F5 above) - submitter can see `waiting_info` and respond
+- [x] `verify_phase8` still passes after the UI + F5 additions (no regression)
 
 
 ---

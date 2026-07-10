@@ -24,6 +24,15 @@ http:
         # single external entry point" more closely than independent budgets
         # per route. burst=50 (not a stricter default) gives real headroom
         # for verify_phase8.py's own submit/poll/approve traffic pattern.
+    stripprefix-ui:
+      stripPrefix:
+        prefixes: ["/ui"]
+        # Only the ui router uses this: services/ui's StaticFiles mount is at
+        # "/" and knows nothing about being served under /ui externally (the
+        # same "logic free", mount-path-agnostic posture as every other
+        # service here) - PathPrefix alone forwards the full original path
+        # unchanged, so /ui/style.css would 404 against a mount expecting
+        # /style.css without this.
 
   routers:
     intake:
@@ -56,6 +65,11 @@ http:
       entryPoints: ["web"]
       service: audit
       middlewares: ["ratelimit"]
+    ui:
+      rule: "PathPrefix(`/ui`)"
+      entryPoints: ["web"]
+      service: ui
+      middlewares: ["ratelimit", "stripprefix-ui"]
     # Decision has no router here, deliberately: pure choreography, nothing
     # external ever calls it over HTTP - see ARCHITECTURE.md §7/§4.
 
@@ -80,3 +94,7 @@ http:
       loadBalancer:
         servers:
           - url: "http://audit:8005"
+    ui:
+      loadBalancer:
+        servers:
+          - url: "http://ui:8006"
