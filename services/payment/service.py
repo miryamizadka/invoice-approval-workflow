@@ -124,7 +124,7 @@ class PaymentService:
                 f"guarantees RESERVED here; this is a programmer error, not a business outcome."
             )
         try:
-            await self._gateway.charge(record.invoice)
+            await self._gateway.charge(record.invoice, idempotency_key=record.tracking_id)
         except PaymentGatewayError as exc:
             await self._budget_repository.release(record.department, record.reserved_amount)
             updated = record.model_copy(update={"status": PaymentStatus.FAILED, "reason": str(exc)})

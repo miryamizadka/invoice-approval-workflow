@@ -45,6 +45,15 @@ Schema is created via a plain `CREATE TABLE IF NOT EXISTS` at service startup (`
 - One inconsistency in access pattern versus the rest of the codebase (direct SQL vs. Dapr state) - documented here specifically so it isn't mistaken for an oversight.
 - No migration framework means schema evolution is manual (acceptable at this project's scale; would need revisiting if the schema grows significantly).
 
+## Non-goals
+
+This phase is trail storage + point lookup only: no dashboard, no analytics/BI, no search, no filtering, no pagination, no export. `GET /audit/{tracking_id}` is the entire read surface. If F8 (Dashboard) is ever built, **it should query the Audit service's API, not Postgres directly** - going straight to `audit_trail` from another service would bypass the service boundary this ADR establishes and couple a second service to the table's exact schema.
+
+## Forward-looking notes
+
+- **Schema is append-friendly.** Every event-specific column (`recommendation_*`, `approval_*`, `payment_*`) is nullable by design, and the evolving nested shapes (`invoice_json`, `triggered_rules`, `recommendation_cited_rules`) are JSONB, not flattened columns - a new field added to `Invoice`/`Decision`/`Recommendation` upstream shows up in the JSON automatically, no migration needed. Nothing here assumes today's event shapes are final.
+- **`recommendation_reasoning` stores the agent's full text, not a truncated summary** - a deliberate choice, not an oversight. Postgres `TEXT` is unbounded (unlike `VARCHAR(n)`), so there's no schema-level size limit; today's reasoning text is short (a paragraph). If the LLM prompt ever changes to produce much longer output, this is worth revisiting, but isn't a concern at the current scope.
+
 ## Alternatives considered
 
 - **Extend Dapr state store to also cover Audit** (a new `state.postgresql` Dapr component, same `AuditRepository` Protocol pattern as every other service) - rejected. Keeps 100% consistency with "everything through Dapr", but the underlying storage would still be Dapr's generic key→JSONB-blob schema, not real relational columns - F8's aggregation needs would still require pulling every row into Python and summing there, gaining none of the reason Postgres was chosen.

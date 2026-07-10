@@ -26,7 +26,12 @@ COMPLETED/FAILED are terminal. RESERVED is not terminal and is also the
 crash-recovery resume point: if the process crashes after reserve() and
 before the charge step finishes, the record is left at RESERVED, and a
 redelivery of the same triggering event resumes exactly at "attempt the
-charge", never re-reserving.
+charge", never re-reserving. The resumed charge() call is itself
+idempotent - PaymentService passes idempotency_key=tracking_id
+(PaymentGateway Protocol), so a second call for the same tracking_id
+replays the original outcome instead of re-executing the charge. This is a
+real idempotency key, not a coincidence of this project's gateways being
+pure/stateless - it would hold against a real, stateful payment gateway too.
 """
 
 from __future__ import annotations
