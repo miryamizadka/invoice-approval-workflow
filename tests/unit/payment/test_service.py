@@ -331,6 +331,37 @@ async def test_crash_recovery_resume_that_then_fails_still_compensates_correctly
     assert len(publisher.published) == 1
 
 
+async def test_resumed_charge_uses_tracking_id_as_idempotency_key_and_never_double_charges() -> (
+    None
+):
+    """The direct proof that the crash-recovery scenario documented in
+    PaymentRecord's docstring cannot double-charge: _execute_charge is
+    invoked twice for the *same* still-RESERVED record (simulating two
+    redelivery attempts that both observe the pre-crash RESERVED state,
+    exactly as real redelivery would if the process crashed again before
+    persisting COMPLETED) - gateway.execution_count must stay at 1, proving
+    the underlying charge logic ran exactly once, not just that both calls
+    happened to succeed without crashing."""
+    gateway = FakePaymentGateway()
+    service, repository, budget_repository, _, _ = await _service(gateway=gateway)
+    await budget_repository.reserve(_DEPARTMENT, Decimal("50.00"))
+    record = PaymentRecord(
+        tracking_id="corr-1",
+        invoice=clean_invoice(total=Decimal("50.00")),
+        decision=_decision(),
+        status=PaymentStatus.RESERVED,
+        department=_DEPARTMENT,
+        reserved_amount=Decimal("50.00"),
+    )
+    await repository.save(record)
+
+    await service._execute_charge(record)  # noqa: SLF001 - simulating redelivery attempt #1
+    await service._execute_charge(record)  # noqa: SLF001 - simulating redelivery attempt #2
+
+    assert gateway.execution_count == 1
+    assert gateway.charged == ["TEST-0000"]
+
+
 # --- invariant guard -------------------------------------------------------
 
 

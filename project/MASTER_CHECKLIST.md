@@ -327,7 +327,16 @@ secrets remain unused.
   record at `RESERVED`, so a redelivery resumes exactly at the charge step instead of
   re-reserving. Verified live via `docker compose` restart (record + budget both survived,
   `ensure_seeded()` did not reset the in-progress budget) and via two dedicated deterministic
-  unit tests for the RESERVED-resume path (success and failure outcomes).
+  unit tests for the RESERVED-resume path (success and failure outcomes). The resumed charge
+  step itself is also idempotent: `PaymentGateway.charge()` takes `idempotency_key=tracking_id`
+  (`SimulatedPaymentGateway`/`FakePaymentGateway` cache the outcome per key) - previously this was
+  only accidentally safe because both gateways are pure/stateless; now it's a real guarantee, not
+  a coincidence. Verified via a dedicated test (`_execute_charge` invoked twice for the same
+  still-RESERVED record → gateway's underlying charge logic runs exactly once) and live via
+  `docker compose` (INV-1012's payment-failure/compensation journey re-run, unaffected). See
+  `docs/adr/ADR-004-Saga-Orchestration.md` for the full reasoning, including the one known,
+  accepted limitation this does *not* close (no business/technical failure distinction at the
+  gateway - there is no real payment processor to model a transient failure against).
 - [x] Notification retries safe - `NotificationService._notify()` checks a Dapr-state
   tracking_id marker before sending (no-op if already notified); `send()` runs before
   `mark_notified()` so a failed send is safely retried. Verified live: re-POSTing an identical
