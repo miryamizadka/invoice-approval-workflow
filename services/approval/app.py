@@ -10,6 +10,7 @@ from typing import Any
 
 from dapr.ext.fastapi import DaprApp
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
 
 from services.approval.dapr_state_repository import DaprStateApprovalRepository
 from services.approval.logging_config import configure_logging
@@ -21,11 +22,16 @@ from services.approval.outcome_publisher import (
 from services.approval.repository import ApprovalRepository
 from services.approval.service import (
     ApprovalAlreadyResolvedError,
+    ApprovalNotAwaitingInfoError,
     ApprovalNotFoundError,
     ApprovalService,
     build_approval_service,
 )
 from shared.contracts.models import DecisionCompletedEvent
+
+
+class _AdditionalInfoBody(BaseModel):
+    info: str
 
 
 def create_app(
@@ -73,6 +79,18 @@ def create_app(
     async def request_info(tracking_id: str, request: Request) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.request_info, tracking_id)
+
+    @app.post("/approvals/{tracking_id}/additional-info", response_model=PendingApproval)
+    async def additional_info(
+        tracking_id: str, body: _AdditionalInfoBody, request: Request
+    ) -> PendingApproval:
+        service: ApprovalService = request.app.state.approval_service
+        try:
+            return await service.add_additional_info(tracking_id, body.info)
+        except ApprovalNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="tracking_id not found") from exc
+        except ApprovalNotAwaitingInfoError as exc:
+            raise HTTPException(status_code=409, detail="not awaiting additional info") from exc
 
     @dapr_app.subscribe(
         pubsub="pubsub", topic="decision.completed", route="/events/decision-completed"

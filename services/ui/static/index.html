@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ApprovalFlow - Submit Invoice</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<nav>
+  <a href="index.html">Submit Invoice</a>
+  <a href="approvals.html">Approval Queue</a>
+</nav>
+
+<h1>Submit an Invoice</h1>
+
+<form id="submit-form">
+  <label for="id">Invoice ID
+    <input type="text" id="id" name="id" required />
+  </label>
+  <label for="submitter">Submitter email
+    <input type="email" id="submitter" name="submitter" required />
+  </label>
+  <label for="department">Department
+    <input type="text" id="department" name="department" required />
+  </label>
+  <label for="vendor">Vendor
+    <input type="text" id="vendor" name="vendor" required />
+  </label>
+  <label>
+    <input type="checkbox" id="vendorKnown" name="vendorKnown" />
+    Vendor is known/pre-approved
+  </label>
+  <label for="invoiceNumber">Invoice number
+    <input type="text" id="invoiceNumber" name="invoiceNumber" required />
+  </label>
+  <label for="currency">Currency (3-letter code)
+    <input type="text" id="currency" name="currency" pattern="[A-Z]{3}" maxlength="3" value="USD" required />
+  </label>
+  <label for="category">Category
+    <select id="category" name="category" required>
+      <option value="meals">Meals</option>
+      <option value="travel">Travel</option>
+      <option value="saas">SaaS</option>
+      <option value="hardware">Hardware</option>
+      <option value="other">Other</option>
+    </select>
+  </label>
+  <label for="attendees">Attendees (meals only, optional)
+    <input type="number" id="attendees" name="attendees" min="1" />
+  </label>
+
+  <fieldset>
+    <legend>Line item</legend>
+    <label for="lineItemDescription">Description
+      <input type="text" id="lineItemDescription" name="lineItemDescription" required />
+    </label>
+    <label for="lineItemQuantity">Quantity
+      <input type="number" id="lineItemQuantity" name="lineItemQuantity" min="0.01" step="0.01" value="1" required />
+    </label>
+    <label for="lineItemUnitPrice">Unit price
+      <input type="number" id="lineItemUnitPrice" name="lineItemUnitPrice" min="0" step="0.01" required />
+    </label>
+  </fieldset>
+
+  <label for="taxAmount">Tax amount
+    <input type="number" id="taxAmount" name="taxAmount" min="0" step="0.01" value="0" required />
+  </label>
+  <label for="total">Total
+    <input type="number" id="total" name="total" min="0" step="0.01" required />
+  </label>
+  <label>
+    <input type="checkbox" id="receiptPresent" name="receiptPresent" />
+    Receipt attached
+  </label>
+  <label for="date">Invoice date
+    <input type="date" id="date" name="date" required />
+  </label>
+  <label for="notes">Notes (optional)
+    <textarea id="notes" name="notes"></textarea>
+  </label>
+
+  <button type="submit" id="submit-button">Submit Invoice</button>
+</form>
+
+<p id="submit-message" class="message" hidden aria-live="polite"></p>
+
+<section id="status-section" hidden>
+  <h2>Tracking status</h2>
+  <p><strong>Tracking ID:</strong> <span id="tracking-id-display"></span></p>
+  <p id="status-message" aria-live="polite"></p>
+  <div id="waiting-info-section" hidden>
+    <p>The approver requested more information: <span id="waiting-info-reason"></span></p>
+    <label for="additional-info-text">Your response
+      <textarea id="additional-info-text"></textarea>
+    </label>
+    <button type="button" id="submit-additional-info">Send additional information</button>
+  </div>
+</section>
+
+<hr />
+
+<section>
+  <h2>Check an existing submission</h2>
+  <label for="lookup-tracking-id">Tracking ID
+    <input type="text" id="lookup-tracking-id" />
+  </label>
+  <button type="button" id="lookup-button">Check status</button>
+</section>
+
+<script src="api.js"></script>
+<script src="submitter.js"></script>
+</body>
+</html>

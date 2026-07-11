@@ -13,6 +13,7 @@ from services.approval.models import ApprovalStatus
 from services.approval.repository import InMemoryApprovalRepository
 from services.approval.service import (
     ApprovalAlreadyResolvedError,
+    ApprovalNotAwaitingInfoError,
     ApprovalNotFoundError,
     ApprovalService,
     build_approval_service,
@@ -235,3 +236,70 @@ async def test_request_info_raises_already_resolved_when_terminal() -> None:
 
     with pytest.raises(ApprovalAlreadyResolvedError):
         await service.request_info("corr-1")
+
+
+# --- add_additional_info (F5 - submitter responds to a request-info) -------
+
+
+@pytest.mark.asyncio
+async def test_add_additional_info_succeeds_when_waiting_info() -> None:
+    service, repository, _ = _service()
+    await service.handle_decision_completed(_decision_completed_event())
+    await service.request_info("corr-1")
+
+    result = await service.add_additional_info("corr-1", "Client name: Acme Corp")
+
+    assert result.status == ApprovalStatus.PENDING  # (new) signal to approver, resume point
+    assert result.additional_info == "Client name: Acme Corp"
+    stored = await repository.get("corr-1")
+    assert stored is not None
+    assert stored.status == ApprovalStatus.PENDING
+    assert stored.additional_info == "Client name: Acme Corp"
+
+
+@pytest.mark.asyncio
+async def test_add_additional_info_raises_when_not_waiting_info() -> None:
+    """Only valid from WAITING_INFO - this endpoint's purpose is responding
+    to a request, not general note-taking on a still-fresh PENDING item."""
+    service, _, _ = _service()
+    await service.handle_decision_completed(_decision_completed_event())
+
+    with pytest.raises(ApprovalNotAwaitingInfoError):
+        await service.add_additional_info("corr-1", "unsolicited info")
+
+
+@pytest.mark.asyncio
+async def test_add_additional_info_raises_not_found_for_unknown_tracking_id() -> None:
+    service, _, _ = _service()
+
+    with pytest.raises(ApprovalNotFoundError):
+        await service.add_additional_info("missing", "info")
+
+
+@pytest.mark.asyncio
+async def test_add_additional_info_raises_when_already_terminal() -> None:
+    service, _, _ = _service()
+    await service.handle_decision_completed(_decision_completed_event())
+    await service.request_info("corr-1")
+    await service.add_additional_info("corr-1", "first response")
+    await service.approve("corr-1")
+
+    with pytest.raises(ApprovalNotAwaitingInfoError):
+        await service.add_additional_info("corr-1", "too late")
+
+
+@pytest.mark.asyncio
+async def test_additional_info_remains_visible_after_later_approve() -> None:
+    """additional_info is not cleared by a later approve/reject - the
+    approver must still be able to see what the submitter said."""
+    service, repository, _ = _service()
+    await service.handle_decision_completed(_decision_completed_event())
+    await service.request_info("corr-1")
+    await service.add_additional_info("corr-1", "Client name: Acme Corp")
+
+    await service.approve("corr-1")
+
+    stored = await repository.get("corr-1")
+    assert stored is not None
+    assert stored.status == ApprovalStatus.APPROVED
+    assert stored.additional_info == "Client name: Acme Corp"

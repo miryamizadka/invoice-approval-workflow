@@ -37,6 +37,8 @@ services:
         condition: service_healthy
       audit:
         condition: service_healthy
+      ui:
+        condition: service_healthy
     # Unlike the Docker provider, the file provider has no independent way to
     # notice new backends coming up - its routes are static from the start,
     # so there's no benefit to letting gateway start before its backends are
@@ -159,6 +161,25 @@ services:
     # itself creates its own schema at startup (ensure_schema(), no migration
     # framework), which is why it needs postgres healthy first (nothing else
     # in this file depended on postgres being ready until now).
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.ui.app:app --host 0.0.0.0 --port 8006
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+    # No host port mapping - see intake's comment above. M7's static UI:
+    # no Dapr sidecar (ARCHITECTURE.md's UI row shows Dapr block "-" - REST-
+    # to-gateway only, no pub/sub/state of its own), no dependency on any
+    # other service at startup - it's just a StaticFiles mount (ADR-010).
+    # Reachable externally only via the gateway's /ui route; the browser's
+    # own JS calls the other services' existing endpoints directly through
+    # that same gateway (same-origin, no CORS needed).
 
   postgres:
     image: postgres:16-alpine
