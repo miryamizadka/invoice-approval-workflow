@@ -94,30 +94,58 @@
     }
     try {
       const submission = await apiGet(`/invoices/${trackingId}`);
-      renderSubmissionStatus(submission);
-      if (submission.status === "completed" || submission.status === "failed") {
+      // Intake's own status/decision is frozen at whatever Decision
+      // originally output - it never learns the eventual approval outcome
+      // (Intake doesn't subscribe to approval.completed). Only escalated
+      // (human_review) items have an Approval record at all - checking
+      // /approvals/{id} for every other route would just 404 every poll
+      // for no reason, so it's only called when we know it's relevant.
+      const isEscalated = submission.decision && submission.decision.route === "human_review";
+      let approval = null;
+      if (isEscalated) {
+        approval = await checkApprovalStatus(trackingId);
+      } else {
+        waitingInfoSection.hidden = true;
+      }
+      renderSubmissionStatus(submission, approval);
+
+      const escalationResolved =
+        approval !== null && (approval.status === "approved" || approval.status === "rejected");
+      if (submission.status === "failed" ||
+          (submission.status === "completed" && (!isEscalated || escalationResolved))) {
         stopPolling();
       }
-      // Intake's own status has no visibility into Approval's internal
-      // state machine - check the approval queue separately for waiting_info.
-      await checkWaitingInfo(trackingId);
     } catch (err) {
       statusMessage.textContent = err.message;
     }
   }
 
-  function renderSubmissionStatus(submission) {
-    if (submission.status === "completed" && submission.decision) {
-      statusMessage.textContent =
-        `Status: completed - ${submission.decision.route} (${submission.decision.reason})`;
-    } else if (submission.status === "failed") {
+  function renderSubmissionStatus(submission, approval) {
+    if (submission.status === "failed") {
       statusMessage.textContent = `Status: failed - ${submission.reason || "internal error"}`;
-    } else {
-      statusMessage.textContent = `Status: ${submission.status}...`;
+      return;
     }
+    if (submission.status !== "completed" || !submission.decision) {
+      statusMessage.textContent = `Status: ${submission.status}...`;
+      return;
+    }
+    if (submission.decision.route === "human_review") {
+      if (approval && approval.status === "approved") {
+        statusMessage.textContent = `Status: approved by approver (${submission.decision.reason})`;
+      } else if (approval && approval.status === "rejected") {
+        statusMessage.textContent = `Status: rejected by approver (${submission.decision.reason})`;
+      } else if (approval && approval.status === "waiting_info") {
+        statusMessage.textContent = "Status: waiting for your response (see below)";
+      } else {
+        statusMessage.textContent = `Status: pending human review - ${submission.decision.reason}`;
+      }
+      return;
+    }
+    statusMessage.textContent =
+      `Status: completed - ${submission.decision.route} (${submission.decision.reason})`;
   }
 
-  async function checkWaitingInfo(trackingId) {
+  async function checkApprovalStatus(trackingId) {
     try {
       const approval = await apiGet(`/approvals/${trackingId}`);
       if (approval.status === "waiting_info") {
@@ -126,9 +154,14 @@
       } else {
         waitingInfoSection.hidden = true;
       }
+      return approval;
     } catch (err) {
-      // 404 is expected here - not every invoice is ever escalated
+      // A 404 here is expected only very briefly (Intake and Approval both
+      // subscribe to decision.completed independently - no ordering
+      // guarantee between them) - resolves within one poll cycle once
+      // Approval catches up.
       waitingInfoSection.hidden = true;
+      return null;
     }
   }
 

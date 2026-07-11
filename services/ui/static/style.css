@@ -36,6 +36,13 @@ form textarea {
   box-sizing: border-box;
 }
 
+form input[type="checkbox"] {
+  display: inline-block;
+  width: auto;
+  margin: 0 0.5rem 0 0;
+  vertical-align: middle;
+}
+
 fieldset {
   margin-bottom: 0.75rem;
   border: 1px solid #ddd;

@@ -10,7 +10,11 @@
   async function loadQueue() {
     try {
       const approvals = await apiGet("/approvals");
-      renderQueue(approvals);
+      // F4: "queue of only the items the system escalated" - a queue to work
+      // through, not a history. Once approved/rejected, an item's job here is
+      // done and it should disappear, not linger with no action available.
+      const queueItems = approvals.filter((approval) => ACTIONABLE_STATUSES.has(approval.status));
+      renderQueue(queueItems);
     } catch (err) {
       showError(queueMessage, err.message);
     }
@@ -58,11 +62,11 @@
       card.appendChild(info);
     }
 
-    if (ACTIONABLE_STATUSES.has(approval.status)) {
-      card.appendChild(renderActionButton(approval.tracking_id, "Approve", "approve"));
-      card.appendChild(renderActionButton(approval.tracking_id, "Reject", "reject"));
-      card.appendChild(renderActionButton(approval.tracking_id, "Request Info", "request-info"));
-    }
+    // renderCard only ever receives already-filtered (pending/waiting_info)
+    // items from loadQueue - action buttons are always shown here.
+    card.appendChild(renderActionButton(approval.tracking_id, "Approve", "approve"));
+    card.appendChild(renderActionButton(approval.tracking_id, "Reject", "reject"));
+    card.appendChild(renderActionButton(approval.tracking_id, "Request Info", "request-info"));
 
     return card;
   }
