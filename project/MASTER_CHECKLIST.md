@@ -490,11 +490,11 @@ Priority: CRITICAL
 
 ## M18 — README
 
-- [ ] Project explanation
-- [ ] Technology list
-- [ ] Run instructions
-- [ ] Test instructions
-- [ ] System diagram
+- [x] Project explanation
+- [x] Technology list
+- [x] Run instructions
+- [x] Test instructions
+- [x] System diagram (bird's-eye layered diagram + escalate-and-resume swimlane diagram)
 
 
 ---
@@ -545,7 +545,7 @@ CRITICAL
 
 ## D6 — README
 
-- [ ] Complete README
+- [x] Complete README
 
 
 ## D7 — Demo
