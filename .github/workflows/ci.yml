@@ -25,7 +25,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-      - run: pip install .[dev] # cache: pip above auto-invalidates when pyproject.toml's hash changes
+      - run: pip install -e .[dev] # editable - a non-editable `pip install .` leaves a
+        # build/lib/ copy of services/shared in the checkout, which mypy then flags as
+        # a duplicate module (confirmed by reproducing the failure locally)
       - name: Environment info
         run: |
           python --version
