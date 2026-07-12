@@ -37,8 +37,8 @@ ApprovalFlow
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
 | Payment | Saga: reserve budget → pay → compensate | pub/sub | pub/sub, state | payments, budgets (Dapr state/Redis - interim; see §8/§9) |
 | Notification | Final result notification to submitter | pub (consumer) | pub/sub, state | notification idempotency marker (see §8) |
-| Audit | Cross-service decision trail projection (F9) | REST (read) + pub (consumer) | pub/sub | audit_trail (PostgreSQL - see §8) |
-| UI | Minimal interface to submit and view status; approver queue | REST (to gateway) | — | — |
+| Audit | Cross-service decision trail projection (F9) + dashboard aggregation (F8) | REST (read) + pub (consumer) | pub/sub | audit_trail (PostgreSQL - see §8) |
+| UI | Minimal interface to submit and view status; approver queue; dashboard (F8) | REST (to gateway) | — | — |
 
 
 **API Gateway** - Single entry point, routes requests for services, enforce rate limiting, hide internal structure, logic free. It is the only externally supported entry point; internal service-to-service traffic remains direct over the Docker network (Dapr pub/sub) - the gateway never sits between internal services, only at the system's outer boundary. See §7 for the concrete implementation (Traefik).
@@ -54,6 +54,8 @@ ApprovalFlow
 **Notification** - Listens for the final outcome and notifies the submitter (F2, M8). It's a pure consumer - it never initiates, only reacts to the result event. It is a terminal consumer in this architecture's choreography chain - it never publishes any event of its own downstream.
 
 **Audit** - Builds the complete decision trail required by F9: a pure, observational consumer of `decision.completed`/`approval.completed`/`payment.completed`, projecting each into one row per tracking id in PostgreSQL (the `audit_trail` table), exposed for retrieval via `GET /audit/{tracking_id}`. It is a read model, not a source of truth - every business service keeps owning its own operational state; Audit only makes the cross-service history queryable in one place. It never blocks or influences a decision and publishes nothing onward; a failure of Audit cannot prevent Approval/Payment/Notification from completing (verified live - see ADR-008 and PLAN.md's Phase 9). Unlike every other service, Audit accesses PostgreSQL directly instead of through Dapr state - a deliberate, documented exception (ADR-008), since F8-style aggregation (rates, money totals) needs real SQL, not a key-value blob store.
+
+**F8 Dashboard** (Nice to Have) is this exact aggregation, now implemented: `GET /audit/summary` groups `audit_trail` by `(route, currency, approval_resolution)` (`SELECT ... GROUP BY`, `services/audit/postgres_repository.py`) and `AuditService.get_summary()` turns those raw buckets into four metrics - auto-approval rate, human-escalation rate, and money auto-approved/human-approved, the latter two **per currency** (invoices in this system are not all the same currency - a naive cross-currency `SUM` would be meaningless). "Money human-approved" is specifically `route=human_review AND approval_resolution=approved` - a human_review invoice that was rejected still counts toward the escalation rate but never toward this figure; this is a decision-time metric (was the AI or a human responsible for the outcome), not a payment-success metric (Payment/M9's separate concern). Rendered on a new static page, `services/ui/static/dashboard.html`/`dashboard.js`, following M7's existing polling-page pattern (ADR-010) - no charting library, text/number tiles only.
 
 **UI (M7)** - A minimal web interface: static HTML/CSS/vanilla JS, no framework, no build step (ADR-010), served by its own "logic free" FastAPI app (a `StaticFiles` mount, same posture as the Gateway itself) through the Gateway's `/ui` path prefix - the browser's own JS calls the other services' REST endpoints directly through that same Gateway (same-origin, no CORS needed). A submitter can submit an item and track its status with a plain-language reason (F1, F2); an approver can act on the escalation queue - approve, reject, or request more information (F4, F5). **F5 is fully closed, including resume**: `WAITING_INFO` was already non-terminal (`approve`/`reject` already worked on it) - the one missing piece was a channel for the submitter to respond, closed by a new `POST /approvals/{tracking_id}/additional-info` endpoint that stores the response and returns the item to `PENDING` (a visible signal to the approver that new information is available). F8 (Dashboard) remains NICE TO HAVE and out of scope for this UI - not built.
 
@@ -102,7 +104,7 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Gateway | UI | REST | Sync | Serves the static HTML/CSS/JS itself (M7) - the browser's JS then calls the rows above directly, through the same Gateway |
 | Gateway | Payment | REST | Sync | Payment/budget status (ops/debug, not part of the choreography) |
 | Gateway | Notification | REST | Sync | Notification status (ops/debug) |
-| Gateway | Audit | REST | Sync | Decision trail retrieval (F9) |
+| Gateway | Audit | REST | Sync | Decision trail retrieval (F9) + dashboard aggregation (F8) |
 | Intake | Approval | Dapr Service Invocation | Sync | Live approval status enrichment for `GET /invoices/{id}` (M5) |
 | Intake | Decision | Dapr Pub/Sub | Async | Loose coupling |
 | Decision | Approval | Dapr Pub/Sub | Async | Escalation flow |

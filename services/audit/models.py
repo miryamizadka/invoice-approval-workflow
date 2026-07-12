@@ -59,3 +59,31 @@ class AuditTrail(BaseModel):
     payment_resolution: PaymentResolution | None = None
     payment_reason: str | None = None
     payment_completed_at: datetime | None = None
+
+
+class DashboardSummary(BaseModel):
+    """GET /audit/summary's response (F8). All fields always present with a
+    well-defined value - empty dict (not null) when there's no data yet,
+    0.0 (not null) for rates - so the UI only ever needs an empty-state
+    check, never a null-check.
+
+    money_human_approved is specifically route=human_review AND
+    approval_resolution=approved - NOT "any human-touched money" and NOT
+    tied to payment success (that's Payment/M9's concern, a different
+    metric). A human_review invoice that was rejected still counts toward
+    human_review_count/human_escalation_rate (it WAS escalated) but never
+    appears here.
+
+    Money fields are per-currency (currency -> amount), never summed across
+    currencies - invoices in this system are not all the same currency.
+    """
+
+    generated_at: datetime
+    total_invoices: int = 0
+    auto_approved_count: int = 0
+    human_review_count: int = 0
+    auto_approval_rate: float = 0.0
+    human_escalation_rate: float = 0.0
+    money_auto_approved: dict[str, Decimal] = {}
+    money_human_approved: dict[str, Decimal] = {}
+    counts_by_route: dict[str, int] = {}

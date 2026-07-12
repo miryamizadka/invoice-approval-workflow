@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from services.audit.models import AuditTrail
+from services.audit.repository import RouteSummaryBucket
 from shared.contracts.models import (
     ApprovalCompletedEvent,
     Decision,
@@ -143,6 +144,13 @@ ON CONFLICT (tracking_id) DO UPDATE SET
 
 _SELECT_SQL = "SELECT * FROM audit_trail WHERE tracking_id = $1"
 
+_ROUTE_SUMMARY_SQL = """
+SELECT route, currency, approval_resolution, COUNT(*) AS n, SUM(total) AS total
+FROM audit_trail
+GROUP BY route, currency, approval_resolution
+ORDER BY route, currency
+"""
+
 
 def _base_params(invoice: Invoice, decision: Decision) -> tuple[object, ...]:
     return (
@@ -241,6 +249,23 @@ class PostgresAuditRepository:
             payment_reason=row["payment_reason"],
             payment_completed_at=row["payment_completed_at"],
         )
+
+    async def get_route_summary(self) -> list[RouteSummaryBucket]:
+        pool = await self._get_pool()
+        try:
+            rows = await pool.fetch(_ROUTE_SUMMARY_SQL)
+        except asyncpg.PostgresError as exc:
+            raise AuditRepositoryError(f"Failed to compute route summary: {exc}") from exc
+        return [
+            RouteSummaryBucket(
+                route=row["route"],
+                currency=row["currency"],
+                approval_resolution=row["approval_resolution"],
+                count=row["n"],
+                total=row["total"],
+            )
+            for row in rows
+        ]
 
     async def _execute(self, sql: str, params: tuple[object, ...], kind: str) -> None:
         pool = await self._get_pool()

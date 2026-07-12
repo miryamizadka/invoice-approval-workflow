@@ -141,10 +141,24 @@ Priority: MUST HAVE
 
 Priority: NICE TO HAVE
 
-- [ ] Auto approval rate
-- [ ] Human escalation rate
-- [ ] Money auto-approved
-- [ ] Money human-approved
+`GET /audit/summary` (Audit service) groups `audit_trail` by `(route, currency,
+approval_resolution)` in Postgres; `AuditService.get_summary()` turns the raw buckets into
+the four metrics below. Rendered on a new static page (`services/ui/static/dashboard.html`),
+polling every 10s, following M7's existing page pattern - no charting library, text/number
+tiles only. Verified live: ran `verify_phase8` twice back-to-back and confirmed every number
+(`total_invoices`, money per currency) exactly doubled between runs - proof the dashboard
+reflects real cumulative Postgres data, not a cached/static response.
+
+- [x] Auto approval rate (`auto_approval_rate` = `auto_approved_count / total_invoices`,
+  `0.0` on an empty deployment rather than a divide-by-zero)
+- [x] Human escalation rate (`human_escalation_rate`, same shape)
+- [x] Money auto-approved (`money_auto_approved`, per-currency dict - invoices in this system
+  are not all one currency; a naive cross-currency `SUM` would be meaningless)
+- [x] Money human-approved (`money_human_approved` - specifically `route=human_review AND
+  approval_resolution=approved`, not "any human-touched money" and not tied to payment
+  success [that's Payment/M9's separate concern]; a human_review invoice that was rejected
+  still counts toward the escalation rate but never appears here - verified with a dedicated
+  unit test for exactly this distinction, plus a mixed-currencies+rejected combined test)
 
 
 ---

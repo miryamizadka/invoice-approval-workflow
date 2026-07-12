@@ -16,17 +16,37 @@ PostgresAuditRepository (postgres_repository.py) is the real one.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Protocol
+
+from pydantic import BaseModel
 
 from services.audit.models import AuditTrail
 from shared.contracts.models import (
     ApprovalCompletedEvent,
+    ApprovalResolution,
     Decision,
     DecisionCompletedEvent,
     Invoice,
     PaymentCompletedEvent,
+    Route,
 )
+
+
+class RouteSummaryBucket(BaseModel):
+    """One (route, currency, approval_resolution) group with its count and
+    total - the repository's raw aggregation shape for F8's dashboard, not
+    an API response itself (see services/audit/models.py's DashboardSummary
+    for that). Computing the four dashboard metrics from these buckets is
+    AuditService's job (business logic), not the repository's."""
+
+    route: Route
+    currency: str
+    approval_resolution: ApprovalResolution | None
+    count: int
+    total: Decimal
 
 
 def _base_fields(invoice: Invoice, decision: Decision) -> dict[str, object]:
@@ -51,6 +71,12 @@ class AuditRepository(Protocol):
     async def upsert_approval(self, event: ApprovalCompletedEvent) -> None: ...
     async def upsert_payment(self, event: PaymentCompletedEvent) -> None: ...
     async def get(self, tracking_id: str) -> AuditTrail | None: ...
+    # F8: the one method here that isn't plain CRUD - an aggregation query,
+    # not a single-row lookup. Still belongs on the repository (not the
+    # service) because grouping is a backing-store concern (SQL GROUP BY vs
+    # Python accumulation) - AuditService turns these raw buckets into the
+    # actual dashboard metrics.
+    async def get_route_summary(self) -> list[RouteSummaryBucket]: ...
 
 
 class InMemoryAuditRepository:
@@ -91,6 +117,22 @@ class InMemoryAuditRepository:
 
     async def get(self, tracking_id: str) -> AuditTrail | None:
         return self._by_tracking_id.get(tracking_id)
+
+    async def get_route_summary(self) -> list[RouteSummaryBucket]:
+        grouped: dict[tuple[Route, str, ApprovalResolution | None], tuple[int, Decimal]] = (
+            defaultdict(lambda: (0, Decimal("0")))
+        )
+        for trail in self._by_tracking_id.values():
+            key = (trail.route, trail.currency, trail.approval_resolution)
+            count, total = grouped[key]
+            grouped[key] = (count + 1, total + trail.total)
+        return [
+            RouteSummaryBucket(
+                route=route, currency=currency, approval_resolution=resolution,
+                count=count, total=total,
+            )
+            for (route, currency, resolution), (count, total) in grouped.items()
+        ]
 
     def _merge(self, tracking_id: str, fields: dict[str, object]) -> None:
         existing = self._by_tracking_id.get(tracking_id)

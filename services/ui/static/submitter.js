@@ -21,6 +21,16 @@
   let pollDeadline = null;
   let currentTrackingId = null;
 
+  const STATUS_CLASSES = ["status-approved", "status-rejected", "status-waiting", "status-pending"];
+
+  function setStatusMessage(text, statusClass) {
+    statusMessage.textContent = text;
+    statusMessage.classList.remove(...STATUS_CLASSES);
+    if (statusClass) {
+      statusMessage.classList.add(statusClass);
+    }
+  }
+
   function stopPolling() {
     if (pollTimer !== null) {
       clearInterval(pollTimer);
@@ -79,7 +89,7 @@
     statusSection.hidden = false;
     trackingIdDisplay.textContent = trackingId;
     waitingInfoSection.hidden = true;
-    statusMessage.textContent = "Checking status...";
+    setStatusMessage("Checking status...", "status-pending");
     pollDeadline = Date.now() + POLL_TIMEOUT_MS;
     stopPolling();
     pollTimer = setInterval(() => checkStatus(trackingId), POLL_INTERVAL_MS);
@@ -89,7 +99,7 @@
   async function checkStatus(trackingId) {
     if (Date.now() > pollDeadline) {
       stopPolling();
-      statusMessage.textContent = "Still processing - check back later.";
+      setStatusMessage("Still processing - check back later.", "status-pending");
       return;
     }
     try {
@@ -116,33 +126,48 @@
         stopPolling();
       }
     } catch (err) {
-      statusMessage.textContent = err.message;
+      setStatusMessage(err.message, "status-rejected");
     }
   }
 
   function renderSubmissionStatus(submission, approval) {
     if (submission.status === "failed") {
-      statusMessage.textContent = `Status: failed - ${submission.reason || "internal error"}`;
+      setStatusMessage(
+        `Status: failed - ${submission.reason || "internal error"}`,
+        "status-rejected"
+      );
       return;
     }
     if (submission.status !== "completed" || !submission.decision) {
-      statusMessage.textContent = `Status: ${submission.status}...`;
+      setStatusMessage(`Status: ${submission.status}...`, "status-pending");
       return;
     }
     if (submission.decision.route === "human_review") {
       if (approval && approval.status === "approved") {
-        statusMessage.textContent = `Status: approved by approver (${submission.decision.reason})`;
+        setStatusMessage(
+          `Status: approved by approver (${submission.decision.reason})`,
+          "status-approved"
+        );
       } else if (approval && approval.status === "rejected") {
-        statusMessage.textContent = `Status: rejected by approver (${submission.decision.reason})`;
+        setStatusMessage(
+          `Status: rejected by approver (${submission.decision.reason})`,
+          "status-rejected"
+        );
       } else if (approval && approval.status === "waiting_info") {
-        statusMessage.textContent = "Status: waiting for your response (see below)";
+        setStatusMessage("Status: waiting for your response (see below)", "status-waiting");
       } else {
-        statusMessage.textContent = `Status: pending human review - ${submission.decision.reason}`;
+        setStatusMessage(
+          `Status: pending human review - ${submission.decision.reason}`,
+          "status-pending"
+        );
       }
       return;
     }
-    statusMessage.textContent =
-      `Status: completed - ${submission.decision.route} (${submission.decision.reason})`;
+    const isPositive = submission.decision.route === "auto_approve";
+    setStatusMessage(
+      `Status: completed - ${submission.decision.route} (${submission.decision.reason})`,
+      isPositive ? "status-approved" : "status-rejected"
+    );
   }
 
   async function checkApprovalStatus(trackingId) {
@@ -177,8 +202,10 @@
       });
       waitingInfoSection.hidden = true;
       additionalInfoText.value = "";
-      statusMessage.textContent =
-        "Additional information sent - waiting for the approver to review it again.";
+      setStatusMessage(
+        "Additional information sent - waiting for the approver to review it again.",
+        "status-pending"
+      );
     } catch (err) {
       showError(submitMessage, err.message);
     } finally {
