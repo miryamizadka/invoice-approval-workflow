@@ -18,6 +18,7 @@ from dapr.ext.fastapi import DaprApp
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from services.audit.models import DashboardSummary
 from services.audit.postgres_repository import PostgresAuditRepository
 from services.audit.repository import AuditRepository
 from services.audit.service import AuditService, build_audit_service
@@ -44,6 +45,16 @@ def create_app(repository: AuditRepository | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "audit-service"}
+
+    @app.get("/audit/summary", response_model=DashboardSummary)
+    async def get_summary(request: Request) -> DashboardSummary:
+        # Registered BEFORE /audit/{tracking_id} below - FastAPI/Starlette
+        # matches routes in registration order, and {tracking_id} is a
+        # generic string param that would otherwise swallow "summary" as if
+        # it were a tracking_id (same class of hazard as "register /health
+        # before the catch-all mount" in services/ui/app.py).
+        service: AuditService = request.app.state.audit_service
+        return await service.get_summary()
 
     @app.get("/audit/{tracking_id}")
     async def get_audit_trail(tracking_id: str, request: Request) -> Any:

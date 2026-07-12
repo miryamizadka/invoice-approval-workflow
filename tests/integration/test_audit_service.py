@@ -111,3 +111,60 @@ def test_health_check() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "audit-service"}
+
+
+# --- summary (F8 Dashboard) ----------------------------------------------------
+
+
+def test_summary_reflects_recorded_journeys() -> None:
+    app = _build_app()
+    auto_event = decision_completed_event(route=Route.AUTO_APPROVE, correlation_id="a1")
+    human_event = decision_completed_event(route=Route.HUMAN_REVIEW, correlation_id="h1")
+    with TestClient(app) as client:
+        client.post(
+            "/events/decision-completed", json={"data": auto_event.model_dump(mode="json")}
+        )
+        client.post(
+            "/events/decision-completed", json={"data": human_event.model_dump(mode="json")}
+        )
+        _post_approval_completed(
+            client,
+            correlation_id="h1",
+            resolution=ApprovalResolution.APPROVED,
+            decision=human_event.decision,
+        )
+        summary = client.get("/audit/summary")
+
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["total_invoices"] == 2
+    assert body["auto_approved_count"] == 1
+    assert body["human_review_count"] == 1
+    assert body["auto_approval_rate"] == 0.5
+    assert body["human_escalation_rate"] == 0.5
+    assert body["money_auto_approved"] == {"USD": "50.00"}
+    assert body["money_human_approved"] == {"USD": "50.00"}
+    assert "generated_at" in body  # presence only, never assert an exact timestamp
+
+
+def test_summary_with_no_data_returns_zeroed_response() -> None:
+    app = _build_app()
+    with TestClient(app) as client:
+        response = client.get("/audit/summary")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_invoices"] == 0
+    assert body["money_auto_approved"] == {}
+
+
+def test_unknown_tracking_id_still_returns_404_alongside_summary_route() -> None:
+    """Regression guard for the routing-order fix: /audit/summary is
+    registered before /audit/{tracking_id} so FastAPI doesn't treat
+    "summary" as a tracking_id - this confirms the existing 404 behavior for
+    a genuinely unknown id still works."""
+    app = _build_app()
+    with TestClient(app) as client:
+        response = client.get("/audit/unknown")
+
+    assert response.status_code == 404

@@ -74,6 +74,8 @@
   function renderActionButton(trackingId, label, action) {
     const button = document.createElement("button");
     button.type = "button";
+    button.className = `button-${action}`; // presentational only - color-codes
+    // approve/reject/request-info so the approver recognizes each action at a glance
     button.textContent = label;
     button.addEventListener("click", async () => {
       button.disabled = true;

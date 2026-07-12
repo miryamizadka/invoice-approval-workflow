@@ -9,12 +9,14 @@ overwrites what an earlier event already wrote) and order-independence
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 
 import pytest
 
 from services.audit.repository import InMemoryAuditRepository
 from services.audit.service import AuditService, build_audit_service
 from shared.contracts.models import ApprovalResolution, PaymentResolution, Route
+from tests.support.decision_fixtures import clean_invoice
 from tests.support.event_fixtures import (
     approval_completed_event,
     decision_completed_event,
@@ -198,3 +200,192 @@ async def test_record_decision_completed_logs_with_correlation_id(
 
     record = next(r for r in caplog.records if r.getMessage().startswith("audit_decision_recorded"))
     assert record.correlation_id == "corr-1"  # type: ignore[attr-defined]
+
+
+# --- get_summary() - F8 Dashboard aggregation --------------------------------
+
+
+async def test_get_summary_with_no_data_returns_zero_rates_and_empty_dicts() -> None:
+    service, _ = _service()
+
+    summary = await service.get_summary()
+
+    assert summary.total_invoices == 0
+    assert summary.auto_approval_rate == 0.0
+    assert summary.human_escalation_rate == 0.0
+    assert summary.money_auto_approved == {}
+    assert summary.money_human_approved == {}
+    assert summary.counts_by_route == {}
+
+
+async def test_get_summary_computes_auto_approval_rate_and_money() -> None:
+    service, _ = _service()
+    await service.record_decision_completed(
+        decision_completed_event(
+            Route.AUTO_APPROVE, correlation_id="a1", invoice=clean_invoice(total=Decimal("100.00"))
+        )
+    )
+    await service.record_decision_completed(
+        decision_completed_event(Route.HUMAN_REVIEW, correlation_id="a2")
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.total_invoices == 2
+    assert summary.auto_approved_count == 1
+    assert summary.auto_approval_rate == 0.5
+    assert summary.money_auto_approved == {"USD": Decimal("100.00")}
+
+
+async def test_get_summary_human_review_approved_counts_as_money_human_approved() -> None:
+    service, _ = _service()
+    decision_event = decision_completed_event(
+        Route.HUMAN_REVIEW, correlation_id="h1", invoice=clean_invoice(total=Decimal("200.00"))
+    )
+    await service.record_decision_completed(decision_event)
+    await service.record_approval_completed(
+        approval_completed_event(
+            ApprovalResolution.APPROVED,
+            correlation_id="h1",
+            invoice=decision_event.invoice,
+            decision=decision_event.decision,
+        )
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.human_review_count == 1
+    assert summary.human_escalation_rate == 1.0
+    assert summary.money_human_approved == {"USD": Decimal("200.00")}
+
+
+async def test_get_summary_human_review_rejected_counts_toward_rate_but_not_money() -> None:
+    """The critical distinction (escalated != approved): a human_review
+    invoice that was REJECTED still counts toward human_escalation_rate (it
+    WAS escalated) but must NOT appear in money_human_approved (the human
+    did not approve it)."""
+    service, _ = _service()
+    decision_event = decision_completed_event(
+        Route.HUMAN_REVIEW, correlation_id="h1", invoice=clean_invoice(total=Decimal("300.00"))
+    )
+    await service.record_decision_completed(decision_event)
+    await service.record_approval_completed(
+        approval_completed_event(
+            ApprovalResolution.REJECTED,
+            correlation_id="h1",
+            invoice=decision_event.invoice,
+            decision=decision_event.decision,
+        )
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.human_review_count == 1
+    assert summary.human_escalation_rate == 1.0
+    assert summary.money_human_approved == {}
+
+
+async def test_get_summary_handles_multiple_currencies_separately() -> None:
+    service, _ = _service()
+    await service.record_decision_completed(
+        decision_completed_event(
+            Route.AUTO_APPROVE,
+            correlation_id="u1",
+            invoice=clean_invoice(currency="USD", total=Decimal("100.00")),
+        )
+    )
+    await service.record_decision_completed(
+        decision_completed_event(
+            Route.AUTO_APPROVE,
+            correlation_id="e1",
+            invoice=clean_invoice(currency="EUR", total=Decimal("50.00")),
+        )
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.money_auto_approved == {"USD": Decimal("100.00"), "EUR": Decimal("50.00")}
+
+
+async def test_get_summary_reject_and_duplicate_count_toward_total_not_rate_numerators() -> None:
+    service, _ = _service()
+    await service.record_decision_completed(
+        decision_completed_event(Route.REJECT, correlation_id="r1")
+    )
+    await service.record_decision_completed(
+        decision_completed_event(Route.DUPLICATE, correlation_id="d1")
+    )
+    await service.record_decision_completed(
+        decision_completed_event(Route.AUTO_APPROVE, correlation_id="a1")
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.total_invoices == 3
+    assert summary.auto_approved_count == 1
+    assert summary.human_review_count == 0
+    assert summary.auto_approval_rate == pytest.approx(1 / 3)
+    assert summary.counts_by_route == {"reject": 1, "duplicate": 1, "auto_approve": 1}
+
+
+async def test_get_summary_mixed_currencies_and_resolutions_combined() -> None:
+    """The most dangerous case: currency grouping and approval_resolution
+    filtering must not bleed into each other."""
+    service, _ = _service()
+    usd_approved = decision_completed_event(
+        Route.HUMAN_REVIEW,
+        correlation_id="h-usd-approved",
+        invoice=clean_invoice(currency="USD", total=Decimal("100.00")),
+    )
+    await service.record_decision_completed(usd_approved)
+    await service.record_approval_completed(
+        approval_completed_event(
+            ApprovalResolution.APPROVED,
+            correlation_id="h-usd-approved",
+            invoice=usd_approved.invoice,
+            decision=usd_approved.decision,
+        )
+    )
+    eur_approved = decision_completed_event(
+        Route.HUMAN_REVIEW,
+        correlation_id="h-eur-approved",
+        invoice=clean_invoice(currency="EUR", total=Decimal("60.00")),
+    )
+    await service.record_decision_completed(eur_approved)
+    await service.record_approval_completed(
+        approval_completed_event(
+            ApprovalResolution.APPROVED,
+            correlation_id="h-eur-approved",
+            invoice=eur_approved.invoice,
+            decision=eur_approved.decision,
+        )
+    )
+    # Same currency (USD) as the approved one, but rejected - must not leak
+    # into money_human_approved's USD bucket.
+    usd_rejected = decision_completed_event(
+        Route.HUMAN_REVIEW,
+        correlation_id="h-usd-rejected",
+        invoice=clean_invoice(currency="USD", total=Decimal("999.00")),
+    )
+    await service.record_decision_completed(usd_rejected)
+    await service.record_approval_completed(
+        approval_completed_event(
+            ApprovalResolution.REJECTED,
+            correlation_id="h-usd-rejected",
+            invoice=usd_rejected.invoice,
+            decision=usd_rejected.decision,
+        )
+    )
+
+    summary = await service.get_summary()
+
+    assert summary.human_review_count == 3
+    assert summary.money_human_approved == {"USD": Decimal("100.00"), "EUR": Decimal("60.00")}
+
+
+async def test_get_summary_includes_generated_at_timestamp() -> None:
+    service, _ = _service()
+
+    summary = await service.get_summary()
+
+    assert summary.generated_at is not None
