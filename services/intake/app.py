@@ -11,6 +11,10 @@ from typing import Any
 from dapr.ext.fastapi import DaprApp
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
+from services.intake.approval_status_client import (
+    ApprovalStatusClient,
+    DaprApprovalStatusClient,
+)
 from services.intake.dapr_state_repository import DaprStateInvoiceRepository
 from services.intake.decision_completed_publisher import (
     DaprDecisionCompletedPublisher,
@@ -28,12 +32,14 @@ def create_app(
     repository: InvoiceRepository | None = None,
     publisher: DecisionPublisher | None = None,
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
+    approval_status_client: ApprovalStatusClient | None = None,
 ) -> FastAPI:
     configure_logging()
     intake_service = build_intake_service(
         repository or DaprStateInvoiceRepository(),
         publisher or DaprDecisionPublisher(),
         decision_completed_publisher or DaprDecisionCompletedPublisher(),
+        approval_status_client or DaprApprovalStatusClient(),
     )
 
     app = FastAPI(title="ApprovalFlow Intake Service")
@@ -57,10 +63,10 @@ def create_app(
     @app.get("/invoices/{tracking_id}", response_model=SubmissionStatusResponse)
     async def get_invoice_status(tracking_id: str, request: Request) -> SubmissionStatusResponse:
         service: IntakeService = request.app.state.intake_service
-        submission = await service.get_status(tracking_id)
-        if submission is None:
+        response = await service.get_status_response(tracking_id)
+        if response is None:
             raise HTTPException(status_code=404, detail="tracking_id not found")
-        return SubmissionStatusResponse.from_submission(submission)
+        return response
 
     @dapr_app.subscribe(
         pubsub="pubsub", topic="decision.completed", route="/events/decision-completed"

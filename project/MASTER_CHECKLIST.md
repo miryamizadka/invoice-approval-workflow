@@ -262,10 +262,16 @@ Approval and Payment too, verified over the actual Docker network (`docker compo
 `POST /events/invoice-submitted`/`POST /events/decision-completed`/`POST /events/approval-completed`,
 zero direct HTTP calls between any of these four services). Step 4 done: Dapr state now backs
 Intake's, Approval's, and Payment's repositories - including Payment's budget reservation via
-ETag optimistic concurrency (INV-1014), not just simple save/get. Service invocation and Dapr
-secrets remain unused.
+ETag optimistic concurrency (INV-1014), not just simple save/get.
 
-- [ ] Service invocation used
+- [x] Service invocation used (`services/intake/approval_status_client.py`'s
+  `DaprApprovalStatusClient` - Intake calls Approval's `GET /approvals/{tracking_id}` through
+  the Dapr sidecar's HTTP invoke API, enriching `GET /invoices/{tracking_id}` with live approval
+  status for `human_review` submissions. The one synchronous cross-service call in the system -
+  every other flow is deliberately event-driven; see ARCHITECTURE.md §7. Verified live:
+  `approval.status` transitions `pending` → `approved` as the approver acts while Intake's own
+  `decision` stays frozen; stopping Approval Service mid-flow still returns 200 with
+  `approval: null`, never a 500; `verify_phase8` unaffected)
 - [x] Pub/Sub used (`invoice.submitted` published by Intake via `DaprDecisionPublisher`;
   `decision.completed` published by Decision via `DaprDecisionOutcomePublisher`; `approval.completed`
   published by Approval via `DaprApprovalOutcomePublisher`; `payment.completed` published by
@@ -274,7 +280,7 @@ secrets remain unused.
   Approval, `DaprStatePaymentRepository`/`DaprStateBudgetRepository` for Payment - the same
   append-only-index pattern for records; budgets additionally use ETag-based optimistic
   concurrency, backed by the `statestore` component)
-- [ ] Dapr secrets used
+- [ ] Dapr secrets used (next: `feature/dapr-secrets`)
 
 
 ## M6 — API Gateway

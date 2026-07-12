@@ -103,6 +103,7 @@ External clients use REST; internal service-to-service flow is asynchronous via 
 | Gateway | Payment | REST | Sync | Payment/budget status (ops/debug, not part of the choreography) |
 | Gateway | Notification | REST | Sync | Notification status (ops/debug) |
 | Gateway | Audit | REST | Sync | Decision trail retrieval (F9) |
+| Intake | Approval | Dapr Service Invocation | Sync | Live approval status enrichment for `GET /invoices/{id}` (M5) |
 | Intake | Decision | Dapr Pub/Sub | Async | Loose coupling |
 | Decision | Approval | Dapr Pub/Sub | Async | Escalation flow |
 | Decision | Payment | Dapr Pub/Sub | Async | Auto-approved flow |
@@ -119,6 +120,20 @@ Event topics: `invoice.submitted`, `decision.completed`, `approval.completed`, `
 **Two publishers to `decision.completed`**: a known duplicate is short-circuited by Intake before `invoice.submitted` is ever published (running the agent for it would be pure waste - the router's own gate 1 never looks at the recommendation for a duplicate either), so Decision never sees it and never publishes an outcome for it. Discovered as a real gap during Notification's live verification: `decision.completed` simply never fired for duplicates, so Notification could never react to one. Fixed by having Intake itself publish `decision.completed` (with the same canonical `DUPLICATE` decision from `build_duplicate_decision()`) directly when it detects the short-circuit - `services/intake/decision_completed_publisher.py`, mirroring `services/decision/service/outcome_publisher.py`. This is still valid choreography, not a special case: every consumer (Payment, Notification) filters by the `route` field in the payload, never by which service published it - Payment already ignores `route != auto_approve` regardless of source, so a duplicate still never reaches payment (F3).
 
 `approval.completed` is the same pattern, applied consistently: a single topic carrying `invoice` + `decision` + `resolution` (`approved`/`rejected`), not two separate topics per outcome. Payment filters for `resolution == approved` (see below); Notification filters for `resolution == rejected`. `request-info` (send-back to the submitter for more information) does not publish anything on this topic - per ADR-003, once escalated the human owns the decision, and there is no consumer waiting on a "still pending" signal.
+
+**Service invocation (M5)**: the one synchronous cross-service call in this system. `GET /invoices/{tracking_id}` returns Intake's own `decision` field, which never changes after Decision Service's initial verdict - Intake never subscribes to `approval.completed`. For a `human_review` submission, `IntakeService.get_status_response()` closes that gap by calling Approval's already-existing `GET /approvals/{tracking_id}` through the Dapr sidecar's HTTP invoke API (`services/intake/approval_status_client.py`), not by subscribing to a new event stream:
+
+```
+Browser → Gateway → Intake (GET /invoices/{id})
+                       │
+                       ▼ (Dapr HTTP invoke API, localhost:3500)
+                  intake-dapr sidecar
+                       │
+                       ▼ (placement service discovery)
+                  approval-dapr sidecar → Approval (GET /approvals/{id})
+```
+
+One attempt, no retry: a failure (Approval unreachable, or any unexpected response) degrades gracefully to the frozen `decision` already known, logged as a warning - this is a GET-enrichment, not a saga step requiring resilience against a transient failure at all costs. Verified live: `GET /invoices/{id}` shows `approval.status` transitioning from `pending` to `approved` as the approver acts, while `decision` stays fixed; stopping Approval Service mid-flow still returns 200 with `approval: null`, never a 500.
 
 `payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification filters by `resolution`, but acts on **both** `completed` and `failed` unconditionally (§11's flowchart already shows both the DONE and FAILED paths converging on the same NOTIFY node) - the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
 

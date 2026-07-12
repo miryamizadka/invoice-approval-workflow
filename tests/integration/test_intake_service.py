@@ -15,8 +15,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from services.intake.app import create_app
+from services.intake.approval_status_client import ApprovalStatusClient, ApprovalStatusClientError
 from services.intake.decision_completed_publisher import DecisionCompletedPublisher
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
+from services.intake.models import ApprovalStatusSnapshot
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
 from shared.contracts.models import (
     DecisionCompletedEvent,
@@ -47,16 +49,39 @@ class _StubDecisionCompletedPublisher:
         self.calls.append(event)
 
 
+class _StubApprovalStatusClient:
+    def __init__(
+        self, *, snapshot: ApprovalStatusSnapshot | None = None, error: Exception | None = None
+    ) -> None:
+        self._snapshot = snapshot
+        self._error = error
+
+    async def get_status(self, tracking_id: str) -> ApprovalStatusSnapshot | None:
+        if self._error is not None:
+            raise self._error
+        return self._snapshot
+
+
+class _NeverCalledApprovalStatusClient:
+    """Default for tests that never escalate to human_review - if this gets
+    called, something's wrong (see get_status_response's route gate)."""
+
+    async def get_status(self, tracking_id: str) -> ApprovalStatusSnapshot | None:
+        raise AssertionError("not expected to be called for a non-human_review submission")
+
+
 def _build_app(
     publisher: DecisionPublisher,
     repository: InvoiceRepository | None = None,
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
+    approval_status_client: ApprovalStatusClient | None = None,
 ) -> FastAPI:
     return create_app(
         repository=repository or InMemoryInvoiceRepository(),
         publisher=publisher,
         decision_completed_publisher=decision_completed_publisher
         or _StubDecisionCompletedPublisher(),
+        approval_status_client=approval_status_client or _NeverCalledApprovalStatusClient(),
     )
 
 
@@ -269,6 +294,56 @@ def test_decision_completed_for_unknown_tracking_id_does_not_crash() -> None:
     response = _post_decision_completed(client, correlation_id="does-not-exist")
 
     assert response.status_code == 200
+
+
+# --- (j) M5 service invocation: GET /invoices/{id} enriched with live
+#         Approval Service status for a human_review submission --------------
+
+
+def test_status_enriched_with_live_approval_status_for_human_review() -> None:
+    approval_client = _StubApprovalStatusClient(
+        snapshot=ApprovalStatusSnapshot(status="pending", additional_info=None)
+    )
+    app = _build_app(_StubPublisher(), approval_status_client=approval_client)
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+
+    _post_decision_completed(client, Route.HUMAN_REVIEW, correlation_id=tracking_id)
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert status.status_code == 200
+    assert status.json()["approval"] == {"status": "pending", "additional_info": None}
+
+
+def test_status_approval_null_for_non_human_review() -> None:
+    app = _build_app(_StubPublisher())  # default client raises if ever called
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+
+    _post_decision_completed(client, Route.AUTO_APPROVE, correlation_id=tracking_id)
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert status.status_code == 200
+    assert status.json()["approval"] is None
+
+
+def test_status_degrades_gracefully_when_approval_service_returns_500() -> None:
+    """Approval Service being unreachable/erroring must not turn Intake's own
+    GET /invoices/{id} into a 500 - the frozen decision is still valid data."""
+    approval_client = _StubApprovalStatusClient(
+        error=ApprovalStatusClientError("Approval Service invocation failed: 500")
+    )
+    app = _build_app(_StubPublisher(), approval_status_client=approval_client)
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+
+    _post_decision_completed(client, Route.HUMAN_REVIEW, correlation_id=tracking_id)
+    status = client.get(f"/invoices/{tracking_id}")
+
+    assert status.status_code == 200
+    body = status.json()
+    assert body["approval"] is None
+    assert body["decision"]["route"] == Route.HUMAN_REVIEW.value
 
 
 # --- (j) health check ----------------------------------------------------------
