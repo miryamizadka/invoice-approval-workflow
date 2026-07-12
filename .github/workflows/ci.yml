@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch: # manual re-run without a new commit
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true # a rapid string of pushes cancels the stale runs, not just queues them
+
+permissions:
+  contents: read # least privilege - this workflow never needs to write anything
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      LLM_PROVIDER: mock # explicit, not just relying on the factory's default -
+      # self-documenting: CI never touches the real Groq API
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install .[dev] # cache: pip above auto-invalidates when pyproject.toml's hash changes
+      - name: Environment info
+        run: |
+          python --version
+          pip --version
+          echo "LLM_PROVIDER=$LLM_PROVIDER"
+          pip freeze | grep -E "pytest|ruff|mypy" # exact resolved versions - deps are >=, not pinned
+      - name: Ruff
+        run: ruff check .
+      - name: Mypy
+        run: mypy .
+      - name: Pytest (with coverage)
+        run: pytest --cov=services --cov=shared --cov-report=term-missing --cov-report=xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 7 # visibility only, not an audit trail - no need to keep longer
+
+  docker-build:
+    # Deliberately NOT `needs: quality` - independent failure modes (a broken
+    # Dockerfile and a broken test are unrelated), and there's no technical
+    # dependency (this doesn't consume anything quality produces). Sequencing
+    # would only save runner-minutes on failure, at the cost of hiding a
+    # Dockerfile break until a separate push - less information per push, not
+    # more, for a project at this CI volume.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t approvalflow:ci .
+        # Goal: prove the Dockerfile stays buildable as the code changes, not
+        # a smoke test of the running app - no `docker run` here. The full
+        # running-system checks are exactly the docker-compose verification
+        # scripts (scripts/verify_phase8.py etc.) deliberately excluded from
+        # CI - they need a real Dapr/Redis/Postgres/Traefik stack and one of
+        # them (INV-1013) needs the real Groq LLM, the opposite of "stubbed".
