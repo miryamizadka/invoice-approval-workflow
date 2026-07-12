@@ -280,7 +280,17 @@ ETag optimistic concurrency (INV-1014), not just simple save/get.
   Approval, `DaprStatePaymentRepository`/`DaprStateBudgetRepository` for Payment - the same
   append-only-index pattern for records; budgets additionally use ETag-based optimistic
   concurrency, backed by the `statestore` component)
-- [ ] Dapr secrets used (next: `feature/dapr-secrets`)
+- [x] Dapr secrets used (`services/decision/service/dapr_secret_loader.py` - `GROQ_API_KEY`
+  fetched via Dapr's Secrets API, `dapr/components/secretstore.yaml`'s `secretstores.local.env`,
+  instead of `os.environ` directly, mirroring F7/M13's config-loader shape exactly (I/O vs pure
+  split: `load_groq_api_key()` never raises, `resolve_provider_from_secret()` is pure and fully
+  unit tested). Fetch-once at startup, same posture as thresholds/policy - the provider is built
+  synchronously first [fail-fast, unchanged], then optionally rebuilt from the secret once Dapr's
+  async lifespan hook resolves. Verified live: `docker compose logs decision` shows
+  `llm_provider_rebuilt_from_dapr_secret`; with `decision-dapr` unreachable, the service still
+  starts and serves correctly on the env-var fallback [warning logged, not a crash];
+  `verify_phase8` including the real-LLM INV-1013 anti-cheese test passes against the
+  secret-sourced provider)
 
 
 ## M6 — API Gateway
