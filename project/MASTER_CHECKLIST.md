@@ -487,10 +487,9 @@ Priority: CRITICAL
 
 ## D3 — Git Hygiene
 
-- [x] GitHub Flow followed (feature branch + PR + merge for every milestone, PR #7-#18 plus
-  `feature/ci`; CI now runs on every push/PR per M16)
-- [ ] Clean repository (many merged feature branches still exist locally/remotely - branch
-  cleanup not yet done)
+- [x] GitHub Flow followed (feature branch + PR + merge for every milestone, PR #7-#19)
+- [x] Clean repository (all merged feature branches deleted locally and on origin - verified
+  via `git branch -a`: only `main` remains)
 
 
 ## D4 — API Documentation
