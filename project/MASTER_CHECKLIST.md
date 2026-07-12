@@ -572,10 +572,11 @@ CRITICAL
 Implemented (`publish` job, `.github/workflows/ci.yml`, `needs: [quality, docker-build]`,
 runs only on push to `main`) - builds and pushes to `ghcr.io/miryamizadka/
 invoice-approval-workflow` (`latest` + commit SHA), via the existing `GITHUB_TOKEN`, no new
-secret. **Checkbox stays unchecked until live-verified after a real merge to `main`** - not
-yet confirmed that `publish` actually runs (vs. skips) and that the pushed image is pullable.
+secret. **Live-verified after a real merge to `main`**: `publish` skipped on the feature branch
+and ran successfully once merged (confirmed via `gh run view`), and the pushed image was
+pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest`).
 
-- [ ] Automatic artifact publishing (implemented, pending live verification after merge)
+- [x] Automatic artifact publishing
 
 
 ## N3 Reliability
