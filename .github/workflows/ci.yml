@@ -66,3 +66,48 @@ jobs:
         # scripts (scripts/verify_phase8.py etc.) deliberately excluded from
         # CI - they need a real Dapr/Redis/Postgres/Traefik stack and one of
         # them (INV-1013) needs the real Groq LLM, the opposite of "stubbed".
+
+  publish:
+    # N2 (CD): build+publish the image to GHCR, but only from a real merge to
+    # main - never from a feature branch or PR, regardless of how green they
+    # are. needs: [quality, docker-build] - anticipated in the original CI
+    # design: "a future deploy job could simply be needs: [quality,
+    # docker-build] without changing what already exists."
+    needs: [quality, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write # job-level override only - the workflow-level
+      # `permissions: contents: read` above stays untouched for every other
+      # job (least privilege: only this job ever needs to push a package)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # no new secret - the
+          # token GitHub Actions already provides every run
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=ApprovalFlow
+        # Deliberately rebuilds the image here rather than reusing
+        # docker-build's - GitHub Actions doesn't share Docker layers
+        # between jobs by default, and a shared `cache-from`/`cache-to:
+        # type=gha` layer cache was considered and rejected for the same
+        # reason docker/setup-buildx-action was rejected for docker-build
+        # itself: added complexity (buildx setup, cache-key management) not
+        # justified at this project's CI volume. The duplication also keeps
+        # docker-build (runs always, validate-only) and publish (runs only
+        # on main, has side effects) cleanly isolated from each other.

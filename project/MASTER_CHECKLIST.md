@@ -569,7 +569,13 @@ CRITICAL
 
 ## N2 CD
 
-- [ ] Automatic artifact publishing
+Implemented (`publish` job, `.github/workflows/ci.yml`, `needs: [quality, docker-build]`,
+runs only on push to `main`) - builds and pushes to `ghcr.io/miryamizadka/
+invoice-approval-workflow` (`latest` + commit SHA), via the existing `GITHUB_TOKEN`, no new
+secret. **Checkbox stays unchecked until live-verified after a real merge to `main`** - not
+yet confirmed that `publish` actually runs (vs. skips) and that the pushed image is pullable.
+
+- [ ] Automatic artifact publishing (implemented, pending live verification after merge)
 
 
 ## N3 Reliability
