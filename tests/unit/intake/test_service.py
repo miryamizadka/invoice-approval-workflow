@@ -12,13 +12,37 @@ from typing import Any
 
 import pytest
 
+from services.intake.approval_status_client import ApprovalStatusClientError
 from services.intake.decision_completed_publisher import DecisionCompletedPublisherError
 from services.intake.decision_publisher import DecisionPublisherError
-from services.intake.models import SubmissionStatus
+from services.intake.models import ApprovalStatusSnapshot, SubmissionStatus
 from services.intake.repository import InMemoryInvoiceRepository
 from services.intake.service import IntakeService
 from shared.contracts.models import Decision, DecisionCompletedEvent, Invoice, Route
 from tests.support.decision_fixtures import clean_invoice
+
+
+class _UnusedApprovalStatusClient:
+    """For tests below that exercise submit()/process()/complete(), never
+    get_status_response() - should never actually be called."""
+
+    async def get_status(self, tracking_id: str) -> ApprovalStatusSnapshot | None:
+        raise NotImplementedError("not expected to be called in this test")
+
+
+class _StubApprovalStatusClient:
+    def __init__(
+        self, *, snapshot: ApprovalStatusSnapshot | None = None, error: Exception | None = None
+    ) -> None:
+        self._snapshot = snapshot
+        self._error = error
+        self.calls: list[str] = []
+
+    async def get_status(self, tracking_id: str) -> ApprovalStatusSnapshot | None:
+        self.calls.append(tracking_id)
+        if self._error is not None:
+            raise self._error
+        return self._snapshot
 
 
 class _StubPublisher:
@@ -53,7 +77,9 @@ def _decision(route: Route = Route.AUTO_APPROVE, correlation_id: str = "cid") ->
 async def test_process_publishes_invoice_and_marks_processing() -> None:
     publisher = _StubPublisher()
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, publisher, _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository, publisher, _StubDecisionCompletedPublisher(), _UnusedApprovalStatusClient()
+    )
     tracking_id = await service.submit(clean_invoice())
 
     await service.process(tracking_id)
@@ -79,7 +105,10 @@ async def test_process_marks_processing_before_publishing() -> None:
             seen_status_at_publish_time.append(submission.status)
 
     service = IntakeService(
-        repository, _OrderCheckingPublisher(), _StubDecisionCompletedPublisher()
+        repository,
+        _OrderCheckingPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
     )
     tracking_id = await service.submit(clean_invoice())
 
@@ -91,7 +120,9 @@ async def test_process_marks_processing_before_publishing() -> None:
 async def test_process_does_not_publish_invoice_submitted_for_known_duplicate() -> None:
     publisher = _StubPublisher()
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, publisher, _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository, publisher, _StubDecisionCompletedPublisher(), _UnusedApprovalStatusClient()
+    )
     invoice = clean_invoice()
     first_id = await service.submit(invoice)
     await service.process(first_id)
@@ -114,7 +145,9 @@ async def test_process_publishes_decision_completed_for_known_duplicate() -> Non
     repository = InMemoryInvoiceRepository()
     decision_completed_publisher = _StubDecisionCompletedPublisher()
     invoice = clean_invoice()
-    service = IntakeService(repository, _StubPublisher(), decision_completed_publisher)
+    service = IntakeService(
+        repository, _StubPublisher(), decision_completed_publisher, _UnusedApprovalStatusClient()
+    )
     first_id = await service.submit(invoice)
     await service.process(first_id)
     second_id = await service.submit(invoice)  # duplicate
@@ -133,7 +166,9 @@ async def test_process_does_not_double_publish_decision_completed_for_duplicate(
     repository = InMemoryInvoiceRepository()
     decision_completed_publisher = _StubDecisionCompletedPublisher()
     invoice = clean_invoice()
-    service = IntakeService(repository, _StubPublisher(), decision_completed_publisher)
+    service = IntakeService(
+        repository, _StubPublisher(), decision_completed_publisher, _UnusedApprovalStatusClient()
+    )
     first_id = await service.submit(invoice)
     await service.process(first_id)
     second_id = await service.submit(invoice)  # duplicate
@@ -152,7 +187,9 @@ async def test_process_logs_and_does_not_revert_status_when_decision_completed_p
         error=DecisionCompletedPublisherError("sidecar unreachable")
     )
     invoice = clean_invoice()
-    service = IntakeService(repository, _StubPublisher(), failing_publisher)
+    service = IntakeService(
+        repository, _StubPublisher(), failing_publisher, _UnusedApprovalStatusClient()
+    )
     first_id = await service.submit(invoice)
     await service.process(first_id)
     second_id = await service.submit(invoice)  # duplicate
@@ -174,7 +211,9 @@ async def test_process_logs_and_does_not_revert_status_when_decision_completed_p
 async def test_process_publish_failure_marks_failed() -> None:
     publisher = _StubPublisher(error=DecisionPublisherError("sidecar unreachable"))
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, publisher, _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository, publisher, _StubDecisionCompletedPublisher(), _UnusedApprovalStatusClient()
+    )
     tracking_id = await service.submit(clean_invoice())
 
     await service.process(tracking_id)
@@ -189,7 +228,12 @@ async def test_process_publish_failure_marks_failed() -> None:
 
 async def test_complete_marks_completed_with_decision() -> None:
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, _StubPublisher(), _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository,
+        _StubPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
+    )
     tracking_id = await service.submit(clean_invoice())
     await service.process(tracking_id)
     decision = _decision(route=Route.HUMAN_REVIEW, correlation_id=tracking_id)
@@ -204,14 +248,24 @@ async def test_complete_marks_completed_with_decision() -> None:
 
 async def test_complete_with_unknown_tracking_id_does_not_raise() -> None:
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, _StubPublisher(), _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository,
+        _StubPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
+    )
 
     await service.complete("does-not-exist", _decision(correlation_id="does-not-exist"))
 
 
 async def test_complete_called_twice_is_idempotent() -> None:
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, _StubPublisher(), _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository,
+        _StubPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
+    )
     tracking_id = await service.submit(clean_invoice())
     await service.process(tracking_id)
     decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
@@ -230,7 +284,12 @@ async def test_complete_called_with_different_decision_after_completed_keeps_fir
     """First-write-wins: a redelivered event with a (should-never-happen)
     different decision for the same correlation_id doesn't overwrite."""
     repository = InMemoryInvoiceRepository()
-    service = IntakeService(repository, _StubPublisher(), _StubDecisionCompletedPublisher())
+    service = IntakeService(
+        repository,
+        _StubPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
+    )
     tracking_id = await service.submit(clean_invoice())
     await service.process(tracking_id)
     first_decision = _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
@@ -255,7 +314,9 @@ async def test_complete_is_idempotent_when_intakes_own_published_event_loops_bac
     repository = InMemoryInvoiceRepository()
     decision_completed_publisher = _StubDecisionCompletedPublisher()
     invoice = clean_invoice()
-    service = IntakeService(repository, _StubPublisher(), decision_completed_publisher)
+    service = IntakeService(
+        repository, _StubPublisher(), decision_completed_publisher, _UnusedApprovalStatusClient()
+    )
     first_id = await service.submit(invoice)
     await service.process(first_id)
     second_id = await service.submit(invoice)  # duplicate
@@ -270,4 +331,106 @@ async def test_complete_is_idempotent_when_intakes_own_published_event_loops_bac
     assert submission is not None
     assert submission.status == SubmissionStatus.COMPLETED
     assert submission.decision == published_decision
-    assert caplog.records == []
+
+
+# --- get_status_response() - M5 service invocation to Approval Service -------
+
+
+async def test_get_status_response_returns_none_for_unknown_tracking_id() -> None:
+    repository = InMemoryInvoiceRepository()
+    service = IntakeService(
+        repository,
+        _StubPublisher(),
+        _StubDecisionCompletedPublisher(),
+        _UnusedApprovalStatusClient(),
+    )
+
+    result = await service.get_status_response("missing")
+
+    assert result is None
+
+
+async def test_get_status_response_does_not_call_approval_for_non_human_review() -> None:
+    repository = InMemoryInvoiceRepository()
+    approval_client = _StubApprovalStatusClient()
+    service = IntakeService(
+        repository, _StubPublisher(), _StubDecisionCompletedPublisher(), approval_client
+    )
+    tracking_id = await service.submit(clean_invoice())
+    await service.process(tracking_id)
+    await service.complete(
+        tracking_id, _decision(route=Route.AUTO_APPROVE, correlation_id=tracking_id)
+    )
+
+    result = await service.get_status_response(tracking_id)
+
+    assert result is not None
+    assert result.approval is None
+    assert approval_client.calls == []
+
+
+async def test_get_status_response_enriches_with_live_approval_status() -> None:
+    repository = InMemoryInvoiceRepository()
+    snapshot = ApprovalStatusSnapshot(status="approved", additional_info="looks good")
+    approval_client = _StubApprovalStatusClient(snapshot=snapshot)
+    service = IntakeService(
+        repository, _StubPublisher(), _StubDecisionCompletedPublisher(), approval_client
+    )
+    tracking_id = await service.submit(clean_invoice())
+    await service.process(tracking_id)
+    await service.complete(
+        tracking_id, _decision(route=Route.HUMAN_REVIEW, correlation_id=tracking_id)
+    )
+
+    result = await service.get_status_response(tracking_id)
+
+    assert result is not None
+    assert result.approval == snapshot
+    assert approval_client.calls == [tracking_id]
+
+
+async def test_get_status_response_leaves_approval_none_when_client_returns_none() -> None:
+    """A 404 from Approval (not yet visible there - a benign race, not an
+    error) means approval stays None, same as never having called at all."""
+    repository = InMemoryInvoiceRepository()
+    approval_client = _StubApprovalStatusClient(snapshot=None)
+    service = IntakeService(
+        repository, _StubPublisher(), _StubDecisionCompletedPublisher(), approval_client
+    )
+    tracking_id = await service.submit(clean_invoice())
+    await service.process(tracking_id)
+    await service.complete(
+        tracking_id, _decision(route=Route.HUMAN_REVIEW, correlation_id=tracking_id)
+    )
+
+    result = await service.get_status_response(tracking_id)
+
+    assert result is not None
+    assert result.approval is None
+
+
+async def test_get_status_response_degrades_gracefully_when_approval_client_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    repository = InMemoryInvoiceRepository()
+    approval_client = _StubApprovalStatusClient(error=ApprovalStatusClientError("unreachable"))
+    service = IntakeService(
+        repository, _StubPublisher(), _StubDecisionCompletedPublisher(), approval_client
+    )
+    tracking_id = await service.submit(clean_invoice())
+    await service.process(tracking_id)
+    await service.complete(
+        tracking_id, _decision(route=Route.HUMAN_REVIEW, correlation_id=tracking_id)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await service.get_status_response(tracking_id)
+
+    assert result is not None
+    assert result.approval is None
+    assert result.decision is not None
+    assert result.decision.route == Route.HUMAN_REVIEW
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warning_records) == 1
+    assert warning_records[0].correlation_id == tracking_id  # type: ignore[attr-defined]
+    assert hasattr(warning_records[0], "duration_ms")

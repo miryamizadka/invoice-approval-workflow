@@ -12,19 +12,22 @@ doesn't exist yet.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
+from services.intake.approval_status_client import ApprovalStatusClient, ApprovalStatusClientError
 from services.intake.decision_completed_publisher import (
     DecisionCompletedPublisher,
     DecisionCompletedPublisherError,
 )
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
-from services.intake.models import Submission, SubmissionStatus
+from services.intake.models import Submission, SubmissionStatus, SubmissionStatusResponse
 from services.intake.repository import InvoiceRepository
 from shared.contracts.models import (
     Decision,
     DecisionCompletedEvent,
     Invoice,
+    Route,
     build_duplicate_decision,
     compute_dedup_key,
 )
@@ -36,10 +39,12 @@ class IntakeService:
         repository: InvoiceRepository,
         publisher: DecisionPublisher,
         decision_completed_publisher: DecisionCompletedPublisher,
+        approval_status_client: ApprovalStatusClient,
     ) -> None:
         self._repository = repository
         self._publisher = publisher
         self._decision_completed_publisher = decision_completed_publisher
+        self._approval_status_client = approval_status_client
         self._logger = logging.getLogger(__name__)
 
     async def submit(self, invoice: Invoice) -> str:
@@ -158,14 +163,44 @@ class IntakeService:
             extra={"correlation_id": correlation_id, "route": decision.route.value},
         )
 
-    async def get_status(self, tracking_id: str) -> Submission | None:
-        return await self._repository.get(tracking_id)
+    async def get_status_response(self, tracking_id: str) -> SubmissionStatusResponse | None:
+        """For a human_review submission, also enriches the response with
+        Approval Service's live status via Dapr service invocation (M5) -
+        see services/intake/approval_status_client.py's module docstring for
+        why. Intake's own `decision` field never changes after Decision
+        Service's initial verdict; `approval` is what reflects
+        what happened after that, without Intake subscribing to
+        approval.completed itself."""
+        submission = await self._repository.get(tracking_id)
+        if submission is None:
+            return None
+        response = SubmissionStatusResponse.from_submission(submission)
+        if submission.decision is not None and submission.decision.route == Route.HUMAN_REVIEW:
+            start = time.monotonic()
+            try:
+                live = await self._approval_status_client.get_status(tracking_id)
+            except ApprovalStatusClientError as exc:
+                self._logger.warning(
+                    "approval_status_lookup_failed",
+                    extra={
+                        "correlation_id": tracking_id,
+                        "duration_ms": round((time.monotonic() - start) * 1000, 1),
+                        "error": str(exc),
+                    },
+                )
+                return response  # degrade gracefully - Intake's own frozen decision still valid
+            if live is not None:
+                response = response.model_copy(update={"approval": live})
+        return response
 
 
 def build_intake_service(
     repository: InvoiceRepository,
     publisher: DecisionPublisher,
     decision_completed_publisher: DecisionCompletedPublisher,
+    approval_status_client: ApprovalStatusClient,
 ) -> IntakeService:
     """Composition seam, same reason as build_decider: keeps FastAPI out of this."""
-    return IntakeService(repository, publisher, decision_completed_publisher)
+    return IntakeService(
+        repository, publisher, decision_completed_publisher, approval_status_client
+    )
