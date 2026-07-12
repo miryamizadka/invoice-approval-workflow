@@ -252,6 +252,12 @@ services:
       - "/components"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # secretstores.local.env (dapr/components/secretstore.yaml, M5) reads
+    # from THIS container's own process env, not decision's - the sidecar
+    # and the app share a network namespace but not an environment, so
+    # GROQ_API_KEY needs to be loaded here too for the secret store to see it.
     network_mode: "service:decision"
     depends_on:
       decision:

@@ -7,6 +7,7 @@ Endpoints only call Decider.decide(); all business logic lives there.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,6 +21,10 @@ from services.decision.accessors.factory import get_llm_provider
 from services.decision.accessors.llm_provider import LLMProvider
 from services.decision.router.config import DEFAULT_THRESHOLDS
 from services.decision.service.dapr_config_loader import load_policy_and_thresholds
+from services.decision.service.dapr_secret_loader import (
+    load_groq_api_key,
+    resolve_provider_from_secret,
+)
 from services.decision.service.decider import Decider, build_decider
 from services.decision.service.logging_config import configure_logging
 from services.decision.service.outcome_publisher import (
@@ -42,14 +47,29 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5: overrides the env-var-based GroqProvider with one built from
+        # Dapr's secret store, if LLM_PROVIDER=groq and a value is available -
+        # same fetch-once, resilient-fallback posture as the threshold/policy
+        # override below. `if provider is None` - never second-guesses a
+        # provider a caller/test injected explicitly.
+        active_provider = resolved_provider
+        if provider is None and os.environ.get("LLM_PROVIDER", "mock").lower() == "groq":
+            secret_key = await load_groq_api_key()
+            active_provider = resolve_provider_from_secret(secret_key, resolved_provider)
+            if active_provider is not resolved_provider:
+                logging.getLogger(__name__).info("llm_provider_rebuilt_from_dapr_secret")
         # F7/M13: overrides DEFAULT_THRESHOLDS/policy.md with whatever is
         # configured in Dapr's configuration store, if anything - fetch-once,
         # not live hot-reload (see ADR-009). Falls back silently to the
         # already-built `decider` above if the store is empty/unreachable -
         # the service must work correctly even if never configured.
         policy, thresholds = await load_policy_and_thresholds(fallback_policy, DEFAULT_THRESHOLDS)
-        if policy != fallback_policy or thresholds != DEFAULT_THRESHOLDS:
-            app.state.decider = build_decider(resolved_provider, thresholds, policy)
+        if (
+            policy != fallback_policy
+            or thresholds != DEFAULT_THRESHOLDS
+            or active_provider is not resolved_provider
+        ):
+            app.state.decider = build_decider(active_provider, thresholds, policy)
         yield
 
     app = FastAPI(title="ApprovalFlow Decision Service", lifespan=_lifespan)
