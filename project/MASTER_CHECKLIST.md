@@ -490,11 +490,11 @@ Priority: CRITICAL
 
 ## M18 — README
 
-- [ ] Project explanation
-- [ ] Technology list
-- [ ] Run instructions
-- [ ] Test instructions
-- [ ] System diagram
+- [x] Project explanation
+- [x] Technology list
+- [x] Run instructions
+- [x] Test instructions
+- [x] System diagram (bird's-eye layered diagram + escalate-and-resume swimlane diagram)
 
 
 ---
@@ -545,7 +545,7 @@ CRITICAL
 
 ## D6 — README
 
-- [ ] Complete README
+- [x] Complete README
 
 
 ## D7 — Demo
@@ -572,10 +572,11 @@ CRITICAL
 Implemented (`publish` job, `.github/workflows/ci.yml`, `needs: [quality, docker-build]`,
 runs only on push to `main`) - builds and pushes to `ghcr.io/miryamizadka/
 invoice-approval-workflow` (`latest` + commit SHA), via the existing `GITHUB_TOKEN`, no new
-secret. **Checkbox stays unchecked until live-verified after a real merge to `main`** - not
-yet confirmed that `publish` actually runs (vs. skips) and that the pushed image is pullable.
+secret. **Live-verified after a real merge to `main`**: `publish` skipped on the feature branch
+and ran successfully once merged (confirmed via `gh run view`), and the pushed image was
+pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest`).
 
-- [ ] Automatic artifact publishing (implemented, pending live verification after merge)
+- [x] Automatic artifact publishing
 
 
 ## N3 Reliability
@@ -628,42 +629,3 @@ Already fully covered - not new work, just an unchecked box. Verified directly
 ## B3 Kubernetes
 
 - [ ] Kubernetes manifests
-
-
----
-
-# Current Status
-
-Completed:
-
-- [x] Architecture
-- [x] ADRs
-- [x] Product Dilemma
-- [x] Decision Models
-- [x] Deterministic Router (implementation + 69 unit tests, ruff/mypy clean)
-- [x] LLM Provider Abstraction, incl. Groq strict structured-output support
-  (implementation + 23 unit tests, ruff/mypy clean)
-- [x] LangGraph Agent (`preprocess`/`classify`/`router` nodes, DI'd provider+thresholds;
-  implementation + tests, ruff/mypy clean)
-- [x] Decision Service (`services/decision/service/`: `Decider`/`build_decider` transport-agnostic
-  core + FastAPI wrapper; structured logging, correlation-id, global exception handler;
-  implementation + integration tests, ruff/mypy clean)
-- [x] shared/contracts/ extraction (Invoice/Decision/Recommendation/enums/`compute_dedup_key` -
-  the single source both Decision and Intake depend on; pure refactor, all 113 prior tests
-  passed unmodified before Intake was built on it)
-- [x] Intake Service (`services/intake/`: `IntakeService`/`build_intake_service`
-  transport-agnostic core, `InvoiceRepository`/`InMemoryInvoiceRepository`,
-  `DecisionServiceClient`/`HttpDecisionServiceClient`, thin FastAPI wrapper; implementation +
-  13 tests, ruff/mypy clean; 128 tests total in the suite)
-
-Current:
-
-- [ ] Manual smoke-test of GroqProvider strict mode against the real API
-  (`scripts/smoke_test_groq_strict.py` - written, blocked by a sandbox network/SSL
-  restriction, needs running in an environment with real access to api.groq.com)
-
-Next:
-
-- [ ] Connect Intake -> Decision Service (still out of scope: no Intake service yet)
-- [ ] Build verification journeys
-- [ ] Connect services
