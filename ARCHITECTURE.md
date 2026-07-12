@@ -295,7 +295,15 @@ The project follows GitHub Flow: each feature in its own branch, merged to `main
 | Coverage | pytest-cov |
 | Docker build | Docker |
 
-**CD (on merge to main, planned N2):** build and publish container images automatically.
+**CD (on merge to main, N2):** the `publish` job in the same `ci.yml` workflow
+(`needs: [quality, docker-build]`, `if: github.ref == 'refs/heads/main'`) builds and pushes
+the image to GitHub Container Registry (`ghcr.io/miryamizadka/invoice-approval-workflow`),
+tagged `latest` and the commit SHA - authenticated via the existing `GITHUB_TOKEN`, no new
+secret. Runs only on a real merge to `main`, never on a feature branch or PR, however green.
+`docker-build` stays the always-on, validate-only check (no push); `publish` deliberately
+duplicates that build rather than sharing a layer cache across jobs - the same "simplicity
+over marginal runner-time savings" reasoning already applied to keep `docker-build` and
+`quality` parallel.
 
 The LLM is stubbed in CI to avoid rate limits and keep runs deterministic.
 
