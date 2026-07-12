@@ -593,9 +593,14 @@ CRITICAL
 
 ## N6 Testing Layers
 
-- [ ] Unit tests
-- [ ] Integration tests
-- [ ] End-to-end tests
+Already fully covered - not new work, just an unchecked box. Verified directly
+(not assumed): `pytest --collect-only -q` → 451 tests collected.
+
+- [x] Unit tests (`tests/unit/` - one suite per service)
+- [x] Integration tests (`tests/integration/` - HTTP + TestClient, one suite per service)
+- [x] End-to-end tests (`scripts/verify_phase8.py`, already checked off under D5 - runs
+  against a real `docker compose` stack: Dapr sidecars, Redis, Postgres, Traefik, and the
+  real Groq LLM for INV-1013, through the actual gateway, no mocks)
 
 
 ---
