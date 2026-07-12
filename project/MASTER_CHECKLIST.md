@@ -436,14 +436,18 @@ Priority: CRITICAL
 
 ## M16 — CI
 
-- [ ] CI pipeline exists
-- [ ] Runs on push
-- [ ] Quality gates
+- [x] CI pipeline exists (`.github/workflows/ci.yml`; `quality` + `docker-build` jobs, verified
+  green on GitHub Actions - run [29174857998](https://github.com/miryamizadka/invoice-approval-workflow/actions/runs/29174857998))
+- [x] Runs on push (`on: push` / `pull_request` / `workflow_dispatch`)
+- [x] Quality gates (Ruff, MyPy, pytest+coverage all block the `quality` job on failure;
+  `docker-build` proves the Dockerfile stays buildable)
 
 
 ## M17 — Automated Tests
 
-- [ ] Tests run in CI
+- [x] Tests run in CI (`pytest --cov=services --cov=shared`, 416 tests, all green on GitHub
+  Actions; `LLM_PROVIDER=mock` explicitly set - confirmed in the run logs that `GROQ_API_KEY`
+  is never set and no `api.groq.com` call occurs, per ARCHITECTURE.md §14's "LLM stubbed in CI")
 - [x] Router tests (69 unit tests: fixture-driven + per-rule boundaries)
 - [x] LLM provider tests (18 unit tests: MockProvider, GroqProvider with a fake client, factory)
 - [x] Integration tests (`tests/integration/test_decision_service.py`, 9 tests: full HTTP ->
@@ -483,8 +487,10 @@ Priority: CRITICAL
 
 ## D3 — Git Hygiene
 
-- [ ] GitHub Flow followed
-- [ ] Clean repository
+- [x] GitHub Flow followed (feature branch + PR + merge for every milestone, PR #7-#18 plus
+  `feature/ci`; CI now runs on every push/PR per M16)
+- [ ] Clean repository (many merged feature branches still exist locally/remotely - branch
+  cleanup not yet done)
 
 
 ## D4 — API Documentation
