@@ -15,6 +15,7 @@ from services.decision.accessors.llm_provider import LLMProvider
 from services.decision.agent import AgentError, AgentState, build_agent_graph
 from services.decision.router.config import AutonomyThresholds
 from services.decision.router.router import route_decision
+from services.decision.service.policy_index import parse_policy_index, retrieve_relevant_policy_text
 from shared.contracts.models import DecisionOutcome, Invoice
 
 
@@ -25,6 +26,7 @@ class Decider:
         self._graph = graph
         self._thresholds = thresholds
         self._policy = policy
+        self._policy_index = parse_policy_index(policy)  # once, not per decide() call
         self._logger = logging.getLogger(__name__)
 
     async def decide(
@@ -34,9 +36,26 @@ class Decider:
             "decision_requested",
             extra={"correlation_id": correlation_id, "invoice_id": invoice.id},
         )
+        try:
+            retrieved = retrieve_relevant_policy_text(invoice, self._policy_index)
+            policy_text = retrieved.text
+            self._logger.info(
+                "policy_sections_retrieved",
+                extra={"correlation_id": correlation_id, "section_ids": retrieved.section_ids},
+            )
+        except Exception as exc:
+            # Fail-safe (N5): retrieval is meant to improve relevance, never
+            # to be a new way for a decision to fail. Any unexpected error
+            # here falls back to the full, original policy text (pre-N5
+            # behavior) - never blocks or fails the invoice decision.
+            self._logger.warning(
+                "policy_retrieval_failed_using_full_policy",
+                extra={"correlation_id": correlation_id, "error": str(exc)},
+            )
+            policy_text = self._policy
         initial_state = AgentState(
             invoice=invoice,
-            policy=self._policy,
+            policy=policy_text,
             correlation_id=correlation_id,
             is_duplicate=is_duplicate,
         )
