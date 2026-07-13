@@ -89,7 +89,7 @@ Dependencies flow strictly downward (Manager → Engine → Accessor → Resourc
 | CI/CD | GitHub Actions | Quality gates on every push (M16) |
 | Deployment | Docker Compose | One-command startup (M4) |
 
-*Planned as nice-to-have if time permits (not core):* RAG over policy with a vector store (N5), full OpenTelemetry tracing with Jaeger/Prometheus/Grafana (N4), and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
+*Implemented as a nice-to-have:* RAG over policy via TF-IDF + cosine similarity, pure Python/stdlib, no vector DB (N5 - see §10). *Still planned if time permits (not core):* full OpenTelemetry tracing with Jaeger/Prometheus/Grafana (N4), and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
 
 
 ## 7. Communication
@@ -207,7 +207,7 @@ Workflow:
 3. Apply the deterministic router.
 4. Emit the final decision (auto_approve / human / reject / duplicate).
 
-The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG over the policy (retrieving only relevant clauses instead of the full policy) is a planned nice-to-have (N5). The router can also return `reject` for high-severity policy violations (e.g. alcohol-only receipts, INV-1015) and `duplicate` for re-submissions — not every non-approval is a human escalation.
+The LLM provider sits behind a swappable interface (M15) with a stub for CI. **RAG over the policy (N5)** retrieves only the relevant section(s) of `policy.md` instead of the full text: a deterministic floor (preamble + Global rules + Autonomy thresholds + the invoice's own category section) is always included, plus an additive TF-IDF/cosine-similarity layer that pulls in genuinely cross-referenced sections (e.g. an "alcohol" mention in a Travel invoice's notes still surfaces the Meals section). Implemented in pure Python/stdlib (`services/decision/service/policy_index.py`) rather than embeddings or a vector DB - `policy.md` is a handful of short, fixed sections, so a numeric similarity threshold gives the same relevance benefit without new latency, cost, or non-determinism. Retrieval failures fall back to the full policy text unconditionally (`decider.py`); the router never sees policy text at all, so retrieval quality can only affect the agent's *recommendation*, never a decision's correctness. The router can also return `reject` for high-severity policy violations (e.g. alcohol-only receipts, INV-1015) and `duplicate` for re-submissions — not every non-approval is a human escalation.
 
 
 ## 11. Diagrams

@@ -594,8 +594,20 @@ pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow
 
 ## N5 RAG
 
-- [ ] Policy indexed
-- [ ] Relevant clauses retrieved
+Implemented (`services/decision/service/policy_index.py`): `policy.md` is parsed into a
+preamble + 7 sections once at Decider construction, and each `decide()` call retrieves only
+the relevant section(s) instead of the full policy - a deterministic floor (preamble + Global
+rules + Autonomy thresholds + the invoice's own category section) plus an additive TF-IDF/
+cosine-similarity layer for genuine cross-references (empirically verified: a Travel invoice
+whose notes mention "alcohol" pulls in the Meals section too). Pure Python/stdlib, no
+embeddings/vector DB - the router never sees policy text at all, so imperfect retrieval can
+only affect the agent's recommendation, never a decision's correctness; any retrieval
+exception falls back to the full policy text unconditionally (`decider.py`'s fail-safe).
+12 new unit tests (`test_policy_index.py`, `test_decider.py`), 100%/98% coverage on the two
+changed files, full suite (465 tests)/ruff/mypy green, `verify_phase8` unaffected live.
+
+- [x] Policy indexed
+- [x] Relevant clauses retrieved
 
 
 ## N6 Testing Layers
