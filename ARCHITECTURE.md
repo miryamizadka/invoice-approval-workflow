@@ -89,7 +89,7 @@ Dependencies flow strictly downward (Manager → Engine → Accessor → Resourc
 | CI/CD | GitHub Actions | Quality gates on every push (M16) |
 | Deployment | Docker Compose | One-command startup (M4) |
 
-*Implemented as a nice-to-have:* RAG over policy via TF-IDF + cosine similarity, pure Python/stdlib, no vector DB (N5 - see §10). *Still planned if time permits (not core):* full OpenTelemetry tracing with Jaeger/Prometheus/Grafana (N4), and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
+*Implemented as a nice-to-have:* RAG over policy via TF-IDF + cosine similarity, pure Python/stdlib, no vector DB (N5 - see §10); distributed tracing via Dapr's built-in tracing exporter (Zipkin protocol) + self-hosted Jaeger v2, no application code changes (N4 - see §12). *Still planned if time permits (not core):* Prometheus/Grafana metrics (N4) and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
 
 
 ## 7. Communication
@@ -265,7 +265,17 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. **R
 
 **Security:** the API gateway enforces rate-limiting (M6); secrets (LLM keys) are held in Dapr secrets, never in code. Optional JWT auth with roles - submitter / approver / admin (N1).
 
-**Observability (planned, N4):** structured JSON logs are core; full OpenTelemetry tracing with Jaeger/Prometheus/Grafana is a nice-to-have extension.
+**Observability (tracing implemented, metrics planned; N4):** structured JSON logs + correlation id remain core. Distributed tracing is implemented via Dapr's automatic instrumentation, exported over the Zipkin protocol to a self-hosted Jaeger v2 instance (UI at `localhost:16686`) - no application code changes; every Dapr sidecar exports spans for its pub/sub publishes/consumes and the one service-invocation call automatically. Coverage is Dapr-mediated only:
+
+| Flow | Traced? |
+|---|---|
+| Pub/sub choreography (`invoice.submitted` → `decision`/`approval`/`payment.completed`) | Yes, automatically via Dapr |
+| Service Invocation call (Intake→Approval) | Yes, automatically via Dapr |
+| Gateway → service (direct REST, M6) | **No** - bypasses the Dapr sidecar entirely |
+| State/Config/Secrets operations | Yes, automatically via Dapr |
+| Full request path including the first hop from the UI | **No** - would need FastAPI-level OpenTelemetry instrumentation (a separate, larger future extension - new dependency, per-service setup - not done in this pass) |
+
+**Live-verified, not assumed**: `scripts/verify_tracing.py` drives INV-1001 and INV-1003 through the real stack and asserts (via Jaeger's own HTTP API) that all 6 app-ids appear as services with spans. The escalate-resume journey (INV-1003) was found to produce **one connected trace** across all 6 services (`intake`→`decision`→`approval`→`payment`→`notification`→`audit`), not separate per-hop traces - Dapr's own trace-context propagation through the pub/sub CloudEvents envelope carries the trace id all the way through the choreography chain, with no extra work required. Prometheus/Grafana metrics remain unimplemented (heavier lift, less demonstration value than tracing at this project's scale).
 
 
 ## 13. Testing & Evaluation

@@ -223,6 +223,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     network_mode: "service:intake"
@@ -233,10 +235,15 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     # Infra only, step 1 of Dapr integration (M5) - not called by any service
     # code yet. Shares intake's network namespace so intake can later reach it
     # at localhost:3500 with zero networking changes. Pub/sub and state wiring
     # into IntakeService/Decider are separate, future steps.
+    # --config /components/tracing.yaml (N4): exports spans for this
+    # sidecar's pub/sub and service-invocation calls to Jaeger, via Dapr's
+    # own tracing exporter - no code change in intake itself.
 
   decision-dapr:
     image: daprio/daprd:1.18.1
@@ -250,6 +257,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     env_file:
@@ -263,6 +272,8 @@ services:
       decision:
         condition: service_started
       placement:
+        condition: service_started
+      jaeger:
         condition: service_started
       redis:
         condition: service_healthy
@@ -280,6 +291,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     network_mode: "service:approval"
@@ -290,6 +303,8 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     # See intake-dapr/decision-dapr comments above - same reasoning, paired with approval.
 
   payment-dapr:
@@ -304,6 +319,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     network_mode: "service:payment"
@@ -314,6 +331,8 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     # See intake-dapr/decision-dapr/approval-dapr comments above - same reasoning, paired with payment.
 
   notification-dapr:
@@ -328,6 +347,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     network_mode: "service:notification"
@@ -338,6 +359,8 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     # See intake-dapr/decision-dapr/approval-dapr/payment-dapr comments above - same reasoning, paired with notification.
 
   audit-dapr:
@@ -352,6 +375,8 @@ services:
       - "placement:50006"
       - "--resources-path"
       - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
     network_mode: "service:audit"
@@ -362,6 +387,8 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     # See intake-dapr/decision-dapr/approval-dapr/payment-dapr/notification-dapr
     # comments above - same reasoning, paired with audit. Only for pub/sub
     # (audit is in dapr/components/pubsub.yaml's scopes, deliberately NOT in
@@ -378,6 +405,30 @@ services:
     # rejected: same actors/workflow-only scope as placement, but requires a
     # persistent etcd volume and a root user - not worth it for a capability
     # this project has no plan to use.
+
+  jaeger:
+    image: jaegertracing/jaeger:2.19.0
+    # Jaeger v2 (OpenTelemetry Collector-based) - v1 all-in-one reached
+    # end-of-life 2025-12-31, already past, so v2 is used despite needing a
+    # small pipeline config file (./jaeger/config.yaml) instead of one env
+    # var. Distributed tracing backend (N4) - every Dapr sidecar exports
+    # spans to it automatically (dapr/components/tracing.yaml), no
+    # application code changes.
+    command: ["--config=/etc/jaeger/config.yaml"]
+    volumes:
+      - "./jaeger/config.yaml:/etc/jaeger/config.yaml:ro"
+    ports:
+      - "16686:16686"   # Jaeger UI - dev/demo tooling, same precedent as
+      # postgres/redis keeping a host port despite M6's "hide internal
+      # structure" gateway rule (this isn't business API surface).
+    networks: [approvalflow]
+    # No host port for 9411 (Zipkin receiver) - sidecar-to-jaeger traffic
+    # only, reachable via the `approvalflow` network by hostname `jaeger`
+    # (same principle as redis/placement already being reachable that way).
+    # No healthcheck: this container is only a tracing backend, and span
+    # export is async/non-blocking - sidecars tolerate it being briefly
+    # unavailable at startup. Same precedent as `placement` above, which
+    # also has no healthcheck.
 
 networks:
   approvalflow:

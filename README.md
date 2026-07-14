@@ -191,6 +191,8 @@ install is needed just to run the system.
 4. Everything is also a plain REST API through the same gateway — `/invoices`, `/approvals`,
    `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables under **Details
    and component highlights** below.
+5. Distributed tracing (N4) is visible at **http://localhost:16686** (Jaeger UI) — every Dapr
+   sidecar exports spans automatically, no extra setup needed.
 
 **Interactive API docs (Swagger/OpenAPI):** FastAPI generates these per service at `/docs` and
 `/openapi.json`, but the gateway intentionally forwards only business paths, hiding internal
@@ -454,8 +456,11 @@ dashboard (`dashboard.html`).
   operations rather than one atomic transaction (no Transactional Outbox yet), so a crash between
   them could leave one without the other — deferred until a real transactional store backs the
   affected repositories.
-- No OpenTelemetry tracing yet (N4, planned nice-to-have) — tracing today is structured logs plus
-  a correlation id, not distributed spans.
+- Distributed tracing (N4) is implemented via Dapr's built-in exporter + a self-hosted Jaeger
+  instance, but only for Dapr-mediated traffic (pub/sub + the one service-invocation call) — the
+  initial Gateway→service HTTP hop isn't part of the same trace, since that traffic bypasses the
+  Dapr sidecar entirely (see `ARCHITECTURE.md` §12). Prometheus/Grafana metrics remain
+  unimplemented.
 
 ## Documentation map
 

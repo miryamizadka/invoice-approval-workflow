@@ -1,0 +1,46 @@
+# Jaeger v2 (OpenTelemetry Collector-based) pipeline config, empirically
+# validated (docker run + jaeger validate) before being committed here.
+#
+# Jaeger v1 (all-in-one, the classic single-env-var setup) reached end of
+# life on 2025-12-31 - already past by the time N4 was added - so v2 is used
+# instead, despite needing this small pipeline file rather than one env var.
+#
+# Zipkin receiver, not OTLP: Dapr's tracing config (dapr/components/tracing.yaml)
+# sends spans over the Zipkin v2 HTTP protocol.
+#
+# In-memory storage only (jaeger_storage's memstore backend) - no
+# Elasticsearch/Cassandra - sufficient for a course project's scale (N4).
+#
+# IMPORTANT: the zipkin receiver's `endpoint` must be explicit (0.0.0.0:9411),
+# not the OTel Collector default of 127.0.0.1:9411 - confirmed empirically
+# (netstat inside a running container) that the default binds to localhost
+# only, which no other container on the docker network could ever reach.
+
+service:
+  extensions: [jaeger_storage, jaeger_query]
+  pipelines:
+    traces:
+      receivers: [zipkin]
+      processors: [batch]
+      exporters: [jaeger_storage_exporter]
+
+extensions:
+  jaeger_query:
+    storage:
+      traces: memstore
+  jaeger_storage:
+    backends:
+      memstore:
+        memory:
+          max_traces: 100000
+
+receivers:
+  zipkin:
+    endpoint: 0.0.0.0:9411
+
+processors:
+  batch:
+
+exporters:
+  jaeger_storage_exporter:
+    trace_storage: memstore
