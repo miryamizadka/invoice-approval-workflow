@@ -588,8 +588,17 @@ pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow
 
 ## N4 OpenTelemetry
 
-- [ ] Metrics
-- [ ] Distributed tracing
+Distributed tracing implemented: every Dapr sidecar exports spans automatically (pub/sub +
+the one service-invocation call) via Zipkin protocol to a self-hosted Jaeger v2 instance
+(`docker-compose.yml`, `dapr/components/tracing.yaml`, `jaeger/config.yaml`) - no application
+code changes. Live-verified with a new deterministic script (`scripts/verify_tracing.py`,
+asserts against Jaeger's own HTTP API): all 6 services produce spans, and the escalate-resume
+journey (INV-1003) was found to form one connected trace across all 6, not separate per-hop
+traces. See `ARCHITECTURE.md` §12 for the exact coverage matrix (what's traced vs. not).
+
+- [ ] Metrics - out of scope for this pass; Prometheus/Grafana deferred (heavier lift, less
+  demo value than tracing for a course project at this scale)
+- [x] Distributed tracing
 
 
 ## N5 RAG
