@@ -15,13 +15,14 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from services.audit.models import DashboardSummary
 from services.audit.postgres_repository import PostgresAuditRepository
 from services.audit.repository import AuditRepository
 from services.audit.service import AuditService, build_audit_service
+from shared.auth import AuthenticatedUser, Role, require_role
 from shared.contracts.models import (
     ApprovalCompletedEvent,
     DecisionCompletedEvent,
@@ -47,7 +48,9 @@ def create_app(repository: AuditRepository | None = None) -> FastAPI:
         return {"status": "ok", "service": "audit-service"}
 
     @app.get("/audit/summary", response_model=DashboardSummary)
-    async def get_summary(request: Request) -> DashboardSummary:
+    async def get_summary(
+        request: Request, user: AuthenticatedUser = Depends(require_role(Role.ADMIN))
+    ) -> DashboardSummary:
         # Registered BEFORE /audit/{tracking_id} below - FastAPI/Starlette
         # matches routes in registration order, and {tracking_id} is a
         # generic string param that would otherwise swallow "summary" as if
@@ -57,7 +60,11 @@ def create_app(repository: AuditRepository | None = None) -> FastAPI:
         return await service.get_summary()
 
     @app.get("/audit/{tracking_id}")
-    async def get_audit_trail(tracking_id: str, request: Request) -> Any:
+    async def get_audit_trail(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> Any:
         service: AuditService = request.app.state.audit_service
         trail = await service.get_trail(tracking_id)
         if trail is None:

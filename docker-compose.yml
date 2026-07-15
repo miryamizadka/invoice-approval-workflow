@@ -53,6 +53,8 @@ services:
     command: uvicorn services.intake.app:app --host 0.0.0.0 --port 8000
     environment:
       - DECISION_SERVICE_URL=http://decision:8001
+    env_file:
+      - .env
     depends_on:
       decision:
         condition: service_healthy
@@ -93,6 +95,8 @@ services:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.approval.app:app --host 0.0.0.0 --port 8002
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 10s
@@ -111,6 +115,8 @@ services:
       # compensation journey demonstrable with a plain `docker compose up`,
       # at zero cost to every other invoice (only this one id ever fails).
       - PAYMENT_SIMULATE_FAILURE_IDS=INV-1012
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
       interval: 10s
@@ -125,6 +131,8 @@ services:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.notification.app:app --host 0.0.0.0 --port 8004
+    env_file:
+      - .env
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
       interval: 10s
@@ -144,6 +152,8 @@ services:
       - POSTGRES_USER=approvalflow
       - POSTGRES_PASSWORD=approvalflow
       - POSTGRES_DB=approvalflow
+    env_file:
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -362,6 +372,56 @@ services:
       jaeger:
         condition: service_started
     # See intake-dapr/decision-dapr/approval-dapr/payment-dapr comments above - same reasoning, paired with notification.
+
+  auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn services.auth.app:app --host 0.0.0.0 --port 8007
+    env_file:
+      - .env
+    # JWT_SECRET (and optional JWT_EXPIRY_HOURS) read directly from this
+    # container's own env - plain env var, not Dapr secrets, deliberately
+    # (N1 design - this isn't the documented M5 concern, not expanding its
+    # scope without reason).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks: [approvalflow]
+    # No host port mapping - see intake's comment above.
+
+  auth-dapr:
+    image: daprio/daprd:1.18.1
+    command:
+      - "./daprd"
+      - "--app-id"
+      - "auth"
+      - "--app-port"
+      - "8007"
+      - "--placement-host-address"
+      - "placement:50006"
+      - "--resources-path"
+      - "/components"
+      - "--config"
+      - "/components/tracing.yaml"
+    volumes:
+      - "./dapr/components:/components:ro"
+    network_mode: "service:auth"
+    depends_on:
+      auth:
+        condition: service_started
+      placement:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    # See intake-dapr/decision-dapr/approval-dapr/payment-dapr/notification-dapr
+    # comments above - same reasoning, paired with auth. State store only
+    # (dapr/components/statestore.yaml) - auth doesn't publish/subscribe to
+    # anything, so it's deliberately NOT added to pubsub.yaml's scopes.
 
   audit-dapr:
     image: daprio/daprd:1.18.1

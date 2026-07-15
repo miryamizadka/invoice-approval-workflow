@@ -9,7 +9,7 @@ import logging
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from services.notification.accessors.logging_channel import LoggingNotificationChannel
@@ -18,6 +18,7 @@ from services.notification.dapr_state_repository import DaprStateNotificationRep
 from services.notification.logging_config import configure_logging
 from services.notification.repository import NotificationRepository
 from services.notification.service import NotificationService, build_notification_service
+from shared.auth import AuthenticatedUser, Role, require_role
 from shared.contracts.models import (
     ApprovalCompletedEvent,
     DecisionCompletedEvent,
@@ -44,7 +45,11 @@ def create_app(
         return {"status": "ok", "service": "notification-service"}
 
     @app.get("/notifications/{tracking_id}")
-    async def get_notification_status(tracking_id: str, request: Request) -> dict[str, Any]:
+    async def get_notification_status(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.ADMIN)),
+    ) -> dict[str, Any]:
         """Ops/debug endpoint - not a public API. Always returns 200: "not
         yet notified" is a valid, non-error state, not a 404 (unlike
         Payment's GET /payments/{id}, where an unknown tracking_id is a

@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from scripts.verification_auth import AuthTokens, acquire_tokens
 from scripts.verify_phase8 import (
     APPROVAL_URL,
     _load_fixture,
@@ -85,10 +86,10 @@ async def _jaeger_trace_ids_for_service(client: httpx.AsyncClient, service: str)
     return {trace["traceID"] for trace in traces}
 
 
-async def verify_auto_approve_produces_spans(client: httpx.AsyncClient) -> None:
+async def verify_auto_approve_produces_spans(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     suffix = uuid.uuid4().hex[:8]
     body = _load_fixture("INV-1001", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, body)
+    tracking_id = await _submit_invoice(client, body, tokens)
     await asyncio.sleep(TRACE_PROPAGATION_WAIT_SECONDS)
 
     services = await _jaeger_services(client)
@@ -103,15 +104,21 @@ async def verify_auto_approve_produces_spans(client: httpx.AsyncClient) -> None:
     _ok(f"INV-1001: 'intake' has {len(intake_traces)} trace(s) in the last hour")
 
 
-async def verify_escalate_resume_trace_continuity(client: httpx.AsyncClient) -> dict[str, set[str]]:
+async def verify_escalate_resume_trace_continuity(
+    client: httpx.AsyncClient, tokens: AuthTokens
+) -> dict[str, set[str]]:
     """Returns the per-service trace-ID sets so main() can report continuity
     evidence, rather than asserting it here - the plan is explicit that this
     is observed and documented, not assumed."""
     suffix = uuid.uuid4().hex[:8]
     body = _load_fixture("INV-1003", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, body)
-    await _wait_for_approval_queue(client, tracking_id)
-    response = await client.post(f"{APPROVAL_URL}/approvals/{tracking_id}/approve", timeout=10)
+    tracking_id = await _submit_invoice(client, body, tokens)
+    await _wait_for_approval_queue(client, tracking_id, tokens)
+    response = await client.post(
+        f"{APPROVAL_URL}/approvals/{tracking_id}/approve",
+        headers=tokens.header(tokens.approver),
+        timeout=10,
+    )
     if response.status_code != 200:
         raise SystemExit(
             f"FAIL: approve returned {response.status_code} for INV-1003 tracking_id={tracking_id}"
@@ -141,8 +148,9 @@ async def _main_impl() -> None:
     overall_start = time.perf_counter()
     async with httpx.AsyncClient() as client:
         await _wait_for_jaeger_reachable(client)
-        await verify_auto_approve_produces_spans(client)
-        per_service_traces = await verify_escalate_resume_trace_continuity(client)
+        tokens = await acquire_tokens(client)
+        await verify_auto_approve_produces_spans(client, tokens)
+        per_service_traces = await verify_escalate_resume_trace_continuity(client, tokens)
 
     shared_trace_ids = set.intersection(*per_service_traces.values())
     if shared_trace_ids:

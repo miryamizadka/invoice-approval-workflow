@@ -5,6 +5,11 @@ DecisionPublisher - no real Dapr sidecar. The decision.completed subscription
 route is exercised directly via TestClient, POSTing a CloudEvent-shaped body
 (just the `data` field - that's all the handler reads) to simulate what the
 Dapr sidecar would deliver.
+
+N1: _build_app() authenticates every test as Role.SUBMITTER (the floor role
+for both of Intake's routes) via app.dependency_overrides[get_current_user] -
+the standard FastAPI testing idiom. The dedicated 401 tests at the bottom
+clear that override deliberately to prove the gate itself.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from services.intake.decision_completed_publisher import DecisionCompletedPublis
 from services.intake.decision_publisher import DecisionPublisher, DecisionPublisherError
 from services.intake.models import ApprovalStatusSnapshot
 from services.intake.repository import InMemoryInvoiceRepository, InvoiceRepository
+from shared.auth import AuthenticatedUser, Role, get_current_user
 from shared.contracts.models import (
     DecisionCompletedEvent,
     Invoice,
@@ -28,6 +34,8 @@ from shared.contracts.models import (
     Route,
 )
 from tests.support.event_fixtures import decision_completed_event
+
+_TEST_SUBMITTER_EMAIL = "test-submitter@example.com"
 
 
 class _StubPublisher:
@@ -76,13 +84,17 @@ def _build_app(
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
     approval_status_client: ApprovalStatusClient | None = None,
 ) -> FastAPI:
-    return create_app(
+    app = create_app(
         repository=repository or InMemoryInvoiceRepository(),
         publisher=publisher,
         decision_completed_publisher=decision_completed_publisher
         or _StubDecisionCompletedPublisher(),
         approval_status_client=approval_status_client or _NeverCalledApprovalStatusClient(),
     )
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub=_TEST_SUBMITTER_EMAIL, role=Role.SUBMITTER
+    )
+    return app
 
 
 def _invoice_body(**overrides: Any) -> dict[str, Any]:
@@ -357,3 +369,42 @@ def test_health_check() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "intake-service"}
+
+
+# --- N1: authentication + submitter identity derivation -----------------------
+
+
+def test_submit_requires_authentication() -> None:
+    app = _build_app(_StubPublisher())
+    app.dependency_overrides.pop(get_current_user, None)
+    client = TestClient(app)
+
+    response = client.post("/invoices", json=_invoice_body())
+
+    assert response.status_code == 401
+
+
+def test_get_invoice_status_requires_authentication() -> None:
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+    tracking_id = client.post("/invoices", json=_invoice_body()).json()["tracking_id"]
+    app.dependency_overrides.pop(get_current_user, None)
+
+    response = client.get(f"/invoices/{tracking_id}")
+
+    assert response.status_code == 401
+
+
+def test_submit_forces_submitter_to_the_authenticated_identity() -> None:
+    """Anti-spoofing (N1): the client-supplied `submitter` field must be
+    ignored and overwritten with the JWT identity - otherwise anyone could
+    submit "as" a different, fake submitter."""
+    app = _build_app(_StubPublisher())
+    client = TestClient(app)
+
+    tracking_id = client.post(
+        "/invoices", json=_invoice_body(submitter="attacker@example.com")
+    ).json()["tracking_id"]
+
+    status = client.get(f"/invoices/{tracking_id}")
+    assert status.json()["invoice"]["submitter"] == _TEST_SUBMITTER_EMAIL

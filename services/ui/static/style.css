@@ -34,13 +34,23 @@ body {
 }
 
 nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
   margin-bottom: 2rem;
   padding-bottom: 1rem;
   border-bottom: 1px solid var(--color-border);
 }
 
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
 nav a {
-  margin-right: 1.5rem;
   font-weight: 600;
   color: var(--color-text-muted);
   text-decoration: none;
@@ -49,6 +59,40 @@ nav a {
 
 nav a:hover {
   color: var(--color-accent);
+}
+
+/* Hidden purely via CSS, keyed off html[data-role] - set synchronously by
+   each page's inline <head> script, before <body>/<nav> is even parsed.
+   This is what actually prevents a role from ever seeing a tab it can't
+   use, even for a single frame - a JS DOM-removal approach running at the
+   bottom of body would only act after the browser had already painted the
+   unfiltered nav once. */
+html[data-role="submitter"] nav a[data-min-role],
+html[data-role="approver"] nav a[data-min-role="admin"] {
+  display: none;
+}
+
+.user-bar {
+  color: var(--color-text-muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.user-bar a {
+  margin-left: 0.75rem;
+  font-weight: 600;
+  color: var(--color-accent);
+  text-decoration: none;
+}
+
+.user-bar a:hover {
+  color: var(--color-accent-hover);
+}
+
+input[readonly] {
+  background: var(--color-bg);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
 }
 
 h1 {
@@ -300,4 +344,40 @@ button:disabled {
   color: var(--color-text-muted);
   font-size: 0.85rem;
   margin-top: 0.5rem;
+}
+
+/* Vertically centers the login card in the viewport - horizontal width is
+   deliberately untouched (no max-width override here), so the fields stay
+   the same width as every other page's (input's own width:100% rule,
+   bounded only by body's shared max-width:720px). */
+body.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  margin: 0 auto;
+}
+
+.login-container {
+  width: 100%;
+}
+
+/* <summary> has no default visual affordance that it's clickable (unlike
+   an <a>) - styled to read the same way Logout does, so both interactive
+   text elements on this page look consistent. */
+summary {
+  cursor: pointer;
+  margin-top: 1rem;
+  color: var(--color-accent);
+  font-weight: 600;
+}
+
+summary:hover {
+  color: var(--color-accent-hover);
+}
+
+/* Matches the 1rem gap every field already has (label's margin-bottom) -
+   the gap after the Log In button, before "New here? Register..." */
+details {
+  margin-top: 1rem;
 }

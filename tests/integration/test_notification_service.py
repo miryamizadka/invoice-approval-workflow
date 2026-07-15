@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from services.notification.accessors.fake_channel import FakeNotificationChannel
 from services.notification.app import create_app
 from services.notification.repository import InMemoryNotificationRepository
+from shared.auth import AuthenticatedUser, Role, get_current_user
 from shared.contracts.models import ApprovalResolution, Decision, PaymentResolution, Route
 from tests.support.decision_fixtures import RAW_FIXTURES, clean_invoice, invoice_from_fixture
 
@@ -62,6 +63,9 @@ def _app(
     resolved_repository = repository or InMemoryNotificationRepository()
     resolved_channel = channel or FakeNotificationChannel()
     app = create_app(repository=resolved_repository, channel=resolved_channel)
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="test-admin@example.com", role=Role.ADMIN
+    )
     return TestClient(app), resolved_repository, resolved_channel
 
 
@@ -235,3 +239,26 @@ def test_inv_1015_reject_fixture_produces_exactly_one_notification() -> None:
 
     assert len(channel.sent) == 1
     assert channel.sent[0][1] == "inv-1015-corr"
+
+
+# --- N1: authentication/authorization gates ---------------------------------
+
+
+def test_get_notification_status_requires_authentication() -> None:
+    client, _, _ = _app()
+    client.app.dependency_overrides.pop(get_current_user, None)  # type: ignore[attr-defined]
+
+    response = client.get("/notifications/missing")
+
+    assert response.status_code == 401
+
+
+def test_get_notification_status_requires_admin_role_not_approver() -> None:
+    client, _, _ = _app()
+    client.app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(  # type: ignore[attr-defined]
+        sub="approver@example.com", role=Role.APPROVER
+    )
+
+    response = client.get("/notifications/missing")
+
+    assert response.status_code == 403

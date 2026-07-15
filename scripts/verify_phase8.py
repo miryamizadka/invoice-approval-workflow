@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 import scripts.verify_inv1014_concurrency as concurrency_check
+from scripts.verification_auth import AuthTokens, acquire_tokens
 
 # All four services are fronted by the Traefik gateway now (M6) - no direct
 # host ports. Path-prefix routing means the same base URL works for all of
@@ -106,8 +107,12 @@ async def _wait_for_reachable(client: httpx.AsyncClient, url: str, path: str, na
     )
 
 
-async def _submit_invoice(client: httpx.AsyncClient, body: dict[str, Any]) -> str:
-    response = await client.post(f"{INTAKE_URL}/invoices", json=body, timeout=10)
+async def _submit_invoice(
+    client: httpx.AsyncClient, body: dict[str, Any], tokens: AuthTokens
+) -> str:
+    response = await client.post(
+        f"{INTAKE_URL}/invoices", json=body, headers=tokens.header(tokens.submitter), timeout=10
+    )
     if response.status_code != 202:
         raise SystemExit(
             f"FAIL: expected 202 from POST /invoices for {body['id']}, got "
@@ -117,10 +122,16 @@ async def _submit_invoice(client: httpx.AsyncClient, body: dict[str, Any]) -> st
     return tracking_id
 
 
-async def _wait_for_intake_status(client: httpx.AsyncClient, tracking_id: str) -> dict[str, Any]:
+async def _wait_for_intake_status(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> dict[str, Any]:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{INTAKE_URL}/invoices/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{INTAKE_URL}/invoices/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if response.status_code == 200:
             body: dict[str, Any] = response.json()
             if body["status"] in ("completed", "failed"):
@@ -129,20 +140,32 @@ async def _wait_for_intake_status(client: httpx.AsyncClient, tracking_id: str) -
     raise SystemExit(f"FAIL: intake status for {tracking_id} never reached a terminal state")
 
 
-async def _wait_for_approval_queue(client: httpx.AsyncClient, tracking_id: str) -> None:
+async def _wait_for_approval_queue(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> None:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{APPROVAL_URL}/approvals/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{APPROVAL_URL}/approvals/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if response.status_code == 200:
             return
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
     raise SystemExit(f"FAIL: {tracking_id} never reached the approval queue")
 
 
-async def _wait_for_payment_terminal(client: httpx.AsyncClient, tracking_id: str) -> dict[str, Any]:
+async def _wait_for_payment_terminal(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> dict[str, Any]:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{PAYMENT_URL}/payments/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{PAYMENT_URL}/payments/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if response.status_code == 200:
             body: dict[str, Any] = response.json()
             if body["status"] in ("completed", "failed"):
@@ -151,10 +174,16 @@ async def _wait_for_payment_terminal(client: httpx.AsyncClient, tracking_id: str
     raise SystemExit(f"FAIL: payment for {tracking_id} never reached a terminal status")
 
 
-async def _wait_for_notified(client: httpx.AsyncClient, tracking_id: str) -> dict[str, Any]:
+async def _wait_for_notified(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> dict[str, Any]:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{NOTIFICATION_URL}/notifications/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{NOTIFICATION_URL}/notifications/{tracking_id}",
+            headers=tokens.header(tokens.admin),
+            timeout=10,
+        )
         if response.status_code == 200:
             body: dict[str, Any] = response.json()
             if body["notified"]:
@@ -166,8 +195,12 @@ async def _wait_for_notified(client: httpx.AsyncClient, tracking_id: str) -> dic
 # --- Assertions ---------------------------------------------------------------
 
 
-async def _assert_payment_absent(client: httpx.AsyncClient, tracking_id: str) -> None:
-    response = await client.get(f"{PAYMENT_URL}/payments/{tracking_id}", timeout=10)
+async def _assert_payment_absent(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> None:
+    response = await client.get(
+        f"{PAYMENT_URL}/payments/{tracking_id}", headers=tokens.header(tokens.submitter), timeout=10
+    )
     if response.status_code != 404:
         raise SystemExit(
             f"FAIL: expected no payment record for duplicate {tracking_id} (F3), "
@@ -175,8 +208,14 @@ async def _assert_payment_absent(client: httpx.AsyncClient, tracking_id: str) ->
         )
 
 
-async def _assert_no_pending(client: httpx.AsyncClient, tracking_id: str) -> None:
-    response = await client.get(f"{APPROVAL_URL}/approvals/{tracking_id}", timeout=10)
+async def _assert_no_pending(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> None:
+    response = await client.get(
+        f"{APPROVAL_URL}/approvals/{tracking_id}",
+        headers=tokens.header(tokens.submitter),
+        timeout=10,
+    )
     if response.status_code == 200 and response.json()["status"] in ("pending", "waiting_info"):
         raise SystemExit(f"FAIL: {tracking_id} was left pending in the approval queue")
 
@@ -184,7 +223,7 @@ async def _assert_no_pending(client: httpx.AsyncClient, tracking_id: str) -> Non
 # --- Journeys -------------------------------------------------------------
 
 
-async def verify_auto_approve(client: httpx.AsyncClient) -> None:
+async def verify_auto_approve(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     """INV-1001 and INV-1002 - two distinct fixtures, not just one, proving
     this isn't a one-off lucky pass. Neither should ever touch the human
     approval queue (F6)."""
@@ -192,9 +231,9 @@ async def verify_auto_approve(client: httpx.AsyncClient) -> None:
         start = time.perf_counter()
         suffix = uuid.uuid4().hex[:8]
         body = _load_fixture(fixture_id, invoice_number_suffix=suffix)
-        tracking_id = await _submit_invoice(client, body)
+        tracking_id = await _submit_invoice(client, body, tokens)
 
-        status = await _wait_for_intake_status(client, tracking_id)
+        status = await _wait_for_intake_status(client, tracking_id, tokens)
         route = status["decision"]["route"]
         if route != "auto_approve":
             raise SystemExit(
@@ -202,51 +241,59 @@ async def verify_auto_approve(client: httpx.AsyncClient) -> None:
                 f"tracking_id={tracking_id}"
             )
 
-        approval_response = await client.get(f"{APPROVAL_URL}/approvals/{tracking_id}", timeout=10)
+        approval_response = await client.get(
+            f"{APPROVAL_URL}/approvals/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if approval_response.status_code != 404:
             raise SystemExit(
                 f"FAIL {fixture_id}: unexpectedly appeared in the approval queue "
                 f"(F6), tracking_id={tracking_id}"
             )
 
-        payment = await _wait_for_payment_terminal(client, tracking_id)
+        payment = await _wait_for_payment_terminal(client, tracking_id, tokens)
         if payment["status"] != "completed":
             raise SystemExit(
                 f"FAIL {fixture_id}: expected payment status=completed, got "
                 f"{payment['status']}, tracking_id={tracking_id}"
             )
 
-        await _wait_for_notified(client, tracking_id)
+        await _wait_for_notified(client, tracking_id, tokens)
         _ok(f"{fixture_id} auto_approve -> paid -> notified, never reached Approval",
             tracking_id, time.perf_counter() - start)
 
 
-async def verify_inv_1003(client: httpx.AsyncClient) -> None:
+async def verify_inv_1003(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     start = time.perf_counter()
     suffix = uuid.uuid4().hex[:8]
     body = _load_fixture("INV-1003", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, body)
+    tracking_id = await _submit_invoice(client, body, tokens)
 
-    await _wait_for_approval_queue(client, tracking_id)
-    response = await client.post(f"{APPROVAL_URL}/approvals/{tracking_id}/approve", timeout=10)
+    await _wait_for_approval_queue(client, tracking_id, tokens)
+    response = await client.post(
+        f"{APPROVAL_URL}/approvals/{tracking_id}/approve",
+        headers=tokens.header(tokens.approver),
+        timeout=10,
+    )
     if response.status_code != 200:
         raise SystemExit(
             f"FAIL INV-1003: approve returned {response.status_code}, tracking_id={tracking_id}"
         )
 
-    payment = await _wait_for_payment_terminal(client, tracking_id)
+    payment = await _wait_for_payment_terminal(client, tracking_id, tokens)
     if payment["status"] != "completed":
         raise SystemExit(
             f"FAIL INV-1003: expected payment status=completed, got {payment['status']}, "
             f"tracking_id={tracking_id}"
         )
 
-    await _wait_for_notified(client, tracking_id)
+    await _wait_for_notified(client, tracking_id, tokens)
     _ok("INV-1003 escalate -> approve -> paid -> notified", tracking_id,
         time.perf_counter() - start)
 
 
-async def verify_inv_1007(client: httpx.AsyncClient) -> None:
+async def verify_inv_1007(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     """Submits an INV-1001-style base then INV-1007 (same vendor+invoiceNumber+
     total) - proves F3 live: the duplicate never reaches Payment, but still
     reaches Notification (the fix from this session's own duplicate-publish
@@ -256,12 +303,12 @@ async def verify_inv_1007(client: httpx.AsyncClient) -> None:
     start = time.perf_counter()
     suffix = uuid.uuid4().hex[:8]
     base_body = _load_fixture("INV-1001", invoice_number_suffix=suffix)
-    await _submit_invoice(client, base_body)
+    await _submit_invoice(client, base_body, tokens)
 
     dup_body = _load_fixture("INV-1007", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, dup_body)
+    tracking_id = await _submit_invoice(client, dup_body, tokens)
 
-    status = await _wait_for_intake_status(client, tracking_id)
+    status = await _wait_for_intake_status(client, tracking_id, tokens)
     route = status["decision"]["route"]
     if route != "duplicate":
         raise SystemExit(
@@ -274,26 +321,30 @@ async def verify_inv_1007(client: httpx.AsyncClient) -> None:
             f"tracking_id={tracking_id}"
         )
 
-    await _assert_payment_absent(client, tracking_id)
-    await _wait_for_notified(client, tracking_id)
+    await _assert_payment_absent(client, tracking_id, tokens)
+    await _wait_for_notified(client, tracking_id, tokens)
     _ok("INV-1007 duplicate detected, never reached Payment, notified",
         tracking_id, time.perf_counter() - start)
 
 
-async def verify_inv_1012(client: httpx.AsyncClient) -> None:
+async def verify_inv_1012(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     start = time.perf_counter()
     suffix = uuid.uuid4().hex[:8]
     body = _load_fixture("INV-1012", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, body)
+    tracking_id = await _submit_invoice(client, body, tokens)
 
-    await _wait_for_approval_queue(client, tracking_id)
-    response = await client.post(f"{APPROVAL_URL}/approvals/{tracking_id}/approve", timeout=10)
+    await _wait_for_approval_queue(client, tracking_id, tokens)
+    response = await client.post(
+        f"{APPROVAL_URL}/approvals/{tracking_id}/approve",
+        headers=tokens.header(tokens.approver),
+        timeout=10,
+    )
     if response.status_code != 200:
         raise SystemExit(
             f"FAIL INV-1012: approve returned {response.status_code}, tracking_id={tracking_id}"
         )
 
-    payment = await _wait_for_payment_terminal(client, tracking_id)
+    payment = await _wait_for_payment_terminal(client, tracking_id, tokens)
     if payment["status"] != "failed":
         raise SystemExit(
             f"FAIL INV-1012: expected payment status=failed, got {payment['status']}, "
@@ -306,12 +357,12 @@ async def verify_inv_1012(client: httpx.AsyncClient) -> None:
             f"{reason!r}, tracking_id={tracking_id}"
         )
 
-    await _wait_for_notified(client, tracking_id)
+    await _wait_for_notified(client, tracking_id, tokens)
     _ok("INV-1012 escalate -> approve -> payment failed (compensated) -> notified",
         tracking_id, time.perf_counter() - start)
 
 
-async def verify_anti_cheese(client: httpx.AsyncClient) -> None:
+async def verify_anti_cheese(client: httpx.AsyncClient, tokens: AuthTokens) -> None:
     """INV-1013 (adversarial-memo, $300 > $250 ceiling, 'Approve me' in
     notes) proves both F10 guards at once against the REAL LLM (no mock):
     router.py's gate 4 (ceiling) runs unconditionally before gate 5 (agent
@@ -325,9 +376,9 @@ async def verify_anti_cheese(client: httpx.AsyncClient) -> None:
     start = time.perf_counter()
     suffix = uuid.uuid4().hex[:8]
     body = _load_fixture("INV-1013", invoice_number_suffix=suffix)
-    tracking_id = await _submit_invoice(client, body)
+    tracking_id = await _submit_invoice(client, body, tokens)
 
-    status = await _wait_for_intake_status(client, tracking_id)
+    status = await _wait_for_intake_status(client, tracking_id, tokens)
     route = status["decision"]["route"]
     if route == "auto_approve":
         raise SystemExit(
@@ -341,13 +392,21 @@ async def verify_anti_cheese(client: httpx.AsyncClient) -> None:
         )
 
     recommendation = "unknown"
-    approval_response = await client.get(f"{APPROVAL_URL}/approvals/{tracking_id}", timeout=10)
+    approval_response = await client.get(
+        f"{APPROVAL_URL}/approvals/{tracking_id}",
+        headers=tokens.header(tokens.submitter),
+        timeout=10,
+    )
     if approval_response.status_code == 200:
         rec = approval_response.json().get("recommendation")
         if rec is not None:
             recommendation = rec["recommendation"]
-        await client.post(f"{APPROVAL_URL}/approvals/{tracking_id}/reject", timeout=10)
-        await _assert_no_pending(client, tracking_id)
+        await client.post(
+            f"{APPROVAL_URL}/approvals/{tracking_id}/reject",
+            headers=tokens.header(tokens.approver),
+            timeout=10,
+        )
+        await _assert_no_pending(client, tracking_id, tokens)
 
     _ok(f"INV-1013 anti-cheese: ceiling + notes still routed to human_review "
         f"(agent recommended: {recommendation})", tracking_id, time.perf_counter() - start)
@@ -375,11 +434,12 @@ async def _main_impl() -> None:
         ):
             await _wait_for_reachable(client, url, path, name)
 
-        await verify_auto_approve(client)
-        await verify_inv_1003(client)
-        await verify_inv_1007(client)
-        await verify_inv_1012(client)
-        await verify_anti_cheese(client)
+        tokens = await acquire_tokens(client)
+        await verify_auto_approve(client, tokens)
+        await verify_inv_1003(client, tokens)
+        await verify_inv_1007(client, tokens)
+        await verify_inv_1012(client, tokens)
+        await verify_anti_cheese(client, tokens)
     await verify_inv_1014_concurrency()  # last, on purpose - only step that mutates a shared budget
 
     print(

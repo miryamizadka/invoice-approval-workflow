@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 
 from services.intake.approval_status_client import (
     ApprovalStatusClient,
@@ -25,6 +25,7 @@ from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
 from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
+from shared.auth import AuthenticatedUser, get_current_user
 from shared.contracts.models import DecisionCompletedEvent, Invoice
 
 
@@ -52,8 +53,16 @@ def create_app(
 
     @app.post("/invoices", status_code=202)
     async def submit_invoice(
-        invoice: Invoice, background_tasks: BackgroundTasks, request: Request, response: Response
+        invoice: Invoice,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        response: Response,
+        user: AuthenticatedUser = Depends(get_current_user),
     ) -> dict[str, str]:
+        # N1 anti-spoofing: submitter is always the authenticated identity,
+        # never trusted from the client payload - model_copy works fine on
+        # a frozen model (shared/contracts/models.py's Invoice is unchanged).
+        invoice = invoice.model_copy(update={"submitter": user.sub})
         service: IntakeService = request.app.state.intake_service
         tracking_id = await service.submit(invoice)
         background_tasks.add_task(service.process, tracking_id)
@@ -61,7 +70,11 @@ def create_app(
         return {"tracking_id": tracking_id, "status": "received"}
 
     @app.get("/invoices/{tracking_id}", response_model=SubmissionStatusResponse)
-    async def get_invoice_status(tracking_id: str, request: Request) -> SubmissionStatusResponse:
+    async def get_invoice_status(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> SubmissionStatusResponse:
         service: IntakeService = request.app.state.intake_service
         response = await service.get_status_response(tracking_id)
         if response is None:

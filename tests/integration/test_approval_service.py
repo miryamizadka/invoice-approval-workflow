@@ -3,6 +3,13 @@
 Exercises the full chain: HTTP/subscription -> FastAPI -> ApprovalService -
 with InMemoryApprovalRepository/a stub publisher, no real Dapr (same pattern
 as test_decision_service.py).
+
+N1: every test below authenticates as Role.ADMIN via
+app.dependency_overrides[get_current_user] (the standard FastAPI testing
+idiom for a Depends()-based dependency - Admin passes every gate in this
+service, so existing behavioral assertions are unaffected). The dedicated
+401/403 tests at the bottom clear or downgrade that override deliberately,
+to prove the gate itself, not just the business logic behind it.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from fastapi.testclient import TestClient
 from services.approval.app import create_app
 from services.approval.models import ApprovalStatus
 from services.approval.repository import ApprovalRepository, InMemoryApprovalRepository
+from shared.auth import AuthenticatedUser, Role, get_current_user
 from shared.contracts.models import ApprovalCompletedEvent, Decision, Route
 from tests.support.decision_fixtures import clean_invoice
 
@@ -55,6 +63,9 @@ def _app(
     resolved_repository = repository or InMemoryApprovalRepository()
     resolved_publisher = publisher or _StubOutcomePublisher()
     app = create_app(repository=resolved_repository, publisher=resolved_publisher)
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="test-admin@example.com", role=Role.ADMIN
+    )
     return TestClient(app), resolved_repository, resolved_publisher
 
 
@@ -206,3 +217,64 @@ def test_additional_info_still_visible_after_later_approve() -> None:
     approval = client.get("/approvals/corr-1").json()
     assert approval["status"] == ApprovalStatus.APPROVED.value
     assert approval["additional_info"] == "Client: Acme"
+
+
+# --- N1: authentication/authorization gates ---------------------------------
+
+
+def test_list_approvals_requires_authentication() -> None:
+    client, _, _ = _app()
+    client.app.dependency_overrides.pop(get_current_user, None)  # type: ignore[attr-defined]
+
+    response = client.get("/approvals")
+
+    assert response.status_code == 401
+
+
+def test_list_approvals_requires_approver_role_not_submitter() -> None:
+    client, _, _ = _app()
+    client.app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(  # type: ignore[attr-defined]
+        sub="submitter@example.com", role=Role.SUBMITTER
+    )
+
+    response = client.get("/approvals")
+
+    assert response.status_code == 403
+
+
+def test_list_approvals_succeeds_for_approver_role() -> None:
+    client, _, _ = _app()
+    client.app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(  # type: ignore[attr-defined]
+        sub="approver@example.com", role=Role.APPROVER
+    )
+
+    response = client.get("/approvals")
+
+    assert response.status_code == 200
+
+
+def test_approve_requires_approver_role_not_submitter() -> None:
+    client, _, _ = _app()
+    _post_decision_completed(client)
+    client.app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(  # type: ignore[attr-defined]
+        sub="submitter@example.com", role=Role.SUBMITTER
+    )
+
+    response = client.post("/approvals/corr-1/approve")
+
+    assert response.status_code == 403
+
+
+def test_get_single_approval_only_requires_authentication_not_approver_role() -> None:
+    """Single-item lookups are available to any authenticated role (the
+    caller already knows the specific tracking_id) - unlike the list
+    endpoint above, a Submitter is not rejected here."""
+    client, _, _ = _app()
+    _post_decision_completed(client)
+    client.app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(  # type: ignore[attr-defined]
+        sub="submitter@example.com", role=Role.SUBMITTER
+    )
+
+    response = client.get("/approvals/corr-1")
+
+    assert response.status_code == 200

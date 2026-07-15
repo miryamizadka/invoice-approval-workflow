@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from services.approval.dapr_state_repository import DaprStateApprovalRepository
@@ -27,6 +27,7 @@ from services.approval.service import (
     ApprovalService,
     build_approval_service,
 )
+from shared.auth import AuthenticatedUser, Role, get_current_user, require_role
 from shared.contracts.models import DecisionCompletedEvent
 
 
@@ -53,12 +54,18 @@ def create_app(
         return {"status": "ok", "service": "approval-service"}
 
     @app.get("/approvals", response_model=list[PendingApproval])
-    async def list_approvals(request: Request) -> list[PendingApproval]:
+    async def list_approvals(
+        request: Request, user: AuthenticatedUser = Depends(require_role(Role.APPROVER))
+    ) -> list[PendingApproval]:
         service: ApprovalService = request.app.state.approval_service
         return await service.list_pending()
 
     @app.get("/approvals/{tracking_id}", response_model=PendingApproval)
-    async def get_approval(tracking_id: str, request: Request) -> PendingApproval:
+    async def get_approval(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         try:
             return await service.get(tracking_id)
@@ -66,23 +73,38 @@ def create_app(
             raise HTTPException(status_code=404, detail="tracking_id not found") from exc
 
     @app.post("/approvals/{tracking_id}/approve", response_model=PendingApproval)
-    async def approve(tracking_id: str, request: Request) -> PendingApproval:
+    async def approve(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.approve, tracking_id)
 
     @app.post("/approvals/{tracking_id}/reject", response_model=PendingApproval)
-    async def reject(tracking_id: str, request: Request) -> PendingApproval:
+    async def reject(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.reject, tracking_id)
 
     @app.post("/approvals/{tracking_id}/request-info", response_model=PendingApproval)
-    async def request_info(tracking_id: str, request: Request) -> PendingApproval:
+    async def request_info(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.request_info, tracking_id)
 
     @app.post("/approvals/{tracking_id}/additional-info", response_model=PendingApproval)
     async def additional_info(
-        tracking_id: str, body: _AdditionalInfoBody, request: Request
+        tracking_id: str,
+        body: _AdditionalInfoBody,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
     ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         try:

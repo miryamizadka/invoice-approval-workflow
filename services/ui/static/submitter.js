@@ -6,6 +6,14 @@
 
   const form = document.getElementById("submit-form");
   const submitButton = document.getElementById("submit-button");
+  // N1: the server always overwrites `submitter` from the JWT identity
+  // regardless of what's submitted (services/intake/app.py's model_copy) -
+  // this is cosmetic, just showing the submitter which identity will
+  // actually be recorded rather than letting them type a value that gets
+  // silently discarded.
+  const submitterInput = document.getElementById("submitter");
+  submitterInput.value = getEmail() || "";
+  submitterInput.readOnly = true;
   const submitMessage = document.getElementById("submit-message");
   const statusSection = document.getElementById("status-section");
   const trackingIdDisplay = document.getElementById("tracking-id-display");

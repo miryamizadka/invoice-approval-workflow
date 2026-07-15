@@ -560,8 +560,8 @@ CRITICAL
 
 ## N1 Auth
 
-- [ ] JWT authentication
-- [ ] Roles:
+- [x] JWT authentication - `services/auth/` (register/login, HS256, `shared/auth.py`); every existing route gated via `Depends(get_current_user)`/`Depends(require_role(...))`; live-verified via `scripts/verify_auth.py`.
+- [x] Roles:
   - Submitter
   - Approver
   - Admin

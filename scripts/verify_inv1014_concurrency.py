@@ -45,6 +45,8 @@ from typing import Any
 
 import httpx
 
+from scripts.verification_auth import AuthTokens, acquire_tokens
+
 # Intake/Approval/Payment are fronted by the Traefik gateway now (M6) - no
 # direct host ports. Path-prefix routing means the same base URL works for
 # all of them.
@@ -126,33 +128,53 @@ async def _wait_for_reachable(client: httpx.AsyncClient, url: str, path: str, na
     )
 
 
-async def _submit_invoice(client: httpx.AsyncClient, body: dict[str, Any]) -> str:
-    response = await client.post(f"{INTAKE_URL}/invoices", json=body, timeout=10)
+async def _submit_invoice(
+    client: httpx.AsyncClient, body: dict[str, Any], tokens: AuthTokens
+) -> str:
+    response = await client.post(
+        f"{INTAKE_URL}/invoices", json=body, headers=tokens.header(tokens.submitter), timeout=10
+    )
     if response.status_code != 202:
         raise SystemExit(f"FAIL: expected 202 from POST /invoices, got {response.status_code}")
     tracking_id: str = response.json()["tracking_id"]
     return tracking_id
 
 
-async def _wait_for_approval_queue(client: httpx.AsyncClient, tracking_id: str) -> None:
+async def _wait_for_approval_queue(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> None:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{APPROVAL_URL}/approvals/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{APPROVAL_URL}/approvals/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if response.status_code == 200:
             return
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
     raise SystemExit(f"FAIL: {tracking_id} never reached the approval queue")
 
 
-async def _approve(client: httpx.AsyncClient, tracking_id: str) -> int:
-    response = await client.post(f"{APPROVAL_URL}/approvals/{tracking_id}/approve", timeout=10)
+async def _approve(client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens) -> int:
+    response = await client.post(
+        f"{APPROVAL_URL}/approvals/{tracking_id}/approve",
+        headers=tokens.header(tokens.approver),
+        timeout=10,
+    )
     return response.status_code
 
 
-async def _wait_for_payment_terminal(client: httpx.AsyncClient, tracking_id: str) -> dict[str, Any]:
+async def _wait_for_payment_terminal(
+    client: httpx.AsyncClient, tracking_id: str, tokens: AuthTokens
+) -> dict[str, Any]:
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        response = await client.get(f"{PAYMENT_URL}/payments/{tracking_id}", timeout=10)
+        response = await client.get(
+            f"{PAYMENT_URL}/payments/{tracking_id}",
+            headers=tokens.header(tokens.submitter),
+            timeout=10,
+        )
         if response.status_code == 200:
             body = response.json()
             if body["status"] in ("completed", "failed"):
@@ -161,39 +183,41 @@ async def _wait_for_payment_terminal(client: httpx.AsyncClient, tracking_id: str
     raise SystemExit(f"FAIL: payment for {tracking_id} never reached a terminal status")
 
 
-async def _get_budget_remaining(client: httpx.AsyncClient) -> Decimal:
-    response = await client.get(f"{PAYMENT_URL}/budgets/{DEPARTMENT}", timeout=10)
+async def _get_budget_remaining(client: httpx.AsyncClient, tokens: AuthTokens) -> Decimal:
+    response = await client.get(
+        f"{PAYMENT_URL}/budgets/{DEPARTMENT}", headers=tokens.header(tokens.admin), timeout=10
+    )
     if response.status_code != 200:
         raise SystemExit(f"FAIL: could not read budget for {DEPARTMENT}: {response.status_code}")
     return Decimal(response.json()["remaining"])
 
 
-async def _run_iteration(client: httpx.AsyncClient, iteration: int) -> None:
+async def _run_iteration(client: httpx.AsyncClient, iteration: int, tokens: AuthTokens) -> None:
     print(f"\n--- iteration {iteration} ---")
     _reset_department_budget()
-    remaining_before = await _get_budget_remaining(client)
+    remaining_before = await _get_budget_remaining(client, tokens)
     print(f"[ok] {DEPARTMENT} reset to a fresh {remaining_before} for this iteration")
 
     suffix = uuid.uuid4().hex[:8]
     body_a = _invoice_body(f"A-{iteration}", f"7001-{suffix}")
     body_b = _invoice_body(f"B-{iteration}", f"7002-{suffix}")
 
-    tid_a = await _submit_invoice(client, body_a)
-    tid_b = await _submit_invoice(client, body_b)
+    tid_a = await _submit_invoice(client, body_a, tokens)
+    tid_b = await _submit_invoice(client, body_b, tokens)
     print(f"[ok] submitted pair: {tid_a}, {tid_b}")
 
-    await _wait_for_approval_queue(client, tid_a)
-    await _wait_for_approval_queue(client, tid_b)
+    await _wait_for_approval_queue(client, tid_a, tokens)
+    await _wait_for_approval_queue(client, tid_b, tokens)
 
     # The actual race: both `approve` calls fired concurrently, not sequentially.
     status_a, status_b = await asyncio.gather(
-        _approve(client, tid_a), _approve(client, tid_b)
+        _approve(client, tid_a, tokens), _approve(client, tid_b, tokens)
     )
     print(f"[ok] approve responses: a={status_a}, b={status_b}")
 
-    payment_a = await _wait_for_payment_terminal(client, tid_a)
-    payment_b = await _wait_for_payment_terminal(client, tid_b)
-    remaining_after = await _get_budget_remaining(client)
+    payment_a = await _wait_for_payment_terminal(client, tid_a, tokens)
+    payment_b = await _wait_for_payment_terminal(client, tid_b, tokens)
+    remaining_after = await _get_budget_remaining(client, tokens)
 
     statuses = {payment_a["status"], payment_b["status"]}
     if remaining_after < 0:
@@ -218,8 +242,9 @@ async def main(iterations: int) -> None:
         await _wait_for_reachable(client, APPROVAL_URL, "/approvals/__probe__", "approval")
         await _wait_for_reachable(client, PAYMENT_URL, "/payments/__probe__", "payment")
 
+        tokens = await acquire_tokens(client)
         for i in range(1, iterations + 1):
-            await _run_iteration(client, i)
+            await _run_iteration(client, i, tokens)
 
     print(f"\nVERIFICATION PASSED: {iterations} iteration(s), budget never oversold or negative.")
 
