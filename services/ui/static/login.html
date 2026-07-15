@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ApprovalFlow - Log In</title>
+<script>
+  // Inline, before <body> is parsed - see index.html's head script for the
+  // same reasoning (a bottom-of-body check would flash this login form for
+  // a moment even for an already-logged-in visitor before redirecting them).
+  if (localStorage.getItem("approvalflow_token")) {
+    window.location.replace("index.html");
+  }
+</script>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body class="login-page">
+<div class="login-container">
+<h1>ApprovalFlow</h1>
+
+<form id="login-form">
+  <label for="email">Email
+    <input type="email" id="email" name="email" required autocomplete="username" />
+  </label>
+  <label for="password">Password
+    <input type="password" id="password" name="password" required autocomplete="current-password" />
+  </label>
+  <button type="submit" id="login-button">Log In</button>
+</form>
+
+<p id="login-message" class="message" hidden aria-live="polite"></p>
+
+<details>
+  <summary>New here? Register as a Submitter</summary>
+  <form id="register-form">
+    <label for="register-email">Email
+      <input type="email" id="register-email" name="email" required autocomplete="username" />
+    </label>
+    <label for="register-password">Password
+      <input type="password" id="register-password" name="password" required autocomplete="new-password" />
+    </label>
+    <button type="submit" id="register-button">Register</button>
+  </form>
+</details>
+</div>
+
+<script src="login.js"></script>
+</body>
+</html>

@@ -124,13 +124,16 @@ Redis or the secret store directly. Internal service-to-service traffic is almos
 `decision.completed`, `approval.completed`, `payment.completed`); the one exception is a single
 synchronous **Dapr service invocation** call (Intake → Approval, to enrich a status lookup with
 live approval progress). Everything is logged with structured JSON carrying a correlation id, so
-one submission's path through all eight services can be traced end-to-end.
+one submission's path through all nine services can be traced end-to-end.
 
-**The eight services, in the order a submission flows through them:**
+**The nine services, in the order a submission flows through them:**
 
 - **API Gateway** (Traefik) — the only externally reachable entry point (port `8080`). Routes by
   path prefix to each service, applies a shared rate limit, and serves the static UI. No business
   logic lives here at all.
+- **Auth** — issues JWTs on register/login and seeds the Approver/Admin demo accounts. Every other
+  service's routes are gated by the tokens it issues (N1) — see **Authentication & roles (N1)**
+  below.
 - **Intake** — accepts a submission, returns a tracking id immediately (never blocks on the AI
   call), and checks for duplicates *before* anything else — a duplicate never reaches the agent or
   a payment.
@@ -148,9 +151,10 @@ one submission's path through all eight services can be traced end-to-end.
 - **Audit** — subscribes to the same three completion topics as Notification and projects them
   into one PostgreSQL row per tracking id, giving F9's decision trail and F8's dashboard
   aggregation somewhere real to query from.
-- **UI** — a minimal static HTML/CSS/vanilla-JS app (no build step, no framework) with three
-  pages: submit-and-track, the approver queue, and the aggregate dashboard. It talks to the other
-  services' REST APIs directly through the same gateway the browser is already on.
+- **UI** — a minimal static HTML/CSS/vanilla-JS app (no build step, no framework) with four
+  pages: login, submit-and-track, the approver queue, and the aggregate dashboard. It talks to the
+  other services' REST APIs directly through the same gateway the browser is already on, attaching
+  the JWT from login to every request.
 
 ## Screenshots
 
@@ -181,16 +185,26 @@ install is needed just to run the system.
    ```bash
    docker compose up --build
    ```
-   This starts all eight services, their Dapr sidecars, Redis, PostgreSQL, and the gateway. Give
+   This starts all nine services, their Dapr sidecars, Redis, PostgreSQL, and the gateway. Give
    it a minute, then confirm everything reports healthy:
    ```bash
    docker compose ps
    ```
-3. Open the UI at **http://localhost:8080/ui/index.html**. The approval queue and dashboard are
-   linked from its nav bar (`/ui/approvals.html`, `/ui/dashboard.html`).
+3. Open the UI at **http://localhost:8080/ui/login.html** and log in (N1 — every page requires
+   it). Register a throwaway Submitter account right there, or use one of the seeded demo
+   accounts:
+
+   | Role | Email | Password |
+   |---|---|---|
+   | Approver | `approver@example.com` | `ApproverDemo123!` |
+   | Admin | `admin@example.com` | `AdminDemo123!` |
+
+   The nav bar only shows the tabs your role can use (Submit Invoice for everyone; Approval Queue
+   for Approver/Admin; Dashboard for Admin only) — `/ui/approvals.html`, `/ui/dashboard.html`.
 4. Everything is also a plain REST API through the same gateway — `/invoices`, `/approvals`,
-   `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables under **Details
-   and component highlights** below.
+   `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables and the role
+   matrix under **Details and component highlights** below. Every one of them now requires an
+   `Authorization: Bearer <token>` header from `/auth/login`.
 5. Distributed tracing (N4) is visible at **http://localhost:16686** (Jaeger UI) — every Dapr
    sidecar exports spans automatically, no extra setup needed.
 
@@ -205,9 +219,12 @@ interactively, temporarily add a host port mapping for it in `docker-compose.yml
 This walks through the same four journeys the automated end-to-end suite drives, but by hand,
 through the UI.
 
-**1. Submit an invoice.** Go to **http://localhost:8080/ui/index.html** and fill in the form:
-submitter email, department, vendor, invoice number, currency, category (meals / travel / SaaS /
-hardware / other), a line item (description, quantity, unit price), tax, total, whether a receipt
+**1. Submit an invoice.** Log in first at **http://localhost:8080/ui/login.html** (see **How to
+run** above for demo credentials, or register your own Submitter account there). You'll land on
+**http://localhost:8080/ui/index.html** — the submitter field is pre-filled from your login and
+read-only (N1 always records the authenticated identity server-side, not whatever a client sends).
+Fill in the rest of the form: department, vendor, invoice number, currency, category (meals /
+travel / SaaS / hardware / other), a line item (description, quantity, unit price), tax, total, whether a receipt
 is attached, the invoice date, and optional free-text notes. Submit it — the response is
 immediate (F1): a tracking id and a `PENDING` status, well before the AI has even looked at it.
 
@@ -352,6 +369,40 @@ limit (10 req/s average, burst 50) per client IP to every router, and strips no 
 beyond hiding the port each service would otherwise expose. Decision gets no route at all — it's
 pure choreography, nothing external ever calls it over HTTP.
 
+### Authentication & roles (N1)
+
+**Auth** (`/auth`) — issues JWTs (HS256, 8h expiry) carrying a rank-ordered `Role`
+(`submitter < approver < admin`). Passwords are hashed with stdlib `hashlib.pbkdf2_hmac`
+(260k iterations, per-user salt) — no new dependency for something the stdlib already does
+adequately at this scale. Login failures (unknown email vs. wrong password) return the identical
+generic `401`, so the API can't be used to enumerate registered emails.
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/auth/register` | Self-register — always creates a **Submitter**, regardless of any role in the request body |
+| `POST` | `/auth/login` | Returns a bearer token + its role |
+
+Only Submitter accounts are self-registerable. Approver and Admin exist solely via
+`services/auth/demo_users.json`, seeded at startup — there is no runtime endpoint that can create
+one, a deliberate tightening over letting Approver self-register too.
+
+**Role matrix** — every route below requires *at least* the listed role (an Admin can do
+everything an Approver or Submitter can):
+
+| Role | Can do |
+|---|---|
+| Submitter | `POST /invoices`, `GET /invoices/{id}`, `GET /approvals/{id}`, `POST /approvals/{id}/additional-info`, `GET /payments/{id}` |
+| Approver | everything above, plus `GET /approvals` (the full queue), `POST .../approve`, `POST .../reject`, `POST .../request-info`, `GET /audit/{id}` |
+| Admin | everything above, plus `GET /payments` (all records), `GET /budgets/{department}`, `GET /notifications/{id}`, `GET /audit/summary` |
+
+Single-item lookups by `tracking_id` (e.g. `GET /invoices/{id}`) are open to any authenticated
+role — the caller already has to know the specific id, so this isn't a privacy leak the way a
+*list* endpoint would be. List/aggregate endpoints and every mutating action are role-gated.
+`Invoice.submitter` is always overwritten server-side from the authenticated identity (Intake) —
+a client-supplied value in the request body is silently discarded, closing the obvious spoofing
+angle. `POST /decisions` and every `/events/*` Dapr-subscriber route stay unauthenticated — Decision
+has no gateway route at all, and subscriber calls are internal-only, never reachable from outside
+the Docker network.
+
 **Intake** (`/invoices`) — accepts a submission and immediately hands back a tracking id (F1); the
 AI/router work happens afterward, asynchronously. Builds a dedup key from
 vendor + invoice number + total before publishing anything (F3) — a repeat short-circuits to
@@ -418,14 +469,15 @@ rejections and duplicates too.
 
 **UI** — static HTML/CSS/vanilla JS, no framework, no build step (ADR-010), served by its own
 "logic free" FastAPI app through the gateway's `/ui` prefix. The browser's own JS calls every
-other service's REST API directly through that same gateway (same-origin, no CORS needed). Three
-pages: submit-and-track (`index.html`), the approver queue (`approvals.html`), and the aggregate
-dashboard (`dashboard.html`).
+other service's REST API directly through that same gateway (same-origin, no CORS needed), with
+the JWT from login attached to each request. Four pages: login (`login.html`), submit-and-track
+(`index.html`), the approver queue (`approvals.html`), and the aggregate dashboard
+(`dashboard.html`) — the nav only shows the tabs the logged-in role can actually use.
 
 ## Additional info
 
 - **Logging.** Every service logs structured JSON, and every log line carries the same
-  correlation id (the tracking id) end-to-end, so one submission's path through all eight services
+  correlation id (the tracking id) end-to-end, so one submission's path through all nine services
   can be traced with `docker compose logs <service>` — there's no separate log-shipping setup in
   this project; stdout is the interface.
 - **Configuration.** The autonomy policy text and thresholds are not hard-coded — they're read
@@ -443,8 +495,30 @@ dashboard (`dashboard.html`).
 
 - The system runs over plain HTTP, not HTTPS — acceptable for a local/CI capstone, not for a real
   deployment.
-- No authentication/authorization is implemented (N1, optional nice-to-have) — the approver and
-  submitter UIs are open to anyone who can reach the gateway.
+- **JWT authentication with roles is implemented (N1)** — see **Authentication & roles (N1)**
+  above — with three accepted, documented tradeoffs rather than gaps:
+  - The UI stores the token in `localStorage`, not an `HttpOnly` cookie. An XSS bug on this page
+    could exfiltrate it; acceptable given this project's scope (no third-party scripts are ever
+    loaded), but a real production UI should prefer an `HttpOnly` cookie instead.
+  - `JWT_SECRET` is a plain environment variable (`.env`), the same posture this project already
+    uses for other local secrets — a production deployment should hold it in a real secret store
+    (Dapr's own Secrets API, already used for the LLM key, would be the natural fit) instead.
+  - Single-item lookups (`GET /invoices/{id}`, `GET /approvals/{id}`, `GET /payments/{id}`) are
+    open to any authenticated role rather than restricted to "your own" submissions — there's no
+    per-row ownership check, only the tracking id itself as the access control. This matches the
+    system's existing model (a tracking id is already the only "credential" needed to check
+    status) but is worth calling out explicitly as a tradeoff, not an oversight.
+  - Out of scope for N1: logout/token revocation, password reset, refresh tokens, rate-limiting on
+    `/auth/register` specifically (the gateway's shared rate limit still applies), and an
+    Approver/Admin self-service provisioning UI (by design — see above).
+  - Both authentication (decoding the JWT) and authorization (the per-endpoint role check) are
+    enforced per-service today (`shared/auth.py` + each service's own `require_role(...)` calls) —
+    a deliberate choice at this scale (7 services), not an oversight. At a larger scale,
+    authentication would move to a Dapr sidecar/service-mesh middleware layer (enforced once per
+    sidecar instead of imported into every service), while authorization would stay in each
+    service, since only that service knows its own role matrix. The existing split between
+    `shared/auth.py` (generic) and `require_role(...)` (domain-specific) was already designed so
+    that move would be a targeted swap, not a redesign.
 - Invoice, payment, and budget records currently live in Dapr state (Redis) rather than
   PostgreSQL; this is a documented interim choice, not an oversight (`ARCHITECTURE.md` §8/§9), and
   the repository interfaces are already shaped so the swap doesn't ripple into calling code.

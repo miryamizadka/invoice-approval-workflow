@@ -14,6 +14,7 @@ dependencies = [
     "dapr==1.18.1",
     "dapr-ext-fastapi==1.18.1",
     "asyncpg>=0.29",
+    "pyjwt>=2.9",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,13 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's Depends()/Query()/etc. are deliberately re-evaluated per-request
+# by FastAPI itself (not a real B008 mutable-default-argument bug) - this is
+# ruff's own documented mechanism for that exact interaction, not a blanket
+# B008 suppression.
+extend-immutable-calls = ["fastapi.Depends", "shared.auth.require_role"]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]

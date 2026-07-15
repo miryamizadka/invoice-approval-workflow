@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from services.payment.accessors.payment_gateway import PaymentGateway
@@ -35,6 +35,7 @@ from services.payment.service import (
     PaymentService,
     build_payment_service,
 )
+from shared.auth import AuthenticatedUser, Role, get_current_user, require_role
 from shared.contracts.models import ApprovalCompletedEvent, DecisionCompletedEvent
 
 
@@ -69,12 +70,18 @@ def create_app(
         return {"status": "ok", "service": "payment-service"}
 
     @app.get("/payments", response_model=list[PaymentRecord])
-    async def list_payments(request: Request) -> list[PaymentRecord]:
+    async def list_payments(
+        request: Request, user: AuthenticatedUser = Depends(require_role(Role.ADMIN))
+    ) -> list[PaymentRecord]:
         service: PaymentService = request.app.state.payment_service
         return await service.list_all()
 
     @app.get("/payments/{tracking_id}", response_model=PaymentRecord)
-    async def get_payment(tracking_id: str, request: Request) -> PaymentRecord:
+    async def get_payment(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> PaymentRecord:
         service: PaymentService = request.app.state.payment_service
         try:
             return await service.get(tracking_id)
@@ -82,7 +89,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="tracking_id not found") from exc
 
     @app.get("/budgets/{department}", response_model=Budget)
-    async def get_budget(department: str, request: Request) -> Budget:
+    async def get_budget(
+        department: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.ADMIN)),
+    ) -> Budget:
         service: PaymentService = request.app.state.payment_service
         try:
             return await service.get_budget(department)
