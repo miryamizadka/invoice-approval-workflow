@@ -97,9 +97,13 @@ def test_decode_rejects_a_token_signed_with_a_different_algorithm() -> None:
 
 
 def test_decode_rejects_an_unsigned_none_algorithm_token() -> None:
+    # key="" (not None) - a plain valid str under any PyJWT stub version, so
+    # this doesn't need a type: ignore that could itself become an "unused
+    # ignore" error under a different stub version (as happened in CI).
+    # algorithm="none" means PyJWT never actually uses the key value anyway.
     token = jwt.encode(
         {"sub": "alice@example.com", "role": "admin", "iat": int(time.time())},
-        key=None,  # type: ignore[arg-type]
+        key="",
         algorithm="none",
     )
 
