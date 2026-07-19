@@ -38,7 +38,11 @@ select = ["E", "F", "I", "UP", "B"]
 # by FastAPI itself (not a real B008 mutable-default-argument bug) - this is
 # ruff's own documented mechanism for that exact interaction, not a blanket
 # B008 suppression.
-extend-immutable-calls = ["fastapi.Depends", "shared.auth.require_role"]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "shared.auth.require_role",
+    "shared.rate_limiter.throttle_by_user",
+]
 
 [tool.mypy]
 plugins = ["pydantic.mypy"]
