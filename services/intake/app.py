@@ -6,6 +6,7 @@ Endpoints only call IntakeService; all business logic lives there.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
@@ -15,6 +16,7 @@ from services.intake.approval_status_client import (
     ApprovalStatusClient,
     DaprApprovalStatusClient,
 )
+from services.intake.bulkhead_approval_status_client import BulkheadApprovalStatusClient
 from services.intake.dapr_state_repository import DaprStateInvoiceRepository
 from services.intake.decision_completed_publisher import (
     DaprDecisionCompletedPublisher,
@@ -27,6 +29,13 @@ from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
 from shared.auth import AuthenticatedUser, get_current_user
 from shared.contracts.models import DecisionCompletedEvent, Invoice
+from shared.rate_limiter import DaprStateRateLimiter, RateLimiter, throttle_by_user
+
+_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT = 20  # comfortably above verify_phase8's
+# own measured peak (7 submissions under one identity in a single run,
+# 2-6 more under separately-acquired identities from concurrency_check) -
+# a real anti-flood ceiling, not a limit that would trip live verification.
+_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS = 60
 
 
 def create_app(
@@ -34,17 +43,38 @@ def create_app(
     publisher: DecisionPublisher | None = None,
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
     approval_status_client: ApprovalStatusClient | None = None,
+    rate_limiter: RateLimiter | None = None,
+    invoice_submit_rate_limit: int | None = None,
+    invoice_submit_rate_limit_window_seconds: int | None = None,
 ) -> FastAPI:
     configure_logging()
+    # N3: wrapped unconditionally, including under test - existing stub
+    # clients are instant (no sleep), so always-on wrapping is harmless and
+    # keeps bulkhead behavior uniformly active rather than silently
+    # disabled whenever a caller injects its own client.
     intake_service = build_intake_service(
         repository or DaprStateInvoiceRepository(),
         publisher or DaprDecisionPublisher(),
         decision_completed_publisher or DaprDecisionCompletedPublisher(),
-        approval_status_client or DaprApprovalStatusClient(),
+        BulkheadApprovalStatusClient(approval_status_client or DaprApprovalStatusClient()),
     )
+    resolved_invoice_submit_rate_limit = invoice_submit_rate_limit
+    if resolved_invoice_submit_rate_limit is None:
+        resolved_invoice_submit_rate_limit = int(
+            os.environ.get("INVOICE_SUBMIT_RATE_LIMIT", str(_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT))
+        )
+    resolved_invoice_submit_rate_limit_window_seconds = invoice_submit_rate_limit_window_seconds
+    if resolved_invoice_submit_rate_limit_window_seconds is None:
+        resolved_invoice_submit_rate_limit_window_seconds = int(
+            os.environ.get(
+                "INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS",
+                str(_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS),
+            )
+        )
 
     app = FastAPI(title="ApprovalFlow Intake Service")
     app.state.intake_service = intake_service
+    app.state.rate_limiter = rate_limiter or DaprStateRateLimiter()
     dapr_app = DaprApp(app)
 
     @app.get("/health")
@@ -57,7 +87,13 @@ def create_app(
         background_tasks: BackgroundTasks,
         request: Request,
         response: Response,
-        user: AuthenticatedUser = Depends(get_current_user),
+        user: AuthenticatedUser = Depends(
+            throttle_by_user(
+                scope="invoice_submit",
+                limit=resolved_invoice_submit_rate_limit,
+                window_seconds=resolved_invoice_submit_rate_limit_window_seconds,
+            )
+        ),
     ) -> dict[str, str]:
         # N1 anti-spoofing: submitter is always the authenticated identity,
         # never trusted from the client payload - model_copy works fine on

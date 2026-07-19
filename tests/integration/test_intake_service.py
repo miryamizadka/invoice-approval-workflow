@@ -33,6 +33,7 @@ from shared.contracts.models import (
     RecommendationType,
     Route,
 )
+from shared.rate_limiter import InMemoryRateLimiter, RateLimiter
 from tests.support.event_fixtures import decision_completed_event
 
 _TEST_SUBMITTER_EMAIL = "test-submitter@example.com"
@@ -83,13 +84,23 @@ def _build_app(
     repository: InvoiceRepository | None = None,
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
     approval_status_client: ApprovalStatusClient | None = None,
+    rate_limiter: RateLimiter | None = None,
+    invoice_submit_rate_limit: int | None = None,
 ) -> FastAPI:
+    # N3: rate_limiter defaults to InMemoryRateLimiter(), not create_app()'s
+    # own DaprStateRateLimiter() default - without this, the first POST
+    # /invoices in any test would try to construct a real DaprClient()
+    # (blocks up to 60s retrying a sidecar health check with none running
+    # in plain pytest), same reasoning as every other repository/publisher
+    # default here.
     app = create_app(
         repository=repository or InMemoryInvoiceRepository(),
         publisher=publisher,
         decision_completed_publisher=decision_completed_publisher
         or _StubDecisionCompletedPublisher(),
         approval_status_client=approval_status_client or _NeverCalledApprovalStatusClient(),
+        rate_limiter=rate_limiter or InMemoryRateLimiter(),
+        invoice_submit_rate_limit=invoice_submit_rate_limit,
     )
     app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
         sub=_TEST_SUBMITTER_EMAIL, role=Role.SUBMITTER
@@ -408,3 +419,20 @@ def test_submit_forces_submitter_to_the_authenticated_identity() -> None:
 
     status = client.get(f"/invoices/{tracking_id}")
     assert status.json()["invoice"]["submitter"] == _TEST_SUBMITTER_EMAIL
+
+
+# --- N3: per-identity throttling on submission -------------------------------
+
+
+def test_submit_returns_429_once_the_per_identity_limit_is_reached() -> None:
+    """A tiny limit override (not the production default of 20) - proves
+    the throttle actually gates this route, without needing 21 real POSTs."""
+    app = _build_app(_StubPublisher(), invoice_submit_rate_limit=2)
+    client = TestClient(app)
+
+    client.post("/invoices", json=_invoice_body())
+    client.post("/invoices", json=_invoice_body())
+    third = client.post("/invoices", json=_invoice_body())
+
+    assert third.status_code == 429
+    assert "Retry-After" in third.headers

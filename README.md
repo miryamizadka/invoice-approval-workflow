@@ -204,7 +204,9 @@ install is needed just to run the system.
 4. Everything is also a plain REST API through the same gateway — `/invoices`, `/approvals`,
    `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables and the role
    matrix under **Details and component highlights** below. Every one of them now requires an
-   `Authorization: Bearer <token>` header from `/auth/login`.
+   `Authorization: Bearer <token>` header from `/auth/login`. `POST /invoices`, `POST
+   /auth/register`, and `POST /auth/login` can also return `429` if throttled (N3) — see
+   **Known issues / limitations** for the per-identity limits.
 5. Distributed tracing (N4) is visible at **http://localhost:16686** (Jaeger UI) — every Dapr
    sidecar exports spans automatically, no extra setup needed.
 
@@ -508,9 +510,10 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
     per-row ownership check, only the tracking id itself as the access control. This matches the
     system's existing model (a tracking id is already the only "credential" needed to check
     status) but is worth calling out explicitly as a tradeoff, not an oversight.
-  - Out of scope for N1: logout/token revocation, password reset, refresh tokens, rate-limiting on
-    `/auth/register` specifically (the gateway's shared rate limit still applies), and an
-    Approver/Admin self-service provisioning UI (by design — see above).
+  - Out of scope for N1: logout/token revocation, password reset, refresh tokens, and an
+    Approver/Admin self-service provisioning UI (by design — see above). Dedicated per-identity
+    throttling on `/auth/register`/`/auth/login` was out of scope for N1 specifically but is now
+    implemented — see **N3 Reliability** below.
   - Both authentication (decoding the JWT) and authorization (the per-endpoint role check) are
     enforced per-service today (`shared/auth.py` + each service's own `require_role(...)` calls) —
     a deliberate choice at this scale (7 services), not an oversight. At a larger scale,
@@ -535,6 +538,19 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
   initial Gateway→service HTTP hop isn't part of the same trace, since that traffic bypasses the
   Dapr sidecar entirely (see `ARCHITECTURE.md` §12). Prometheus/Grafana metrics remain
   unimplemented.
+- **Bulkhead + Throttling are implemented (N3)** — see `ARCHITECTURE.md` §12 for the full design
+  (defaults, live-verified 429 behavior, and why the two mechanisms exist where they do). One
+  accepted limitation, found and confirmed live (not assumed) while building this: Dapr's Redis
+  state store silently ignores per-operation TTL metadata on `execute_state_transaction()` — a
+  `redis-cli TTL` check after a direct write confirmed no expiry was actually set, even though the
+  identical metadata works on a plain `save_state()` call. Switching to `save_state()` to get real
+  TTL was considered and rejected: its ETag-conflict path raises a different, less-trusted
+  exception type than the one this project's Dapr-state repositories already rely on for correct
+  concurrent writes (same reason `DaprStateBudgetRepository` avoids it too). Correctness of the
+  rate-limit counter was kept over self-cleaning storage — rate-limit keys accumulate in Redis
+  without auto-expiry; a real, accepted trade-off, not a silent gap. Outbox pattern (the third N3
+  checklist item) remains unimplemented — deferred to its own future pass (a genuine architectural
+  migration to Postgres for the affected repositories, not a bolt-on addition).
 
 ## Documentation map
 

@@ -581,9 +581,19 @@ pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow
 
 ## N3 Reliability
 
-- [ ] Outbox pattern
-- [ ] Bulkhead
-- [ ] Throttling
+- [ ] Outbox pattern - deferred to its own separate future pass (genuine
+  architectural migration to Postgres for the affected repositories, not
+  a bolt-on addition).
+- [x] Bulkhead - `shared/bulkhead.py` (semaphore + timeout), wrapping
+  Decision→Groq (`BulkheadLLMProvider`) and Intake→Approval
+  (`BulkheadApprovalStatusClient`), the two call sites not already
+  decoupled via async Dapr pub/sub. Live-verified via `scripts/verify_phase8.py`
+  (exercises the real Groq call for INV-1013).
+- [x] Throttling - `shared/rate_limiter.py` (per-identity fixed-window
+  counters, Dapr-state-backed) on `POST /invoices` and, dual-keyed by
+  email + source IP, `POST /auth/register`/`POST /auth/login`. Live-verified:
+  a real `curl` loop against the running gateway confirmed a 429 with
+  `Retry-After` on the 6th rapid `/auth/register` call.
 
 
 ## N4 OpenTelemetry
