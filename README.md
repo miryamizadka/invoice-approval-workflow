@@ -33,7 +33,7 @@ Actions · Docker / Docker Compose · static HTML/CSS/vanilla JS (no frontend fr
 
 ## Bird's-eye view
 
-The system is eight containers plus their Dapr sidecars, Redis (state store + pub/sub broker),
+The system is nine containers plus their Dapr sidecars, Redis (state store + pub/sub broker),
 PostgreSQL (audit trail), and a Traefik gateway sitting in front of all of it as the single
 external entry point.
 
@@ -45,12 +45,17 @@ flowchart TB
         GW["Routing + rate limit<br/>single external entry point"]
     end
 
+    GW -->|REST| AUTH
     GW -->|REST| IN
     GW -->|REST| AP
     GW -->|REST| PM
     GW -->|REST| NT
     GW -->|REST| AU
     GW -->|static files| UISV
+
+    subgraph CROSSCUT["Cross-cutting infrastructure (N1)"]
+        AUTH["Auth<br/>issues JWTs on register/login"]
+    end
 
     subgraph MANAGERS["Manager layer - orchestrate a use case"]
         IN["Intake<br/>Manager"]
@@ -114,7 +119,7 @@ flowchart TB
     DA --> PG
 ```
 
-Solid arrows are synchronous REST or the one Dapr service-invocation call; dashed arrows are asynchronous Dapr pub/sub. The Manager/Engine/Accessor/Resource grouping isn't decorative — it's the actual IDesign layering the codebase follows (`ARCHITECTURE.md` §5): dependencies only ever point downward, and services never call each other directly, only sideways through events.
+Solid arrows are synchronous REST or the one Dapr service-invocation call; dashed arrows are asynchronous Dapr pub/sub. The Manager/Engine/Accessor/Resource grouping isn't decorative — it's the actual IDesign layering the codebase follows (`ARCHITECTURE.md` §5): dependencies only ever point downward, and services never call each other directly, only sideways through events. **Auth** sits outside that grouping deliberately — it's cross-cutting infrastructure (the same category as the Gateway's routing/rate-limiting), not a use-case-orchestrating Manager, even though it's *implemented* with the exact same Manager/Accessor layering internally (`AuthService` / `UserRepository`). Every other service verifies a JWT **locally** (`shared/auth.py`, stateless HS256) — none of them call Auth over the network per request; Auth is only ever called directly for `/auth/register`/`/auth/login` themselves.
 
 A Dapr sidecar rides next to every service (except the gateway and the static UI, which have no
 business state of their own), handling service discovery, pub/sub delivery and retries, state
