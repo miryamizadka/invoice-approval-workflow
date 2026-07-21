@@ -12,6 +12,7 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
 ```mermaid 
     flowchart TD
     UI[Submitter UI] --> GW[API Gateway]
+    GW --> AUTH[Auth Service - issues JWTs, N1]
     GW --> IN[Intake Service]
     IN --> DEC[Decision Service - Agent plus Router]
     DEC --> PAY[Payment Service - Saga]
@@ -25,6 +26,11 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
     APP --> AUD
     PAY --> AUD
 ```
+Auth is drawn as a peer of the other Gateway-routed services (it has its own container, per §4), but
+it's called directly only for `/auth/register`/`/auth/login` - every other service verifies a JWT
+locally (stateless HS256, `shared/auth.py`), not by calling Auth per request. See §12 for why Auth is
+classified as cross-cutting infrastructure rather than a use-case Manager, despite being implemented
+as a full service.
 
 
 ## 4. Service Decomposition
@@ -32,6 +38,7 @@ ApprovalFlow
 | Service | Single responsibility | API | Dapr block | DB |
 |---|---|---|---|---|
 | API Gateway | Routing, single entry point, rate limit | REST (external) | — | — |
+| Auth | Issue/verify JWTs (register, login), seed demo Approver/Admin accounts (N1) | REST (external) | state | users |
 | Intake | Accept submission, tracking id, detect duplicates | REST + pub | service invocation, pub/sub | invoices |
 | Decision | Agent recommendation + deterministic router | pub/sub (async) | pub/sub, state, secrets | decisions |
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
@@ -42,6 +49,8 @@ ApprovalFlow
 
 
 **API Gateway** - Single entry point, routes requests for services, enforce rate limiting, hide internal structure, logic free. It is the only externally supported entry point; internal service-to-service traffic remains direct over the Docker network (Dapr pub/sub) - the gateway never sits between internal services, only at the system's outer boundary. See §7 for the concrete implementation (Traefik).
+
+**Auth (N1)** - Issues JWTs on `POST /auth/register`/`POST /auth/login` and seeds the demo Approver/Admin accounts at startup; every other service's routes are gated by the tokens it issues, verified locally (stateless HS256, `shared/auth.py`) rather than by calling Auth per request. Internally it follows the exact same IDesign layering as every other service (`AuthService` Manager, `UserRepository` Accessor) - but see §5/§12 for why it's classified as cross-cutting infrastructure (like the Gateway) rather than a use-case-orchestrating Manager alongside Intake/Approval/Payment. Only Submitter accounts are self-registerable; Approver/Admin exist only via a seed file, never a runtime endpoint.
 
 **Intake** - Receives the submission, returns a tracking id immediately (F1, non-blocking), and checks for duplicates (F3) before anything else. If it's a duplicate, it short-circuits without invoking Decision - no second agent call, no second payment. Otherwise it publishes an event for processing. Its single responsibility is intake and de-duplication.
 
@@ -70,6 +79,10 @@ The service decomposition follows IDesign's volatility-based layering rather tha
 - **Resources** (the actual, most stable sources): PostgreSQL, Redis, the external LLM, and the policy configuration — all run as containers via docker-compose.
 
 Dependencies flow strictly downward (Manager → Engine → Accessor → Resource), and services communicate sideways only through asynchronous events, never direct calls — consistent with IDesign's rules.
+
+**Where Auth (N1) fits:** internally it has the same shape as every domain service - `AuthService` is a Manager (`register`/`login`), `UserRepository` is an Accessor (Dapr state, same Protocol+DaprState+InMemory pattern as every other repository in this codebase). But it isn't counted alongside Intake/Approval/Payment above, because it doesn't orchestrate a *business* use-case with flow volatility of its own - authentication is generic, domain-agnostic infrastructure, the same category of concern as the Gateway's routing/rate-limiting (§12 makes this argument in full, including why it would move to a service-mesh layer at a larger scale). It's implemented as a full service rather than gateway config only because issuing/verifying JWTs and hashing passwords needs real logic and a user store, unlike the Gateway's purely declarative Traefik config.
+
+**Where Bulkhead/Throttling (N3) fit:** `shared/bulkhead.py`/`shared/rate_limiter.py` aren't a new layer or new services - they're cross-cutting *wrappers* around two existing Accessor-layer call sites (`BulkheadLLMProvider` wraps the LLM Accessor, `BulkheadApprovalStatusClient` wraps the Dapr service-invocation Accessor) and two existing Manager-layer route handlers (`POST /invoices`, `POST /auth/register`/`login`), added at the construction site only - `Decider`, `IntakeService`, and `AuthService` themselves are unchanged. `shared/` holds only cross-service, domain-agnostic primitives (JWT auth, Dapr client wrapping, resiliency primitives, wire contracts) — never business/domain logic - so `shared/bulkhead.py` and `shared/rate_limiter.py` belong there for the same reason `shared/auth.py` does.
 
 
 ## 6. Technology Stack
