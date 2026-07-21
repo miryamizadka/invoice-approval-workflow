@@ -6,6 +6,9 @@ NotificationService; all business logic lives there.
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
@@ -24,6 +27,7 @@ from shared.contracts.models import (
     DecisionCompletedEvent,
     PaymentCompletedEvent,
 )
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 def create_app(
@@ -36,7 +40,21 @@ def create_app(
         channel or LoggingNotificationChannel(),
     )
 
-    app = FastAPI(title="ApprovalFlow Notification Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
+        yield
+
+    app = FastAPI(title="ApprovalFlow Notification Service", lifespan=_lifespan)
     app.state.notification_service = notification_service
     dapr_app = DaprApp(app)
 

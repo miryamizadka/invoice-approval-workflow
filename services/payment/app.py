@@ -11,6 +11,7 @@ docstring for the resulting TestClient usage requirement.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -37,6 +38,7 @@ from services.payment.service import (
 )
 from shared.auth import AuthenticatedUser, Role, get_current_user, require_role
 from shared.contracts.models import ApprovalCompletedEvent, DecisionCompletedEvent
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 def create_app(
@@ -58,6 +60,16 @@ def create_app(
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         for department, total in load_budgets().items():
             await resolved_budget_repository.ensure_seeded(department, total)
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
         yield
 
     app = FastAPI(title="ApprovalFlow Payment Service", lifespan=_lifespan)

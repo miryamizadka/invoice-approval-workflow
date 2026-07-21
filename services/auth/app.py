@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from services.auth.dapr_state_repository import DaprStateUserRepository
 from services.auth.demo_users_seeder import seed_demo_users
+from services.auth.logging_config import configure_logging
 from services.auth.models import LoginRequest, LoginResponse, RegisterRequest, RegisterResponse
 from services.auth.rate_limit import throttle_login, throttle_register
 from services.auth.repository import (
@@ -28,6 +29,7 @@ from services.auth.repository import (
     UserRepository,
 )
 from services.auth.service import AuthService, build_auth_service
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr
 from shared.rate_limiter import DaprStateRateLimiter, RateLimiter
 
 _DEFAULT_AUTH_REGISTER_RATE_LIMIT = 5  # comfortably above verify_auth.py's
@@ -49,6 +51,7 @@ def create_app(
     auth_login_rate_limit: int | None = None,
     auth_login_rate_limit_window_seconds: int | None = None,
 ) -> FastAPI:
+    configure_logging()
     resolved_repository = repository or DaprStateUserRepository()
     auth_service = build_auth_service(resolved_repository)
 
@@ -84,6 +87,28 @@ def create_app(
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await seed_demo_users(resolved_repository)
+        # M5/N1: overrides the env-var-based secret with one built from
+        # Dapr's secret store, if JWT_SECRET_DAPR_ENABLED=true and a value
+        # is available - same fetch-once, resilient-fallback posture as
+        # Decision's own GROQ_API_KEY override (dapr_secret_loader.py).
+        # Gated behind an explicit flag, not called unconditionally: like
+        # Decision's LLM_PROVIDER=groq gate, this avoids DaprClient()'s
+        # constructor blocking up to 60s in any test that triggers this
+        # lifespan (`with TestClient(app) as client:`) without a real
+        # sidecar reachable.
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            if dapr_secret:
+                # A genuinely new secret was found - tokens issued from now
+                # on use it. Existing tokens already issued/verified against
+                # the env-var secret remain valid only as long as the two
+                # values happen to match; this is a startup-time swap, never
+                # a live hot-reload mid-request (same posture as every other
+                # Dapr-sourced value in this project).
+                app.state.auth_service = build_auth_service(
+                    resolved_repository, jwt_secret=dapr_secret
+                )
+                logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
         yield
 
     app = FastAPI(title="ApprovalFlow Auth Service", lifespan=_lifespan)

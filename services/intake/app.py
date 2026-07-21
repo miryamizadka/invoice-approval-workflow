@@ -6,7 +6,10 @@ Endpoints only call IntakeService; all business logic lives there.
 
 from __future__ import annotations
 
+import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
@@ -29,6 +32,7 @@ from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
 from shared.auth import AuthenticatedUser, get_current_user
 from shared.contracts.models import DecisionCompletedEvent, Invoice
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 from shared.rate_limiter import DaprStateRateLimiter, RateLimiter, throttle_by_user
 
 _DEFAULT_INVOICE_SUBMIT_RATE_LIMIT = 20  # comfortably above verify_phase8's
@@ -72,7 +76,26 @@ def create_app(
             )
         )
 
-    app = FastAPI(title="ApprovalFlow Intake Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5/N1: app.state.jwt_secret is what shared/auth.py's
+        # get_current_user prefers over the JWT_SECRET env var (see
+        # shared/jwt_secret_loader.py). Gated behind an explicit flag, not
+        # called unconditionally: DaprClient()'s constructor blocks up to
+        # 60s if no sidecar is reachable, which would hang any test that
+        # triggers this lifespan (`with TestClient(app) as client:`) without
+        # a real sidecar running - same reasoning as Decision's own
+        # LLM_PROVIDER=groq gate around its GROQ_API_KEY fetch.
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
+        yield
+
+    app = FastAPI(title="ApprovalFlow Intake Service", lifespan=_lifespan)
     app.state.intake_service = intake_service
     app.state.rate_limiter = rate_limiter or DaprStateRateLimiter()
     dapr_app = DaprApp(app)
