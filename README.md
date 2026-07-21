@@ -490,9 +490,9 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
 - **Configuration.** The autonomy policy text and thresholds are not hard-coded — they're read
   once at startup from Dapr's configuration store, changeable by writing directly to the backing
   Redis key and restarting the Decision container, no code change or rebuild required (M13).
-- **Secrets.** The LLM API key is fetched through Dapr's Secrets API rather than read from an
-  environment variable directly, so swapping to a production secret backend later needs no
-  application code change (M5).
+- **Secrets.** The LLM API key and the JWT signing key are both fetched through Dapr's Secrets
+  API rather than read from an environment variable directly, so swapping to a production secret
+  backend later needs no application code change (M5, N1).
 - **State.** Each service owns its own data — no service reads another's store directly, only
   through events. PostgreSQL currently backs only the Audit trail; the other services' data lives
   in Dapr state (Redis) as an interim choice (see `ARCHITECTURE.md` §8/§9 for the exact migration
@@ -507,9 +507,12 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
   - The UI stores the token in `localStorage`, not an `HttpOnly` cookie. An XSS bug on this page
     could exfiltrate it; acceptable given this project's scope (no third-party scripts are ever
     loaded), but a real production UI should prefer an `HttpOnly` cookie instead.
-  - `JWT_SECRET` is a plain environment variable (`.env`), the same posture this project already
-    uses for other local secrets — a production deployment should hold it in a real secret store
-    (Dapr's own Secrets API, already used for the LLM key, would be the natural fit) instead.
+  - `JWT_SECRET` now goes through Dapr's Secrets API (`shared/jwt_secret_loader.py`), the same
+    mechanism already used for the LLM key — closed, not just noted as the natural fit anymore.
+    The env var remains the fallback if the store is empty/unreachable, and tests/CI leave the
+    Dapr attempt disabled (`JWT_SECRET_DAPR_ENABLED` unset) since `secretstores.local.env` is
+    itself just a thin indirection over the same `.env` value in this project's local setup — see
+    `ARCHITECTURE.md`'s Secrets (M5) section for what this mechanism does and doesn't buy.
   - Single-item lookups (`GET /invoices/{id}`, `GET /approvals/{id}`, `GET /payments/{id}`) are
     open to any authenticated role rather than restricted to "your own" submissions — there's no
     per-row ownership check, only the tracking id itself as the access control. This matches the

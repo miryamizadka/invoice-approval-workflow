@@ -95,8 +95,15 @@ async def get_current_user(request: Request) -> AuthenticatedUser:
     if not header or not header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
     token = header.removeprefix("Bearer ")
+    # app.state.jwt_secret (M5/N1) is set once at startup by each service's
+    # lifespan (see shared/jwt_secret_loader.py) when a Dapr-sourced secret
+    # was resolved - it takes precedence over the env var, never a fallback
+    # to it. getattr(..., None): no lifespan ran (e.g. a bare TestClient(app)
+    # never triggers lifespan at all) or the flag was never enabled - falls
+    # back to _get_secret() exactly as before this change.
+    secret = getattr(request.app.state, "jwt_secret", None) or _get_secret()
     try:
-        return decode_token(token, secret=_get_secret())
+        return decode_token(token, secret=secret)
     except TokenError as exc:
         raise HTTPException(status_code=401, detail="invalid or expired token") from exc
 

@@ -53,6 +53,7 @@ services:
     command: uvicorn services.intake.app:app --host 0.0.0.0 --port 8000
     environment:
       - DECISION_SERVICE_URL=http://decision:8001
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
     depends_on:
@@ -95,6 +96,8 @@ services:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.approval.app:app --host 0.0.0.0 --port 8002
+    environment:
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
     healthcheck:
@@ -115,6 +118,7 @@ services:
       # compensation journey demonstrable with a plain `docker compose up`,
       # at zero cost to every other invoice (only this one id ever fails).
       - PAYMENT_SIMULATE_FAILURE_IDS=INV-1012
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
     healthcheck:
@@ -131,6 +135,8 @@ services:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.notification.app:app --host 0.0.0.0 --port 8004
+    environment:
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
     healthcheck:
@@ -152,6 +158,7 @@ services:
       - POSTGRES_USER=approvalflow
       - POSTGRES_PASSWORD=approvalflow
       - POSTGRES_DB=approvalflow
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
     depends_on:
@@ -237,6 +244,14 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # secretstores.local.env (dapr/components/secretstore.yaml, M5/N1) reads
+    # from THIS container's own process env, not intake's - the sidecar and
+    # the app share a network namespace but not an environment, so
+    # JWT_SECRET needs to be loaded here too for the secret store to see it
+    # (same reasoning decision-dapr's own comment below already documents
+    # for GROQ_API_KEY).
     network_mode: "service:intake"
     depends_on:
       intake:
@@ -305,6 +320,11 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # JWT_SECRET needed here too (secretstores.local.env reads the
+    # sidecar's own env) - see intake-dapr's comment above for the full
+    # reasoning.
     network_mode: "service:approval"
     depends_on:
       approval:
@@ -333,6 +353,9 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # JWT_SECRET needed here too - see intake-dapr's comment above.
     network_mode: "service:payment"
     depends_on:
       payment:
@@ -361,6 +384,9 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # JWT_SECRET needed here too - see intake-dapr's comment above.
     network_mode: "service:notification"
     depends_on:
       notification:
@@ -378,12 +404,21 @@ services:
       context: .
       dockerfile: Dockerfile
     command: uvicorn services.auth.app:app --host 0.0.0.0 --port 8007
+    environment:
+      - JWT_SECRET_DAPR_ENABLED=true
     env_file:
       - .env
-    # JWT_SECRET (and optional JWT_EXPIRY_HOURS) read directly from this
-    # container's own env - plain env var, not Dapr secrets, deliberately
-    # (N1 design - this isn't the documented M5 concern, not expanding its
-    # scope without reason).
+    # JWT_SECRET (and optional JWT_EXPIRY_HOURS) still read directly from
+    # this container's own env as the fail-fast fallback at construction
+    # (unchanged - see services/auth/service.py) - but M5/N1 now also route
+    # it through Dapr's Secrets API, same mechanism GROQ_API_KEY already
+    # used (dapr_secret_loader.py): shared/jwt_secret_loader.py fetches it
+    # once at startup via auth-dapr's sidecar, and every service that
+    # verifies a JWT (not just Auth that issues one) reads the same
+    # Dapr-sourced value through app.state.jwt_secret (shared/auth.py).
+    # JWT_SECRET_DAPR_ENABLED gates the attempt (see shared/jwt_secret_loader.py's
+    # module docstring for why - avoids DaprClient()'s 60s constructor block
+    # in tests, which don't set this flag).
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health')"]
       interval: 10s
@@ -408,6 +443,11 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # JWT_SECRET needed here too - see intake-dapr's comment above. Auth is
+    # the one service that both issues (login) and verifies JWTs, both
+    # through this same Dapr-sourced secret (services/auth/app.py).
     network_mode: "service:auth"
     depends_on:
       auth:
@@ -439,6 +479,9 @@ services:
       - "/components/tracing.yaml"
     volumes:
       - "./dapr/components:/components:ro"
+    env_file:
+      - .env
+    # JWT_SECRET needed here too - see intake-dapr's comment above.
     network_mode: "service:audit"
     depends_on:
       audit:

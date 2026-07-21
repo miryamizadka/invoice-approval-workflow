@@ -10,6 +10,7 @@ seeding - same `asynccontextmanager` pattern.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -18,6 +19,7 @@ from dapr.ext.fastapi import DaprApp
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from services.audit.logging_config import configure_logging
 from services.audit.models import DashboardSummary
 from services.audit.postgres_repository import PostgresAuditRepository
 from services.audit.repository import AuditRepository
@@ -28,15 +30,27 @@ from shared.contracts.models import (
     DecisionCompletedEvent,
     PaymentCompletedEvent,
 )
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 def create_app(repository: AuditRepository | None = None) -> FastAPI:
+    configure_logging()
     resolved_repository = repository or PostgresAuditRepository()
     audit_service = build_audit_service(resolved_repository)
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await resolved_repository.ensure_schema()
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
         yield
 
     app = FastAPI(title="ApprovalFlow Audit Service", lifespan=_lifespan)

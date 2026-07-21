@@ -192,3 +192,57 @@ def test_require_role_rejects_with_no_token_at_all() -> None:
     response = client.get("/approver-only")
 
     assert response.status_code == 401
+
+
+# --- app.state.jwt_secret (M5/N1: Dapr-sourced secret) takes precedence ----
+
+
+def test_get_current_user_accepts_token_signed_with_app_state_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """app.state.jwt_secret is how each service's lifespan hands over a
+    Dapr-resolved secret (see shared/jwt_secret_loader.py) - it must win
+    over the JWT_SECRET env var, not just be an equally-valid alternative."""
+    monkeypatch.setenv("JWT_SECRET", "env-secret-should-not-be-used")
+    app = _build_test_app()
+    app.state.jwt_secret = "state-secret"
+    client = TestClient(app)
+    token = create_access_token(
+        subject="dave@example.com", role=Role.SUBMITTER, secret="state-secret"
+    )
+
+    response = client.get("/whoami", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert response.json()["sub"] == "dave@example.com"
+
+
+def test_get_current_user_rejects_env_secret_token_when_app_state_secret_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proves precedence, not just "also works": a token signed with the env
+    secret must be rejected once app.state.jwt_secret names a different
+    value - otherwise both secrets would be silently accepted at once."""
+    monkeypatch.setenv("JWT_SECRET", "env-secret")
+    app = _build_test_app()
+    app.state.jwt_secret = "state-secret"
+    client = TestClient(app)
+    token = create_access_token(
+        subject="dave@example.com", role=Role.SUBMITTER, secret="env-secret"
+    )
+
+    response = client.get("/whoami", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 401
+
+
+def test_get_current_user_falls_back_to_env_when_app_state_secret_not_set() -> None:
+    """No service lifespan has run (or Dapr/the flag was never enabled) -
+    app.state has no jwt_secret attribute at all. Must fall back to the env
+    var exactly as before this change, not raise AttributeError."""
+    client = TestClient(_build_test_app())
+    token = create_access_token(subject="erin@example.com", role=Role.SUBMITTER, secret=SECRET)
+
+    response = client.get("/whoami", headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200

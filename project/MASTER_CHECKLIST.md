@@ -304,7 +304,16 @@ ETag optimistic concurrency (INV-1014), not just simple save/get.
   `llm_provider_rebuilt_from_dapr_secret`; with `decision-dapr` unreachable, the service still
   starts and serves correctly on the env-var fallback [warning logged, not a crash];
   `verify_phase8` including the real-LLM INV-1013 anti-cheese test passes against the
-  secret-sourced provider)
+  secret-sourced provider. **Extended to `JWT_SECRET` (N1)**: `shared/jwt_secret_loader.py`
+  (identical I/O-vs-pure split, `secretstore.yaml`'s scopes widened to all six services that
+  issue/verify a JWT) is read once at startup by each of them and takes precedence via
+  `app.state.jwt_secret` over the `JWT_SECRET` env var (`shared/auth.py`'s `get_current_user`) -
+  gated behind `JWT_SECRET_DAPR_ENABLED` (unset in tests/CI, `true` in `docker-compose.yml`) for
+  the same reason Decision's own fetch is gated behind `LLM_PROVIDER=groq`: `DaprClient()`'s
+  constructor blocks up to 60s with no sidecar reachable, which would otherwise hang every test
+  that triggers a service's lifespan. Closes the gap `README.md`'s Known Limitations previously
+  documented explicitly ("a production deployment should hold it in a real secret store... the
+  natural fit").)
 
 
 ## M6 — API Gateway
