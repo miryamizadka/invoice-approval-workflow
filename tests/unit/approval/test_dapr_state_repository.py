@@ -9,6 +9,7 @@ once (see module docstring on DaprStateApprovalRepository for invariants).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -27,24 +28,42 @@ from tests.support.decision_fixtures import clean_invoice
 
 
 class _FakeStateResponse:
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, etag: str = "") -> None:
         self.data = data
+        self.etag = etag
 
 
 class _FakeDaprStateClient:
-    def __init__(self, *, raise_on_transaction: bool = False) -> None:
+    """Tracks a per-key etag, incrementing on every successful write via
+    execute_state_transaction - same fixture shape as Payment's, close
+    enough to real Redis-backed Dapr state to exercise the
+    optimistic-concurrency read-check-write loop."""
+
+    def __init__(self, *, fail_transactions: int = 0) -> None:
         self.store: dict[str, str] = {}
-        self._raise_on_transaction = raise_on_transaction
+        self.etags: dict[str, str] = {}
+        self._etag_counter = 0
+        self._fail_transactions = fail_transactions
+        self.get_state_calls = 0
+        self.transaction_calls = 0
 
     async def get_state(self, store_name: str, key: str) -> _FakeStateResponse:
-        return _FakeStateResponse(self.store.get(key, "").encode("utf-8"))
+        self.get_state_calls += 1
+        data = self.store.get(key, "")
+        return _FakeStateResponse(data.encode("utf-8"), self.etags.get(key, ""))
 
     async def execute_state_transaction(self, store_name: str, operations: list[Any]) -> None:
-        if self._raise_on_transaction:
+        self.transaction_calls += 1
+        if self.transaction_calls <= self._fail_transactions:
             raise grpc.RpcError()
+        for op in operations:
+            if op.etag is not None and op.etag != self.etags.get(op.key, ""):
+                raise grpc.RpcError()
         for op in operations:
             data = op.data if isinstance(op.data, str) else op.data.decode("utf-8")
             self.store[op.key] = data
+            self._etag_counter += 1
+            self.etags[op.key] = str(self._etag_counter)
 
 
 def _decision() -> Decision:
@@ -124,11 +143,61 @@ async def test_save_again_for_existing_tracking_id_does_not_duplicate_index_entr
 
 
 async def test_save_wraps_transaction_failure_as_approval_repository_error() -> None:
-    client = _FakeDaprStateClient(raise_on_transaction=True)
+    client = _FakeDaprStateClient(fail_transactions=999)
     repo = DaprStateApprovalRepository(client=client)
 
     with pytest.raises(ApprovalRepositoryError):
         await repo.save(_pending_approval())
+
+
+async def test_save_writes_index_with_the_etag_just_read() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStateApprovalRepository(client=client)
+    await repo.save(_pending_approval(tracking_id="tid-1"))
+    etag_before = client.etags[APPROVAL_INDEX_KEY]
+
+    await repo.save(_pending_approval(tracking_id="tid-2"))
+
+    etag_after = client.etags[APPROVAL_INDEX_KEY]
+    assert etag_after != etag_before
+    assert json.loads(client.store[APPROVAL_INDEX_KEY]) == ["tid-1", "tid-2"]
+
+
+async def test_save_retries_on_index_conflict_and_succeeds_on_second_attempt() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStateApprovalRepository(client=client)
+    await repo.save(_pending_approval(tracking_id="tid-1"))
+    client._fail_transactions = client.transaction_calls + 1  # next transaction call fails once
+
+    await repo.save(_pending_approval(tracking_id="tid-2"))
+
+    assert json.loads(client.store[APPROVAL_INDEX_KEY]) == ["tid-1", "tid-2"]
+
+
+async def test_save_raises_approval_repository_error_after_exhausting_retries() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStateApprovalRepository(client=client)
+    client._fail_transactions = client.transaction_calls + 999
+
+    with pytest.raises(ApprovalRepositoryError):
+        await repo.save(_pending_approval(tracking_id="tid-1"))
+
+
+async def test_save_sleeps_between_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = _FakeDaprStateClient()
+    repo = DaprStateApprovalRepository(client=client)
+    await repo.save(_pending_approval(tracking_id="tid-1"))
+    client._fail_transactions = client.transaction_calls + 1
+
+    await repo.save(_pending_approval(tracking_id="tid-2"))
+
+    assert len(sleep_calls) == 1
 
 
 def test_construction_does_not_call_factory_eagerly() -> None:
