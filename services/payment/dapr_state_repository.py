@@ -11,6 +11,10 @@ Key layout:
 
 Both PaymentRecord keys are written together in one atomic transaction
 (execute_state_transaction), same invariant as DaprStateApprovalRepository.
+payment:index writes carry the etag read alongside the index, with the same
+retry-on-conflict loop as Budget's below (_MAX_RETRIES/_RETRY_DELAY_SECONDS)
+- same fix as DaprStateApprovalRepository.save() for the identical
+documented read-then-write race on approval:index.
 
 Budget writes go through execute_state_transaction with a per-operation
 etag for optimistic concurrency (ARCHITECTURE.md's INV-1014 guarantee).
@@ -88,9 +92,11 @@ class _DaprStateClient(Protocol):
 
 
 class DaprStatePaymentRepository:
-    """Identical shape/invariants to DaprStateApprovalRepository - see that
-    file's docstring for the index-race/unbounded-growth caveats, which
-    apply here unchanged (accepted non-goal for this phase, same category)."""
+    """Identical shape/invariants to DaprStateApprovalRepository, including
+    the ETag-protected index write (see module docstring above). The
+    remaining accepted gap is also identical: payment:index grows without
+    bound - append-only, no delete/compaction (same non-goal as Approval's,
+    see that file's module docstring)."""
 
     def __init__(
         self,
@@ -100,31 +106,41 @@ class DaprStatePaymentRepository:
     ) -> None:
         self._dapr = LazyDaprClient[_DaprStateClient](client, factory=factory)
 
-    async def _read_index(self) -> list[str]:
+    async def _read_index(self) -> tuple[list[str], str]:
         try:
             response = await self._dapr.get().get_state(_STORE_NAME, PAYMENT_INDEX_KEY)
         except grpc.RpcError as exc:
             raise PaymentRepositoryError(f"Failed to read payment index: {exc}") from exc
         if not response.data:
-            return []
+            return [], response.etag
         raw = response.data if isinstance(response.data, str) else response.data.decode("utf-8")
-        return list(json.loads(raw))
+        return list(json.loads(raw)), response.etag
 
     async def save(self, payment: PaymentRecord) -> None:
-        index = await self._read_index()
-        if payment.tracking_id not in index:
-            index = [*index, payment.tracking_id]
-        operations = [
-            TransactionalStateOperation(
-                key=f"{PAYMENT_KEY_PREFIX}{payment.tracking_id}",
-                data=payment.model_dump_json(),
-            ),
-            TransactionalStateOperation(key=PAYMENT_INDEX_KEY, data=json.dumps(index)),
-        ]
-        try:
-            await self._dapr.get().execute_state_transaction(_STORE_NAME, operations)
-        except grpc.RpcError as exc:
-            raise PaymentRepositoryError(f"Failed to save payment: {exc}") from exc
+        for _ in range(_MAX_RETRIES):
+            index, etag = await self._read_index()
+            if payment.tracking_id not in index:
+                index = [*index, payment.tracking_id]
+            operations = [
+                TransactionalStateOperation(
+                    key=f"{PAYMENT_KEY_PREFIX}{payment.tracking_id}",
+                    data=payment.model_dump_json(),
+                ),
+                TransactionalStateOperation(
+                    key=PAYMENT_INDEX_KEY, data=json.dumps(index), etag=etag
+                ),
+            ]
+            try:
+                await self._dapr.get().execute_state_transaction(_STORE_NAME, operations)
+                return
+            except grpc.RpcError:
+                # Stale index etag from a concurrent save() (or a genuine
+                # transport failure - not distinguished, same assumption as
+                # Budget's reserve()/release()) - re-read and retry.
+                await asyncio.sleep(_RETRY_DELAY_SECONDS)
+        raise PaymentRepositoryError(
+            f"Exceeded {_MAX_RETRIES} retries saving payment {payment.tracking_id!r}"
+        )
 
     async def get(self, tracking_id: str) -> PaymentRecord | None:
         try:
@@ -138,7 +154,7 @@ class DaprStatePaymentRepository:
         return PaymentRecord.model_validate_json(response.data)
 
     async def list_all(self) -> list[PaymentRecord]:
-        index = await self._read_index()
+        index, _ = await self._read_index()
         result: list[PaymentRecord] = []
         for tracking_id in index:
             payment = await self.get(tracking_id)
