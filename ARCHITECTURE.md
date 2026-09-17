@@ -12,6 +12,7 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
 ```mermaid 
     flowchart TD
     UI[Submitter UI] --> GW[API Gateway]
+    GW --> AUTH[Auth Service - issues JWTs, N1]
     GW --> IN[Intake Service]
     IN --> DEC[Decision Service - Agent plus Router]
     DEC --> PAY[Payment Service - Saga]
@@ -25,6 +26,11 @@ Key non-functional: ≥3 containerized microservices (M3), one docker compose up
     APP --> AUD
     PAY --> AUD
 ```
+Auth is drawn as a peer of the other Gateway-routed services (it has its own container, per §4), but
+it's called directly only for `/auth/register`/`/auth/login` - every other service verifies a JWT
+locally (stateless HS256, `shared/auth.py`), not by calling Auth per request. See §12 for why Auth is
+classified as cross-cutting infrastructure rather than a use-case Manager, despite being implemented
+as a full service.
 
 
 ## 4. Service Decomposition
@@ -32,6 +38,7 @@ ApprovalFlow
 | Service | Single responsibility | API | Dapr block | DB |
 |---|---|---|---|---|
 | API Gateway | Routing, single entry point, rate limit | REST (external) | — | — |
+| Auth | Issue/verify JWTs (register, login), seed demo Approver/Admin accounts (N1) | REST (external) | state | users |
 | Intake | Accept submission, tracking id, detect duplicates | REST + pub | service invocation, pub/sub | invoices |
 | Decision | Agent recommendation + deterministic router | pub/sub (async) | pub/sub, state, secrets | decisions |
 | Approval | Human queue, durable pause/resume | REST + pub | state (durable), pub/sub | approvals |
@@ -42,6 +49,8 @@ ApprovalFlow
 
 
 **API Gateway** - Single entry point, routes requests for services, enforce rate limiting, hide internal structure, logic free. It is the only externally supported entry point; internal service-to-service traffic remains direct over the Docker network (Dapr pub/sub) - the gateway never sits between internal services, only at the system's outer boundary. See §7 for the concrete implementation (Traefik).
+
+**Auth (N1)** - Issues JWTs on `POST /auth/register`/`POST /auth/login` and seeds the demo Approver/Admin accounts at startup; every other service's routes are gated by the tokens it issues, verified locally (stateless HS256, `shared/auth.py`) rather than by calling Auth per request. Internally it follows the exact same IDesign layering as every other service (`AuthService` Manager, `UserRepository` Accessor) - but see §5/§12 for why it's classified as cross-cutting infrastructure (like the Gateway) rather than a use-case-orchestrating Manager alongside Intake/Approval/Payment. Only Submitter accounts are self-registerable; Approver/Admin exist only via a seed file, never a runtime endpoint.
 
 **Intake** - Receives the submission, returns a tracking id immediately (F1, non-blocking), and checks for duplicates (F3) before anything else. If it's a duplicate, it short-circuits without invoking Decision - no second agent call, no second payment. Otherwise it publishes an event for processing. Its single responsibility is intake and de-duplication.
 
@@ -71,6 +80,10 @@ The service decomposition follows IDesign's volatility-based layering rather tha
 
 Dependencies flow strictly downward (Manager → Engine → Accessor → Resource), and services communicate sideways only through asynchronous events, never direct calls — consistent with IDesign's rules.
 
+**Where Auth (N1) fits:** internally it has the same shape as every domain service - `AuthService` is a Manager (`register`/`login`), `UserRepository` is an Accessor (Dapr state, same Protocol+DaprState+InMemory pattern as every other repository in this codebase). But it isn't counted alongside Intake/Approval/Payment above, because it doesn't orchestrate a *business* use-case with flow volatility of its own - authentication is generic, domain-agnostic infrastructure, the same category of concern as the Gateway's routing/rate-limiting (§12 makes this argument in full, including why it would move to a service-mesh layer at a larger scale). It's implemented as a full service rather than gateway config only because issuing/verifying JWTs and hashing passwords needs real logic and a user store, unlike the Gateway's purely declarative Traefik config.
+
+**Where Bulkhead/Throttling (N3) fit:** `shared/bulkhead.py`/`shared/rate_limiter.py` aren't a new layer or new services - they're cross-cutting *wrappers* around two existing Accessor-layer call sites (`BulkheadLLMProvider` wraps the LLM Accessor, `BulkheadApprovalStatusClient` wraps the Dapr service-invocation Accessor) and two existing Manager-layer route handlers (`POST /invoices`, `POST /auth/register`/`login`), added at the construction site only - `Decider`, `IntakeService`, and `AuthService` themselves are unchanged. `shared/` holds only cross-service, domain-agnostic primitives (JWT auth, Dapr client wrapping, resiliency primitives, wire contracts) — never business/domain logic - so `shared/bulkhead.py` and `shared/rate_limiter.py` belong there for the same reason `shared/auth.py` does.
+
 
 ## 6. Technology Stack
 
@@ -89,7 +102,7 @@ Dependencies flow strictly downward (Manager → Engine → Accessor → Resourc
 | CI/CD | GitHub Actions | Quality gates on every push (M16) |
 | Deployment | Docker Compose | One-command startup (M4) |
 
-*Planned as nice-to-have if time permits (not core):* RAG over policy with a vector store (N5), full OpenTelemetry tracing with Jaeger/Prometheus/Grafana (N4), and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
+*Implemented as a nice-to-have:* RAG over policy via TF-IDF + cosine similarity, pure Python/stdlib, no vector DB (N5 - see §10); distributed tracing via Dapr's built-in tracing exporter (Zipkin protocol) + self-hosted Jaeger v2, no application code changes (N4 - see §12). *Still planned if time permits (not core):* Prometheus/Grafana metrics (N4) and Kubernetes manifests (B3). Service Mesh was considered but is unnecessary — Dapr already provides service invocation, mTLS, and observability hooks.
 
 
 ## 7. Communication
@@ -138,6 +151,8 @@ Browser → Gateway → Intake (GET /invoices/{id})
 One attempt, no retry: a failure (Approval unreachable, or any unexpected response) degrades gracefully to the frozen `decision` already known, logged as a warning - this is a GET-enrichment, not a saga step requiring resilience against a transient failure at all costs. Verified live: `GET /invoices/{id}` shows `approval.status` transitioning from `pending` to `approved` as the approver acts, while `decision` stays fixed; stopping Approval Service mid-flow still returns 200 with `approval: null`, never a 500.
 
 **Secrets (M5)**: `GROQ_API_KEY` is fetched via Dapr's Secrets API (`dapr/components/secretstore.yaml`, `secretstores.local.env`) rather than read from `os.environ` directly, so a future move to a production secret backend (Vault, AWS Secrets Manager, Kubernetes secrets) needs zero application code changes. `services/decision/service/dapr_secret_loader.py` mirrors the F7/M13 configuration loader's shape exactly: `load_groq_api_key()` (I/O, never raises - unreachable/timeout/no-value all collapse to `None`) and `resolve_provider_from_secret()` (pure - decides whether to build a fresh `GroqProvider` or keep the existing env-var-based one). Fetch-once at startup, same as thresholds/policy: `Decider`'s provider is built synchronously first (unchanged, fail-fast on a genuinely missing key), then optionally rebuilt once Dapr's async lifespan hook resolves - never a live hot-reload. Verified live: `docker compose logs decision` shows `llm_provider_rebuilt_from_dapr_secret`; with the sidecar unreachable, the service still starts and serves correctly on the env-var fallback (logged as a warning, not a crash); `verify_phase8` (including the real-LLM INV-1013 anti-cheese test) passes against the secret-sourced provider.
+
+`JWT_SECRET` (N1) is fetched the same way, via `shared/jwt_secret_loader.py` - a near-identical `load_jwt_secret_from_dapr()`/`resolve_jwt_secret()` split, deliberately not sharing code with Decision's own loader (two occurrences of two small Protocol classes is an acceptable, documented duplication at this scale - see that module's docstring; extraction is the established next step once a third occurrence appears, not before, matching how `LazyDaprClient` itself was only extracted to `shared/` on its third near-identical occurrence). Every service that issues or verifies a JWT (`auth`, `intake`, `approval`, `payment`, `notification`, `audit` - not `decision`, which has no authenticated HTTP routes at all) resolves it once at startup and stores it on `app.state.jwt_secret`, which `shared/auth.py`'s `get_current_user` prefers over the `JWT_SECRET` env var. `secretstore.yaml`'s `scopes` widened from `[decision]` to all seven app-ids accordingly. Unlike Decision's `LLM_PROVIDER=groq` gate (a pre-existing, semantically meaningful selector), there's no equivalent natural on/off switch for authentication, so the Dapr attempt is gated behind an explicit `JWT_SECRET_DAPR_ENABLED` flag instead - `docker-compose.yml` sets it `true` for every service that needs it, while tests/CI leave it unset (`false`) so `DaprClient()`'s up-to-60s blocking constructor is never reached when no sidecar exists. This closes a gap this document and the README's Known Limitations previously called out explicitly as a deliberate, scoped-out tradeoff.
 
 `payment.completed` is the same pattern applied a third time: a single topic carrying `invoice` + `decision` + `resolution` (`completed`/`failed`) + `reason`, not two separate topics (an earlier draft of this document listed `payment.completed`/`payment.failed` separately - corrected for consistency with the two consolidations above). This reads the same way `decision.completed`/`approval.completed` already do - "the payment PROCESS completed", not "it succeeded". Notification filters by `resolution`, but acts on **both** `completed` and `failed` unconditionally (§11's flowchart already shows both the DONE and FAILED paths converging on the same NOTIFY node) - the same way Payment itself filters `decision.completed` by `route == auto_approve` and `approval.completed` by `resolution == approved`.
 
@@ -207,7 +222,7 @@ Workflow:
 3. Apply the deterministic router.
 4. Emit the final decision (auto_approve / human / reject / duplicate).
 
-The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG over the policy (retrieving only relevant clauses instead of the full policy) is a planned nice-to-have (N5). The router can also return `reject` for high-severity policy violations (e.g. alcohol-only receipts, INV-1015) and `duplicate` for re-submissions — not every non-approval is a human escalation.
+The LLM provider sits behind a swappable interface (M15) with a stub for CI. **RAG over the policy (N5)** retrieves only the relevant section(s) of `policy.md` instead of the full text: a deterministic floor (preamble + Global rules + Autonomy thresholds + the invoice's own category section) is always included, plus an additive TF-IDF/cosine-similarity layer that pulls in genuinely cross-referenced sections (e.g. an "alcohol" mention in a Travel invoice's notes still surfaces the Meals section). Implemented in pure Python/stdlib (`services/decision/service/policy_index.py`) rather than embeddings or a vector DB - `policy.md` is a handful of short, fixed sections, so a numeric similarity threshold gives the same relevance benefit without new latency, cost, or non-determinism. Retrieval failures fall back to the full policy text unconditionally (`decider.py`); the router never sees policy text at all, so retrieval quality can only affect the agent's *recommendation*, never a decision's correctness. The router can also return `reject` for high-severity policy violations (e.g. alcohol-only receipts, INV-1015) and `duplicate` for re-submissions — not every non-approval is a human escalation.
 
 
 ## 11. Diagrams
@@ -261,11 +276,27 @@ The LLM provider sits behind a swappable interface (M15) with a stub for CI. RAG
 
 **Error handling & resilience:** each service exposes a health check; the LLM provider is swappable and fails fast (never silently) on errors (M15); inter-service calls use retry and timeout - for pub/sub this is a Dapr resiliency policy on the subscriber, not application code.
 
+**Bulkhead (N3, implemented):** the two call sites that aren't already decoupled via async Dapr pub/sub each get an isolated concurrency cap + total-latency timeout, via a small shared `Bulkhead` primitive (`shared/bulkhead.py`, a semaphore + `asyncio.timeout()` covering both the wait-for-a-slot and the call itself) wrapped around the existing Protocol implementation at its construction site only - `Decider`/`build_decider()` and `IntakeService` are unchanged. Decision→Groq (`BulkheadLLMProvider`, `LLM_BULKHEAD_MAX_CONCURRENCY=5`, `LLM_BULKHEAD_TIMEOUT_SECONDS=15.0` - this call had no timeout at all before N3) and Intake→Approval (`BulkheadApprovalStatusClient`, `APPROVAL_STATUS_BULKHEAD_MAX_CONCURRENCY=20`, `APPROVAL_STATUS_BULKHEAD_TIMEOUT_SECONDS=5.0`, just above the inner client's own 3.0s timeout). On a bulkhead timeout, each adapter raises the *same* error type its wrapped dependency already raises (`LLMProviderError` / `ApprovalStatusClientError`) - both already had a tested fail-clean path upstream (Decision falls back to `human_review`; Intake returns the frozen decision), so no new error-handling code was needed downstream.
+
+**Throttling (N3, implemented):** per-identity fixed-window counters (`shared/rate_limiter.py`, `RateLimiter` Protocol + `InMemoryRateLimiter`/`DaprStateRateLimiter`, mirroring the existing Protocol+Dapr-state+InMemory pattern) on `POST /invoices` (per authenticated user, `INVOICE_SUBMIT_RATE_LIMIT=20`/60s) and `POST /auth/register`+`POST /auth/login` (dual-keyed by *both* the target email and the source IP - registration spam is only caught by IP-keying, since the attacker controls the email; login brute-force needs both, since IP-keying alone would miss credential-stuffing spread across many attacker-controlled accounts). This is a *different* layer from the gateway's existing flat per-client-IP `ratelimit` middleware (M6, `traefik/dynamic.yml`) - that one protects the whole system from raw traffic volume; this one targets abuse of one specific identity/endpoint, using identity the system didn't have before N1. A 429 includes a `Retry-After` header; the limiter fails *open* on a backing-store outage (throttling is defense-in-depth, never a hard gate real traffic depends on). **Known limitation, verified live, not assumed:** Dapr's Redis state store silently ignores per-operation TTL metadata on `execute_state_transaction()` (confirmed via `redis-cli TTL` after a direct write - no expiry was set), so rate-limit keys accumulate in Redis without auto-expiry; correctness of the counter (via the same proven ETag-conditional-write mechanism `DaprStateBudgetRepository`/INV-1014 already uses) was kept over self-cleaning storage. **Live-verified**: a real `curl` loop against the running gateway confirmed the 6th rapid `POST /auth/register` from one source returns `429` with `Retry-After` set, not just in unit tests.
+
 **Known gap, not yet implemented (Transactional Outbox):** a service's own state write (e.g. Intake marking a submission PROCESSING) and its corresponding event publish are two separate operations, not one atomic transaction. A crash between them leaves the state written but the event never published (or vice versa). Closing this needs the Transactional Outbox pattern (write the event to the same transactional store as the state change, with a separate relay process publishing it) - deferred until a real transactional store (PostgreSQL) backs the affected repositories; `InMemoryInvoiceRepository` can't support it.
 
-**Security:** the API gateway enforces rate-limiting (M6); secrets (LLM keys) are held in Dapr secrets, never in code. Optional JWT auth with roles - submitter / approver / admin (N1).
+**Security (N1, implemented):** the API gateway enforces rate-limiting (M6); secrets (LLM keys and, as of this pass, the JWT signing key - see the Secrets (M5) paragraph above) are held in Dapr secrets, never in code. A dedicated `auth` service (`services/auth/`, IDesign-layered like every other service) issues JWTs (`shared/auth.py`, HS256, algorithm pinned rather than trusted from the token itself) carrying a `Role` (`submitter < approver < admin`, an `IntEnum` so `require_role(minimum)` is one rank comparison, not a per-endpoint role set). Every existing route is gated via FastAPI `Depends(get_current_user)` / `Depends(require_role(...))` - the full per-endpoint role matrix is in README.md. Passwords are hashed with stdlib `hashlib.pbkdf2_hmac` (260k iterations, per-user salt, `hmac.compare_digest`) rather than adding a new dependency for something the stdlib already handles adequately at this scale. `Invoice.submitter` is always overwritten server-side from the authenticated JWT identity in Intake, never trusted from the client payload. Only Submitter accounts are self-registerable (`POST /auth/register`); Approver/Admin exist only via a seed file (`services/auth/demo_users.json`) loaded at startup. The UI (`services/ui/static/login.html`) stores the token in `localStorage` and attaches it to every request - see README.md's Known Limitations for that tradeoff (and for the item-level-lookup tradeoff; the JWT-secret-as-env-var tradeoff previously noted there is now closed, see above).
 
-**Observability (planned, N4):** structured JSON logs are core; full OpenTelemetry tracing with Jaeger/Prometheus/Grafana is a nice-to-have extension.
+**AuthN vs. AuthZ placement, at this scale vs. at production scale:** both are enforced per-service today - `shared/auth.py`'s `get_current_user` decodes/verifies the JWT (authentication), and each service's own `require_role(minimum)` calls check the per-endpoint role (authorization). This is a deliberate scope decision for 7 services, not an oversight: authentication is generic, domain-agnostic infrastructure - the same category of concern as TLS termination or rate-limiting, both of which already live at the gateway rather than in application code (M6) - so at a larger scale it would move to a Dapr sidecar/service-mesh middleware layer, verified once per sidecar instead of imported and re-run in every service. Authorization is domain-specific (only a given service knows which roles its own endpoints should allow) and would stay exactly where it is. The `shared/auth.py` (AuthN) / `require_role(...)` (AuthZ) split already reflects this distinction, so that future move is a targeted swap of one piece, not a redesign. Not implemented now: YAGNI at this service count - per-service JWT decoding is not a measured or expected performance problem here, and a mesh middleware layer would add real operational complexity for no current gain.
+
+**Observability (tracing implemented, metrics planned; N4):** structured JSON logs + correlation id remain core. Distributed tracing is implemented via Dapr's automatic instrumentation, exported over the Zipkin protocol to a self-hosted Jaeger v2 instance (UI at `localhost:16686`) - no application code changes; every Dapr sidecar exports spans for its pub/sub publishes/consumes and the one service-invocation call automatically. Coverage is Dapr-mediated only:
+
+| Flow | Traced? |
+|---|---|
+| Pub/sub choreography (`invoice.submitted` → `decision`/`approval`/`payment.completed`) | Yes, automatically via Dapr |
+| Service Invocation call (Intake→Approval) | Yes, automatically via Dapr |
+| Gateway → service (direct REST, M6) | **No** - bypasses the Dapr sidecar entirely |
+| State/Config/Secrets operations | Yes, automatically via Dapr |
+| Full request path including the first hop from the UI | **No** - would need FastAPI-level OpenTelemetry instrumentation (a separate, larger future extension - new dependency, per-service setup - not done in this pass) |
+
+**Live-verified, not assumed**: `scripts/verify_tracing.py` drives INV-1001 and INV-1003 through the real stack and asserts (via Jaeger's own HTTP API) that all 6 app-ids appear as services with spans. The escalate-resume journey (INV-1003) was found to produce **one connected trace** across all 6 services (`intake`→`decision`→`approval`→`payment`→`notification`→`audit`), not separate per-hop traces - Dapr's own trace-context propagation through the pub/sub CloudEvents envelope carries the trace id all the way through the choreography chain, with no extra work required. Prometheus/Grafana metrics remain unimplemented (heavier lift, less demonstration value than tracing at this project's scale).
 
 
 ## 13. Testing & Evaluation

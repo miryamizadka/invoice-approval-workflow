@@ -1,0 +1,14 @@
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: tracing
+spec:
+  tracing:
+    samplingRate: "1"
+    zipkin:
+      endpointAddress: "http://jaeger:9411/api/v2/spans"
+# kind: Configuration, not kind: Component like the 4 files beside this one -
+# a different Dapr CRD (daprd's own runtime behavior, not an app-facing
+# building block). No scopes: here - scopes restrict which app-ids may use a
+# shared Component; a Configuration only ever applies to whichever sidecar
+# explicitly references it via --config, so there's nothing to restrict (N4).

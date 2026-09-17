@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from services.payment.accessors.fake_gateway import FakePaymentGateway
 from services.payment.app import create_app
 from services.payment.repository import InMemoryBudgetRepository, InMemoryPaymentRepository
+from shared.auth import AuthenticatedUser, Role, get_current_user
 from shared.contracts.models import ApprovalCompletedEvent, ApprovalResolution, Decision, Route
 from tests.support.decision_fixtures import RAW_FIXTURES, clean_invoice, invoice_from_fixture
 
@@ -101,6 +102,9 @@ def _app(
         budget_repository=resolved_budget_repository,
         publisher=resolved_publisher,
         gateway=resolved_gateway,
+    )
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="test-admin@example.com", role=Role.ADMIN
     )
     return (
         app,
@@ -299,3 +303,50 @@ def test_inv_1014_concurrent_pair_exactly_one_succeeds_budget_never_negative() -
         assert budget.remaining >= Decimal("0.00")
 
     asyncio.run(_run_and_check())
+
+
+# --- N1: authentication/authorization gates ---------------------------------
+
+
+def test_list_payments_requires_authentication() -> None:
+    app, *_ = _app()
+    app.dependency_overrides.pop(get_current_user, None)
+    with TestClient(app) as client:
+        response = client.get("/payments")
+
+    assert response.status_code == 401
+
+
+def test_list_payments_requires_admin_role_not_submitter() -> None:
+    app, *_ = _app()
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="submitter@example.com", role=Role.SUBMITTER
+    )
+    with TestClient(app) as client:
+        response = client.get("/payments")
+
+    assert response.status_code == 403
+
+
+def test_get_budget_requires_admin_role_not_approver() -> None:
+    app, *_ = _app()
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="approver@example.com", role=Role.APPROVER
+    )
+    with TestClient(app) as client:
+        response = client.get(f"/budgets/{_DEPARTMENT}")
+
+    assert response.status_code == 403
+
+
+def test_get_single_payment_only_requires_authentication_not_admin_role() -> None:
+    app, *_ = _app()
+    with TestClient(app) as client:
+        _post_decision_completed(client)
+        app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+            sub="submitter@example.com", role=Role.SUBMITTER
+        )
+
+        response = client.get("/payments/corr-1")
+
+    assert response.status_code == 200

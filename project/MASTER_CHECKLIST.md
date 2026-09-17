@@ -304,7 +304,16 @@ ETag optimistic concurrency (INV-1014), not just simple save/get.
   `llm_provider_rebuilt_from_dapr_secret`; with `decision-dapr` unreachable, the service still
   starts and serves correctly on the env-var fallback [warning logged, not a crash];
   `verify_phase8` including the real-LLM INV-1013 anti-cheese test passes against the
-  secret-sourced provider)
+  secret-sourced provider. **Extended to `JWT_SECRET` (N1)**: `shared/jwt_secret_loader.py`
+  (identical I/O-vs-pure split, `secretstore.yaml`'s scopes widened to all six services that
+  issue/verify a JWT) is read once at startup by each of them and takes precedence via
+  `app.state.jwt_secret` over the `JWT_SECRET` env var (`shared/auth.py`'s `get_current_user`) -
+  gated behind `JWT_SECRET_DAPR_ENABLED` (unset in tests/CI, `true` in `docker-compose.yml`) for
+  the same reason Decision's own fetch is gated behind `LLM_PROVIDER=groq`: `DaprClient()`'s
+  constructor blocks up to 60s with no sidecar reachable, which would otherwise hang every test
+  that triggers a service's lifespan. Closes the gap `README.md`'s Known Limitations previously
+  documented explicitly ("a production deployment should hold it in a real secret store... the
+  natural fit").)
 
 
 ## M6 — API Gateway
@@ -560,8 +569,8 @@ CRITICAL
 
 ## N1 Auth
 
-- [ ] JWT authentication
-- [ ] Roles:
+- [x] JWT authentication - `services/auth/` (register/login, HS256, `shared/auth.py`); every existing route gated via `Depends(get_current_user)`/`Depends(require_role(...))`; live-verified via `scripts/verify_auth.py`.
+- [x] Roles:
   - Submitter
   - Approver
   - Admin
@@ -581,21 +590,52 @@ pulled successfully (`docker pull ghcr.io/miryamizadka/invoice-approval-workflow
 
 ## N3 Reliability
 
-- [ ] Outbox pattern
-- [ ] Bulkhead
-- [ ] Throttling
+- [ ] Outbox pattern - deferred to its own separate future pass (genuine
+  architectural migration to Postgres for the affected repositories, not
+  a bolt-on addition).
+- [x] Bulkhead - `shared/bulkhead.py` (semaphore + timeout), wrapping
+  Decision→Groq (`BulkheadLLMProvider`) and Intake→Approval
+  (`BulkheadApprovalStatusClient`), the two call sites not already
+  decoupled via async Dapr pub/sub. Live-verified via `scripts/verify_phase8.py`
+  (exercises the real Groq call for INV-1013).
+- [x] Throttling - `shared/rate_limiter.py` (per-identity fixed-window
+  counters, Dapr-state-backed) on `POST /invoices` and, dual-keyed by
+  email + source IP, `POST /auth/register`/`POST /auth/login`. Live-verified:
+  a real `curl` loop against the running gateway confirmed a 429 with
+  `Retry-After` on the 6th rapid `/auth/register` call.
 
 
 ## N4 OpenTelemetry
 
-- [ ] Metrics
-- [ ] Distributed tracing
+Distributed tracing implemented: every Dapr sidecar exports spans automatically (pub/sub +
+the one service-invocation call) via Zipkin protocol to a self-hosted Jaeger v2 instance
+(`docker-compose.yml`, `dapr/components/tracing.yaml`, `jaeger/config.yaml`) - no application
+code changes. Live-verified with a new deterministic script (`scripts/verify_tracing.py`,
+asserts against Jaeger's own HTTP API): all 6 services produce spans, and the escalate-resume
+journey (INV-1003) was found to form one connected trace across all 6, not separate per-hop
+traces. See `ARCHITECTURE.md` §12 for the exact coverage matrix (what's traced vs. not).
+
+- [ ] Metrics - out of scope for this pass; Prometheus/Grafana deferred (heavier lift, less
+  demo value than tracing for a course project at this scale)
+- [x] Distributed tracing
 
 
 ## N5 RAG
 
-- [ ] Policy indexed
-- [ ] Relevant clauses retrieved
+Implemented (`services/decision/service/policy_index.py`): `policy.md` is parsed into a
+preamble + 7 sections once at Decider construction, and each `decide()` call retrieves only
+the relevant section(s) instead of the full policy - a deterministic floor (preamble + Global
+rules + Autonomy thresholds + the invoice's own category section) plus an additive TF-IDF/
+cosine-similarity layer for genuine cross-references (empirically verified: a Travel invoice
+whose notes mention "alcohol" pulls in the Meals section too). Pure Python/stdlib, no
+embeddings/vector DB - the router never sees policy text at all, so imperfect retrieval can
+only affect the agent's recommendation, never a decision's correctness; any retrieval
+exception falls back to the full policy text unconditionally (`decider.py`'s fail-safe).
+12 new unit tests (`test_policy_index.py`, `test_decider.py`), 100%/98% coverage on the two
+changed files, full suite (465 tests)/ruff/mypy green, `verify_phase8` unaffected live.
+
+- [x] Policy indexed
+- [x] Relevant clauses retrieved
 
 
 ## N6 Testing Layers

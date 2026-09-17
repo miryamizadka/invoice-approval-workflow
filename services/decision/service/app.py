@@ -17,6 +17,7 @@ from dapr.ext.fastapi import DaprApp
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
+from services.decision.accessors.bulkhead_llm_provider import BulkheadLLMProvider
 from services.decision.accessors.factory import get_llm_provider
 from services.decision.accessors.llm_provider import LLMProvider
 from services.decision.router.config import DEFAULT_THRESHOLDS
@@ -40,7 +41,11 @@ def create_app(
     outcome_publisher: DecisionOutcomePublisher | None = None,
 ) -> FastAPI:
     configure_logging()
-    resolved_provider = provider or get_llm_provider()
+    # N3: wrapped exactly once, here - never inside build_decider()/Decider,
+    # which stay provider-implementation-agnostic. The `is not` identity
+    # check below (in _lifespan) is what prevents this from ever being
+    # re-wrapped when the provider is unchanged.
+    resolved_provider = BulkheadLLMProvider(provider or get_llm_provider())
     fallback_policy = load_policy_text()  # read once, reused below - not twice
     decider = build_decider(resolved_provider, DEFAULT_THRESHOLDS, fallback_policy)
     resolved_outcome_publisher = outcome_publisher or DaprDecisionOutcomePublisher()
@@ -55,8 +60,11 @@ def create_app(
         active_provider = resolved_provider
         if provider is None and os.environ.get("LLM_PROVIDER", "mock").lower() == "groq":
             secret_key = await load_groq_api_key()
-            active_provider = resolve_provider_from_secret(secret_key, resolved_provider)
-            if active_provider is not resolved_provider:
+            rebuilt = resolve_provider_from_secret(secret_key, resolved_provider)
+            if rebuilt is not resolved_provider:
+                # A genuinely new raw provider was built from the secret -
+                # wrap *that* one (N3), not resolved_provider again.
+                active_provider = BulkheadLLMProvider(rebuilt)
                 logging.getLogger(__name__).info("llm_provider_rebuilt_from_dapr_secret")
         # F7/M13: overrides DEFAULT_THRESHOLDS/policy.md with whatever is
         # configured in Dapr's configuration store, if anything - fetch-once,

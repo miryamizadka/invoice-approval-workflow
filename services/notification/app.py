@@ -6,10 +6,13 @@ NotificationService; all business logic lives there.
 from __future__ import annotations
 
 import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from services.notification.accessors.logging_channel import LoggingNotificationChannel
@@ -18,11 +21,13 @@ from services.notification.dapr_state_repository import DaprStateNotificationRep
 from services.notification.logging_config import configure_logging
 from services.notification.repository import NotificationRepository
 from services.notification.service import NotificationService, build_notification_service
+from shared.auth import AuthenticatedUser, Role, require_role
 from shared.contracts.models import (
     ApprovalCompletedEvent,
     DecisionCompletedEvent,
     PaymentCompletedEvent,
 )
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 def create_app(
@@ -35,7 +40,21 @@ def create_app(
         channel or LoggingNotificationChannel(),
     )
 
-    app = FastAPI(title="ApprovalFlow Notification Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
+        yield
+
+    app = FastAPI(title="ApprovalFlow Notification Service", lifespan=_lifespan)
     app.state.notification_service = notification_service
     dapr_app = DaprApp(app)
 
@@ -44,7 +63,11 @@ def create_app(
         return {"status": "ok", "service": "notification-service"}
 
     @app.get("/notifications/{tracking_id}")
-    async def get_notification_status(tracking_id: str, request: Request) -> dict[str, Any]:
+    async def get_notification_status(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.ADMIN)),
+    ) -> dict[str, Any]:
         """Ops/debug endpoint - not a public API. Always returns 200: "not
         yet notified" is a valid, non-error state, not a 404 (unlike
         Payment's GET /payments/{id}, where an unknown tracking_id is a

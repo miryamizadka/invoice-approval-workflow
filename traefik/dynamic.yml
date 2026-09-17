@@ -12,6 +12,13 @@
 # trade-off versus the Docker provider: backend addresses are fixed here,
 # not dynamically discovered - a non-issue for this project's static
 # docker-compose topology (no scaling/rescheduling to react to).
+#
+# IMPORTANT (confirmed empirically, N1): the file provider does NOT hot-
+# reload by default - `--providers.file.watch=true` isn't set on the
+# gateway's command in docker-compose.yml. Editing this file while the
+# gateway container is already running has no effect until it's restarted
+# (`docker compose restart gateway`) - a new router added here will 404
+# silently otherwise, with no error anywhere.
 
 http:
   middlewares:
@@ -65,6 +72,15 @@ http:
       entryPoints: ["web"]
       service: audit
       middlewares: ["ratelimit"]
+    auth:
+      rule: "PathPrefix(`/auth`)"
+      entryPoints: ["web"]
+      service: auth
+      middlewares: ["ratelimit"]
+      # Same rate-limit middleware as every other router - no dedicated
+      # login/register throttling added (N1's Out of scope): this generic
+      # per-client-IP budget already covers /auth/login and /auth/register
+      # incidentally, the same way it already covers every other route.
     ui:
       rule: "PathPrefix(`/ui`)"
       entryPoints: ["web"]
@@ -94,6 +110,10 @@ http:
       loadBalancer:
         servers:
           - url: "http://audit:8005"
+    auth:
+      loadBalancer:
+        servers:
+          - url: "http://auth:8007"
     ui:
       loadBalancer:
         servers:

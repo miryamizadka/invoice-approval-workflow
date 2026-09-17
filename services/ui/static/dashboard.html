@@ -4,13 +4,27 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ApprovalFlow - Dashboard</title>
+<script>
+  // See index.html for why this must be inline and run before <body> is
+  // parsed (avoids a flash of protected content / a nav tab this role
+  // shouldn't see).
+  (function () {
+    if (!localStorage.getItem("approvalflow_token")) {
+      window.location.replace("login.html");
+      return;
+    }
+    document.documentElement.dataset.role = localStorage.getItem("approvalflow_role") || "";
+  })();
+</script>
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
 <nav>
-  <a href="index.html">Submit Invoice</a>
-  <a href="approvals.html">Approval Queue</a>
-  <a href="dashboard.html">Dashboard</a>
+  <div class="nav-links">
+    <a href="index.html">Submit Invoice</a>
+    <a href="approvals.html" data-min-role="approver">Approval Queue</a>
+    <a href="dashboard.html" data-min-role="admin">Dashboard</a>
+  </div>
 </nav>
 
 <h1>Dashboard</h1>

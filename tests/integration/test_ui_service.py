@@ -58,3 +58,17 @@ def test_static_js_and_css_served() -> None:
     assert client.get("/approver.js").status_code == 200
     assert client.get("/dashboard.js").status_code == 200
     assert client.get("/style.css").status_code == 200
+
+
+def test_static_responses_disable_caching() -> None:
+    """N1's role-gated nav surfaced real confusion during manual QA: with no
+    build step or versioned filenames, a plain link click (not a hard
+    refresh) can silently reuse a stale cached HTML/JS/CSS page across a
+    deploy. `no-cache` forces the browser to always revalidate (a
+    conditional GET against the ETag/Last-Modified StaticFiles already
+    sends) before ever reusing a cached response."""
+    client = TestClient(create_app())
+
+    response = client.get("/api.js")
+
+    assert response.headers["cache-control"] == "no-cache"

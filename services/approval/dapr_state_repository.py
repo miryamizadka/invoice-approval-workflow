@@ -16,14 +16,18 @@ key-value store has no Query API (no RediSearch/RedisJSON installed). It is
 an interim solution forced by that limitation, not a fixed architectural
 choice - a relational store with `WHERE status IN (...)` would not need it.
 
-Known, accepted gaps (documented, not fixed here):
-1. Read-then-write race on the index (same category as Intake's dedup-key
-   race): two near-simultaneous saves for a brand-new tracking_id could both
-   read the index before either appends. Low-risk here - one escalation
-   event per invoice, not concurrent submits.
-2. The index grows without bound - append-only, no delete/compaction. Not a
-   bug; out of scope until a relational store replaces this entirely, at
-   which point the index itself is expected to disappear, not be optimized.
+Index writes use ETag-based optimistic concurrency with retry (same pattern
+as services/payment/dapr_state_repository.py's reserve()/release(), INV-1014):
+save() reads the index together with its ETag, and the transactional write
+carries that ETag on the index operation only (never the per-record
+operation). A stale ETag - another save() won the race - surfaces as
+execute_state_transaction failing, which is retried with a fresh read up to
+_MAX_RETRIES times before giving up as ApprovalRepositoryError.
+
+Known, accepted gap (documented, not fixed here):
+The index grows without bound - append-only, no delete/compaction. Not a
+bug; out of scope until a relational store replaces this entirely, at
+which point the index itself is expected to disappear, not be optimized.
 
 Every tracking_id appears in the index at most once - save() checks before
 appending, never blindly appends on every call.
@@ -31,6 +35,7 @@ appending, never blindly appends on every call.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -45,6 +50,8 @@ APPROVAL_KEY_PREFIX = "approval:"
 APPROVAL_INDEX_KEY = "approval:index"
 
 _STORE_NAME = "statestore"
+_MAX_RETRIES = 5
+_RETRY_DELAY_SECONDS = 0.01  # small, fixed - avoids a retry storm under real contention
 
 
 class ApprovalRepositoryError(Exception):
@@ -55,6 +62,8 @@ class ApprovalRepositoryError(Exception):
 class _StateResponse(Protocol):
     @property
     def data(self) -> bytes | str: ...
+    @property
+    def etag(self) -> str: ...
 
 
 class _DaprStateClient(Protocol):
@@ -77,34 +86,43 @@ class DaprStateApprovalRepository:
     ) -> None:
         self._dapr = LazyDaprClient[_DaprStateClient](client, factory=factory)
 
-    async def _read_index(self) -> list[str]:
+    async def _read_index(self) -> tuple[list[str], str]:
         try:
             response = await self._dapr.get().get_state(_STORE_NAME, APPROVAL_INDEX_KEY)
         except grpc.RpcError as exc:
             raise ApprovalRepositoryError(f"Failed to read approval index: {exc}") from exc
         if not response.data:
-            return []
+            return [], response.etag
         raw = response.data if isinstance(response.data, str) else response.data.decode("utf-8")
-        return list(json.loads(raw))
+        return list(json.loads(raw)), response.etag
 
     async def save(self, approval: PendingApproval) -> None:
-        index = await self._read_index()
-        if approval.tracking_id not in index:
-            index = [*index, approval.tracking_id]
-        operations = [
-            TransactionalStateOperation(
-                key=f"{APPROVAL_KEY_PREFIX}{approval.tracking_id}",
-                data=approval.model_dump_json(),
-            ),
-            TransactionalStateOperation(
-                key=APPROVAL_INDEX_KEY,
-                data=json.dumps(index),
-            ),
-        ]
-        try:
-            await self._dapr.get().execute_state_transaction(_STORE_NAME, operations)
-        except grpc.RpcError as exc:
-            raise ApprovalRepositoryError(f"Failed to save approval: {exc}") from exc
+        for _ in range(_MAX_RETRIES):
+            index, etag = await self._read_index()
+            if approval.tracking_id not in index:
+                index = [*index, approval.tracking_id]
+            operations = [
+                TransactionalStateOperation(
+                    key=f"{APPROVAL_KEY_PREFIX}{approval.tracking_id}",
+                    data=approval.model_dump_json(),
+                ),
+                TransactionalStateOperation(
+                    key=APPROVAL_INDEX_KEY,
+                    data=json.dumps(index),
+                    etag=etag,
+                ),
+            ]
+            try:
+                await self._dapr.get().execute_state_transaction(_STORE_NAME, operations)
+                return
+            except grpc.RpcError:
+                # Stale index etag from a concurrent save() (or a genuine
+                # transport failure - not distinguished, same assumption as
+                # Payment's reserve()/release()) - re-read and retry.
+                await asyncio.sleep(_RETRY_DELAY_SECONDS)
+        raise ApprovalRepositoryError(
+            f"Exceeded {_MAX_RETRIES} retries saving approval {approval.tracking_id!r}"
+        )
 
     async def get(self, tracking_id: str) -> PendingApproval | None:
         try:
@@ -118,7 +136,7 @@ class DaprStateApprovalRepository:
         return PendingApproval.model_validate_json(response.data)
 
     async def list_pending(self) -> list[PendingApproval]:
-        index = await self._read_index()
+        index, _ = await self._read_index()
         result: list[PendingApproval] = []
         for tracking_id in index:
             approval = await self.get(tracking_id)

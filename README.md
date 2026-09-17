@@ -28,14 +28,15 @@ what's implemented and how each was verified, see
 ## Technologies used
 
 Python 3.12 · FastAPI · LangGraph · Groq (swappable LLM provider) · Dapr (pub/sub, state, service
-invocation, secrets, configuration) · Redis · PostgreSQL · Traefik · pytest · Ruff · MyPy · GitHub
-Actions · Docker / Docker Compose · static HTML/CSS/vanilla JS (no frontend framework)
+invocation, secrets, configuration) · Redis · PostgreSQL · Traefik · Jaeger (distributed tracing,
+Zipkin-protocol export) · pytest · Ruff · MyPy · GitHub Actions + GHCR · Docker / Docker Compose ·
+static HTML/CSS/vanilla JS (no frontend framework)
 
 ## Bird's-eye view
 
-The system is eight containers plus their Dapr sidecars, Redis (state store + pub/sub broker),
-PostgreSQL (audit trail), and a Traefik gateway sitting in front of all of it as the single
-external entry point.
+The system is nine containers plus their Dapr sidecars, Redis (state store + pub/sub broker),
+PostgreSQL (audit trail), Jaeger (trace collector, N4), and a Traefik gateway sitting in front of
+all of it as the single external entry point.
 
 ```mermaid
 flowchart TB
@@ -45,12 +46,17 @@ flowchart TB
         GW["Routing + rate limit<br/>single external entry point"]
     end
 
+    GW -->|REST| AUTH
     GW -->|REST| IN
     GW -->|REST| AP
     GW -->|REST| PM
     GW -->|REST| NT
     GW -->|REST| AU
     GW -->|static files| UISV
+
+    subgraph CROSSCUT["Cross-cutting infrastructure (N1)"]
+        AUTH["Auth<br/>issues JWTs on register/login"]
+    end
 
     subgraph MANAGERS["Manager layer - orchestrate a use case"]
         IN["Intake<br/>Manager"]
@@ -114,7 +120,7 @@ flowchart TB
     DA --> PG
 ```
 
-Solid arrows are synchronous REST or the one Dapr service-invocation call; dashed arrows are asynchronous Dapr pub/sub. The Manager/Engine/Accessor/Resource grouping isn't decorative — it's the actual IDesign layering the codebase follows (`ARCHITECTURE.md` §5): dependencies only ever point downward, and services never call each other directly, only sideways through events.
+Solid arrows are synchronous REST or the one Dapr service-invocation call; dashed arrows are asynchronous Dapr pub/sub. The Manager/Engine/Accessor/Resource grouping isn't decorative — it's the actual IDesign layering the codebase follows (`ARCHITECTURE.md` §5): dependencies only ever point downward, and services never call each other directly, only sideways through events. **Auth** sits outside that grouping deliberately — it's cross-cutting infrastructure (the same category as the Gateway's routing/rate-limiting), not a use-case-orchestrating Manager, even though it's *implemented* with the exact same Manager/Accessor layering internally (`AuthService` / `UserRepository`). Every other service verifies a JWT **locally** (`shared/auth.py`, stateless HS256) — none of them call Auth over the network per request; Auth is only ever called directly for `/auth/register`/`/auth/login` themselves.
 
 A Dapr sidecar rides next to every service (except the gateway and the static UI, which have no
 business state of their own), handling service discovery, pub/sub delivery and retries, state
@@ -124,13 +130,16 @@ Redis or the secret store directly. Internal service-to-service traffic is almos
 `decision.completed`, `approval.completed`, `payment.completed`); the one exception is a single
 synchronous **Dapr service invocation** call (Intake → Approval, to enrich a status lookup with
 live approval progress). Everything is logged with structured JSON carrying a correlation id, so
-one submission's path through all eight services can be traced end-to-end.
+one submission's path through all nine services can be traced end-to-end.
 
-**The eight services, in the order a submission flows through them:**
+**The nine services, in the order a submission flows through them:**
 
 - **API Gateway** (Traefik) — the only externally reachable entry point (port `8080`). Routes by
   path prefix to each service, applies a shared rate limit, and serves the static UI. No business
   logic lives here at all.
+- **Auth** — issues JWTs on register/login and seeds the Approver/Admin demo accounts. Every other
+  service's routes are gated by the tokens it issues (N1) — see **Authentication & roles (N1)**
+  below.
 - **Intake** — accepts a submission, returns a tracking id immediately (never blocks on the AI
   call), and checks for duplicates *before* anything else — a duplicate never reaches the agent or
   a payment.
@@ -148,9 +157,10 @@ one submission's path through all eight services can be traced end-to-end.
 - **Audit** — subscribes to the same three completion topics as Notification and projects them
   into one PostgreSQL row per tracking id, giving F9's decision trail and F8's dashboard
   aggregation somewhere real to query from.
-- **UI** — a minimal static HTML/CSS/vanilla-JS app (no build step, no framework) with three
-  pages: submit-and-track, the approver queue, and the aggregate dashboard. It talks to the other
-  services' REST APIs directly through the same gateway the browser is already on.
+- **UI** — a minimal static HTML/CSS/vanilla-JS app (no build step, no framework) with four
+  pages: login, submit-and-track, the approver queue, and the aggregate dashboard. It talks to the
+  other services' REST APIs directly through the same gateway the browser is already on, attaching
+  the JWT from login to every request.
 
 ## Screenshots
 
@@ -181,16 +191,30 @@ install is needed just to run the system.
    ```bash
    docker compose up --build
    ```
-   This starts all eight services, their Dapr sidecars, Redis, PostgreSQL, and the gateway. Give
+   This starts all nine services, their Dapr sidecars, Redis, PostgreSQL, and the gateway. Give
    it a minute, then confirm everything reports healthy:
    ```bash
    docker compose ps
    ```
-3. Open the UI at **http://localhost:8080/ui/index.html**. The approval queue and dashboard are
-   linked from its nav bar (`/ui/approvals.html`, `/ui/dashboard.html`).
+3. Open the UI at **http://localhost:8080/ui/login.html** and log in (N1 — every page requires
+   it). Register a throwaway Submitter account right there, or use one of the seeded demo
+   accounts:
+
+   | Role | Email | Password |
+   |---|---|---|
+   | Approver | `approver@example.com` | `ApproverDemo123!` |
+   | Admin | `admin@example.com` | `AdminDemo123!` |
+
+   The nav bar only shows the tabs your role can use (Submit Invoice for everyone; Approval Queue
+   for Approver/Admin; Dashboard for Admin only) — `/ui/approvals.html`, `/ui/dashboard.html`.
 4. Everything is also a plain REST API through the same gateway — `/invoices`, `/approvals`,
-   `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables under **Details
-   and component highlights** below.
+   `/payments`, `/budgets`, `/notifications`, `/audit` — see the endpoint tables and the role
+   matrix under **Details and component highlights** below. Every one of them now requires an
+   `Authorization: Bearer <token>` header from `/auth/login`. `POST /invoices`, `POST
+   /auth/register`, and `POST /auth/login` can also return `429` if throttled (N3) — see
+   **Reliability — bulkhead & throttling (N3)** for the per-identity limits.
+5. Distributed tracing (N4) is visible at **http://localhost:16686** (Jaeger UI) — every Dapr
+   sidecar exports spans automatically, no extra setup needed.
 
 **Interactive API docs (Swagger/OpenAPI):** FastAPI generates these per service at `/docs` and
 `/openapi.json`, but the gateway intentionally forwards only business paths, hiding internal
@@ -203,9 +227,12 @@ interactively, temporarily add a host port mapping for it in `docker-compose.yml
 This walks through the same four journeys the automated end-to-end suite drives, but by hand,
 through the UI.
 
-**1. Submit an invoice.** Go to **http://localhost:8080/ui/index.html** and fill in the form:
-submitter email, department, vendor, invoice number, currency, category (meals / travel / SaaS /
-hardware / other), a line item (description, quantity, unit price), tax, total, whether a receipt
+**1. Submit an invoice.** Log in first at **http://localhost:8080/ui/login.html** (see **How to
+run** above for demo credentials, or register your own Submitter account there). You'll land on
+**http://localhost:8080/ui/index.html** — the submitter field is pre-filled from your login and
+read-only (N1 always records the authenticated identity server-side, not whatever a client sends).
+Fill in the rest of the form: department, vendor, invoice number, currency, category (meals /
+travel / SaaS / hardware / other), a line item (description, quantity, unit price), tax, total, whether a receipt
 is attached, the invoice date, and optional free-text notes. Submit it — the response is
 immediate (F1): a tracking id and a `PENDING` status, well before the AI has even looked at it.
 
@@ -310,7 +337,19 @@ flowchart TD
 
 ## How to test
 
-**Automated test suite** (451 unit + integration tests, no Docker required):
+Tests sit at three layers (N6), each answering a question the others structurally can't:
+
+| Layer | Where | Size | Docker? | What it actually proves |
+|---|---|---|---|---|
+| **Unit** | `tests/unit/` — one package per service, plus `shared/` | 499 tests | No | One component's logic in isolation: router thresholds, policy retrieval, idempotency keys, saga compensation, password hashing, rate-limit windows |
+| **Integration** | `tests/integration/` — one suite per service | 110 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
+| **End-to-end** | `scripts/verify_phase8.py` | 4 journeys + 3 guards | Yes | The real running system — nine containers, Dapr sidecars, Redis, Postgres, Traefik, and the *real* Groq LLM — driven through the actual gateway, no mocks anywhere |
+
+The first two layers run anywhere in seconds and gate every push; the end-to-end layer needs a live
+stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
+for why CI always stubs the LLM).
+
+**Automated test suite** (609 unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
@@ -336,6 +375,15 @@ python -m scripts.verify_phase8
 This is the one script that talks to the real LLM provider instead of the mock — see
 `ARCHITECTURE.md` §14 for why CI itself always stubs the LLM.
 
+**Tracing verification (N4)** (also needs the stack running) — checks the distributed trace really
+exists, by asserting against Jaeger's own HTTP API rather than "open the UI and have a look":
+```bash
+python -m scripts.verify_tracing
+```
+It drives INV-1001 and INV-1003 through the live gateway, then verifies that all six traced
+services emitted spans and reports whether INV-1003's spans share one trace id across the whole
+choreography. They do — see **Observability — tracing (N4)** below.
+
 ## Details and component highlights
 
 Every service follows the same shape internally — IDesign's Manager / Engine / Accessor /
@@ -349,6 +397,40 @@ ADR-007). Path-prefix routes each of the six business services and `/ui`, applie
 limit (10 req/s average, burst 50) per client IP to every router, and strips no internal detail
 beyond hiding the port each service would otherwise expose. Decision gets no route at all — it's
 pure choreography, nothing external ever calls it over HTTP.
+
+### Authentication & roles (N1)
+
+**Auth** (`/auth`) — issues JWTs (HS256, 8h expiry) carrying a rank-ordered `Role`
+(`submitter < approver < admin`). Passwords are hashed with stdlib `hashlib.pbkdf2_hmac`
+(260k iterations, per-user salt) — no new dependency for something the stdlib already does
+adequately at this scale. Login failures (unknown email vs. wrong password) return the identical
+generic `401`, so the API can't be used to enumerate registered emails.
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/auth/register` | Self-register — always creates a **Submitter**, regardless of any role in the request body |
+| `POST` | `/auth/login` | Returns a bearer token + its role |
+
+Only Submitter accounts are self-registerable. Approver and Admin exist solely via
+`services/auth/demo_users.json`, seeded at startup — there is no runtime endpoint that can create
+one, a deliberate tightening over letting Approver self-register too.
+
+**Role matrix** — every route below requires *at least* the listed role (an Admin can do
+everything an Approver or Submitter can):
+
+| Role | Can do |
+|---|---|
+| Submitter | `POST /invoices`, `GET /invoices/{id}`, `GET /approvals/{id}`, `POST /approvals/{id}/additional-info`, `GET /payments/{id}` |
+| Approver | everything above, plus `GET /approvals` (the full queue), `POST .../approve`, `POST .../reject`, `POST .../request-info`, `GET /audit/{id}` |
+| Admin | everything above, plus `GET /payments` (all records), `GET /budgets/{department}`, `GET /notifications/{id}`, `GET /audit/summary` |
+
+Single-item lookups by `tracking_id` (e.g. `GET /invoices/{id}`) are open to any authenticated
+role — the caller already has to know the specific id, so this isn't a privacy leak the way a
+*list* endpoint would be. List/aggregate endpoints and every mutating action are role-gated.
+`Invoice.submitter` is always overwritten server-side from the authenticated identity (Intake) —
+a client-supplied value in the request body is silently discarded, closing the obvious spoofing
+angle. `POST /decisions` and every `/events/*` Dapr-subscriber route stay unauthenticated — Decision
+has no gateway route at all, and subscriber calls are internal-only, never reachable from outside
+the Docker network.
 
 **Intake** (`/invoices`) — accepts a submission and immediately hands back a tracking id (F1); the
 AI/router work happens afterward, asynchronously. Builds a dedup key from
@@ -416,22 +498,162 @@ rejections and duplicates too.
 
 **UI** — static HTML/CSS/vanilla JS, no framework, no build step (ADR-010), served by its own
 "logic free" FastAPI app through the gateway's `/ui` prefix. The browser's own JS calls every
-other service's REST API directly through that same gateway (same-origin, no CORS needed). Three
-pages: submit-and-track (`index.html`), the approver queue (`approvals.html`), and the aggregate
-dashboard (`dashboard.html`).
+other service's REST API directly through that same gateway (same-origin, no CORS needed), with
+the JWT from login attached to each request. Four pages: login (`login.html`), submit-and-track
+(`index.html`), the approver queue (`approvals.html`), and the aggregate dashboard
+(`dashboard.html`) — the nav only shows the tabs the logged-in role can actually use.
+
+## Cross-cutting capabilities
+
+Authentication (N1) is documented with the Auth service above, because it *is* a service with its
+own routes. The four below aren't services — they're properties of the system as a whole.
+
+### Policy retrieval — RAG (N5)
+
+The agent never sees the whole policy. `policy.md` is parsed **once**, at Decider construction,
+into a preamble plus its seven sections (Meals, Travel, SaaS, Hardware, Global rules, Autonomy
+thresholds, Department budgets); each `decide()` call then builds a prompt from only the sections
+that matter to *that* invoice (`services/decision/service/policy_index.py`).
+
+Retrieval is two layers, and the split is the whole point:
+
+- **A deterministic floor that never depends on a score.** The preamble, **Global rules**,
+  **Autonomy thresholds**, and the invoice's own category section are *always* included. A
+  retrieval miss therefore can't drop a rule the decision hinges on — the floor is a guarantee,
+  not a ranking.
+- **An additive TF-IDF / cosine-similarity layer on top**, which can only ever *add* sections,
+  never remove one. This is what catches genuine cross-references: a Travel invoice whose notes
+  mention *"alcohol"* also pulls in the Meals section, because that's Meals vocabulary. It scores
+  ~0.20 against a 0.15 threshold, while a clean single-category invoice scores exactly 0.0 — not
+  merely "below threshold" — against every unrelated section. The threshold sits in that measured
+  gap rather than being a round number someone liked.
+
+Pure Python/stdlib: no embeddings, no vector database. `policy.md` is seven short, fixed sections,
+so an embedding model or a vector store would buy no separation that lexical similarity isn't
+already getting cleanly, in exchange for a dependency, latency, and a non-deterministic failure
+mode. An LLM-based reranker was rejected for the same reason — there are no near-duplicate
+candidates for it to disambiguate.
+
+Two properties make imperfect retrieval survivable rather than dangerous. The **deterministic
+router never sees policy text at all**, so retrieval quality can only move the agent's
+*recommendation*, never the correctness of a decision. And **any retrieval exception falls back to
+the full policy text unconditionally** (`decider.py`) — RAG is allowed to improve relevance, never
+to become a new way for an invoice to fail. Every retrieval logs the section ids it chose under
+the correlation id, so what the agent was shown is auditable after the fact, not a black box.
+
+### Reliability — bulkhead & throttling (N3)
+
+**Bulkhead.** Most inter-service traffic is already isolated by construction: async Dapr pub/sub
+means a slow consumer has no shared call stack to exhaust. Exactly two call sites *aren't*
+decoupled that way, and each gets its own concurrency cap plus a total-latency timeout
+(`shared/bulkhead.py` — a semaphore and an `asyncio.timeout()` covering both the wait for a slot
+*and* the call itself, so a queue of waiters can't quietly become unbounded latency):
+
+| Call site | Concurrency cap | Timeout |
+|---|---|---|
+| Decision → Groq (`BulkheadLLMProvider`) | 5 | 15s — this call had **no** timeout at all before N3 |
+| Intake → Approval (`BulkheadApprovalStatusClient`) | 20 | 5s, just above the inner client's own 3s |
+
+The wrapper is applied at the construction site only — `Decider` and `IntakeService` are
+unchanged — and on timeout each adapter raises the *same* error type its wrapped dependency
+already raises (`LLMProviderError` / `ApprovalStatusClientError`). Both already had a tested
+fail-clean path (Decision falls back to `human_review`, Intake returns the frozen decision), so
+the bulkhead needed no new error handling anywhere downstream.
+
+**Throttling.** Per-identity fixed-window counters (`shared/rate_limiter.py` — a `RateLimiter`
+Protocol with Dapr-state and in-memory implementations, the same Protocol + Dapr + fake pattern
+every repository in the project uses):
+
+| Endpoint | Limit | Keyed by |
+|---|---|---|
+| `POST /invoices` | 20 / 60s | authenticated user |
+| `POST /auth/register` | 5 / 60s | email **and** source IP |
+| `POST /auth/login` | 20 / 60s | email **and** source IP |
+
+The dual key on the auth endpoints isn't belt-and-braces. Registration spam is caught *only* by
+IP-keying, since the attacker picks the emails; credential stuffing spread across many
+attacker-controlled accounts is caught *only* by email-keying. Either key alone leaves one of the
+two wide open. This is also a different layer from the gateway's flat per-client-IP rate limit
+(M6): that one defends the system against raw traffic volume, this one defends a specific identity
+and endpoint against abuse — using identity the system didn't even have before N1. A `429` carries
+`Retry-After`, and the limiter **fails open** if its backing store is unreachable: throttling is
+defense-in-depth, never a hard gate legitimate traffic depends on.
+
+### Observability — tracing (N4)
+
+Every Dapr sidecar exports spans over the Zipkin protocol to a self-hosted Jaeger v2 instance
+(`dapr/components/tracing.yaml`, sampling rate `1` — every request, which is the right call at
+this volume). **No application code changed for this.** Tracing is a sidecar configuration
+(`--config /components/tracing.yaml`), not an instrumentation library imported into seven
+services — the same reasoning that keeps retries, service discovery, and secrets out of the
+application code. The UI is at **http://localhost:16686**.
+
+The payoff is the thing distributed tracing actually exists for: one escalate-and-resume journey
+(INV-1003) appears as **one connected trace** spanning
+`intake → decision → approval → payment → notification → audit` — not six disconnected per-hop
+traces. Dapr propagates W3C trace context through the pub/sub CloudEvents envelope, so the trace
+id survives the whole async choreography, human pause included, with nothing extra written. That
+was *verified*, not assumed: `scripts/verify_tracing.py` intersects the trace ids Jaeger reports
+per service and fails loudly if the intersection is empty.
+
+Coverage is Dapr-mediated traffic only, which is a real boundary and worth stating plainly:
+
+| Flow | Traced? |
+|---|---|
+| Pub/sub choreography (all four topics) | Yes, automatically |
+| Service invocation (Intake → Approval) | Yes, automatically |
+| State / config / secrets operations | Yes, automatically |
+| Gateway → service (direct REST) | **No** — that traffic hits the app port and bypasses the sidecar entirely |
+
+Closing the last row needs FastAPI-level OpenTelemetry instrumentation in each service — a new
+dependency and per-service setup, a separate and larger extension than this one. Metrics
+(Prometheus/Grafana) are not implemented. `ARCHITECTURE.md` §12 carries the full matrix.
+
+### CI/CD (N2)
+
+One workflow (`.github/workflows/ci.yml`), three jobs:
+
+| Job | Runs on | Does |
+|---|---|---|
+| `quality` | every push and PR | Ruff, MyPy, the full pytest suite with coverage, plus a coverage artifact |
+| `docker-build` | every push and PR | Builds the image to prove the Dockerfile stays buildable — validate only, never pushes |
+| `publish` (**the CD stage**) | pushes to `main` only | Builds and pushes to `ghcr.io/<owner>/invoice-approval-workflow`, tagged `latest` **and** the commit SHA, with OCI revision/source/created labels |
+
+`publish` is gated two ways. `needs: [quality, docker-build]` makes the quality gates a hard
+prerequisite — a red lint, a type error, or one failing test means no artifact is published at
+all. `if: github.ref == 'refs/heads/main'` means a feature branch or PR never publishes, however
+green it is. Between them there's **no manual release step**: merging the PR *is* the release.
+Authentication uses the `GITHUB_TOKEN` that every Actions run already gets, with `packages: write`
+granted as a job-level override so the workflow-level `contents: read` stays least-privilege for
+every other job — no new secret to store or rotate.
+
+Two deliberate non-optimisations: `quality` and `docker-build` run in **parallel** rather than
+chained, because a broken Dockerfile and a failing test are independent failure modes and
+sequencing them would hide one behind the other for an extra push-cycle; and `publish` **rebuilds**
+the image instead of sharing a layer cache across jobs, because at this CI volume buildx setup and
+cache-key management cost more than the runner minutes they'd save. It also keeps the always-on,
+side-effect-free job cleanly separate from the one that has side effects.
+
+The result is pullable:
+```bash
+docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest
+```
+
 
 ## Additional info
 
 - **Logging.** Every service logs structured JSON, and every log line carries the same
-  correlation id (the tracking id) end-to-end, so one submission's path through all eight services
+  correlation id (the tracking id) end-to-end, so one submission's path through all nine services
   can be traced with `docker compose logs <service>` — there's no separate log-shipping setup in
-  this project; stdout is the interface.
+  this project; stdout is the interface. Distributed tracing (N4) sits alongside this, not instead
+  of it: logs and the Audit trail join on the tracking id, traces show the same journey's shape and
+  timing across sidecars.
 - **Configuration.** The autonomy policy text and thresholds are not hard-coded — they're read
   once at startup from Dapr's configuration store, changeable by writing directly to the backing
   Redis key and restarting the Decision container, no code change or rebuild required (M13).
-- **Secrets.** The LLM API key is fetched through Dapr's Secrets API rather than read from an
-  environment variable directly, so swapping to a production secret backend later needs no
-  application code change (M5).
+- **Secrets.** The LLM API key and the JWT signing key are both fetched through Dapr's Secrets
+  API rather than read from an environment variable directly, so swapping to a production secret
+  backend later needs no application code change (M5, N1).
 - **State.** Each service owns its own data — no service reads another's store directly, only
   through events. PostgreSQL currently backs only the Audit trail; the other services' data lives
   in Dapr state (Redis) as an interim choice (see `ARCHITECTURE.md` §8/§9 for the exact migration
@@ -441,8 +663,34 @@ dashboard (`dashboard.html`).
 
 - The system runs over plain HTTP, not HTTPS — acceptable for a local/CI capstone, not for a real
   deployment.
-- No authentication/authorization is implemented (N1, optional nice-to-have) — the approver and
-  submitter UIs are open to anyone who can reach the gateway.
+- **JWT authentication with roles is implemented (N1)** — see **Authentication & roles (N1)**
+  above — with the accepted, documented tradeoffs below, rather than gaps:
+  - The UI stores the token in `localStorage`, not an `HttpOnly` cookie. An XSS bug on this page
+    could exfiltrate it; acceptable given this project's scope (no third-party scripts are ever
+    loaded), but a real production UI should prefer an `HttpOnly` cookie instead.
+  - `JWT_SECRET` now goes through Dapr's Secrets API (`shared/jwt_secret_loader.py`), the same
+    mechanism already used for the LLM key — closed, not just noted as the natural fit anymore.
+    The env var remains the fallback if the store is empty/unreachable, and tests/CI leave the
+    Dapr attempt disabled (`JWT_SECRET_DAPR_ENABLED` unset) since `secretstores.local.env` is
+    itself just a thin indirection over the same `.env` value in this project's local setup — see
+    `ARCHITECTURE.md`'s Secrets (M5) section for what this mechanism does and doesn't buy.
+  - Single-item lookups (`GET /invoices/{id}`, `GET /approvals/{id}`, `GET /payments/{id}`) are
+    open to any authenticated role rather than restricted to "your own" submissions — there's no
+    per-row ownership check, only the tracking id itself as the access control. This matches the
+    system's existing model (a tracking id is already the only "credential" needed to check
+    status) but is worth calling out explicitly as a tradeoff, not an oversight.
+  - Out of scope for N1: logout/token revocation, password reset, refresh tokens, and an
+    Approver/Admin self-service provisioning UI (by design — see above). Dedicated per-identity
+    throttling on `/auth/register`/`/auth/login` was out of scope for N1 specifically but is now
+    implemented — see **Reliability — bulkhead & throttling (N3)** above.
+  - Both authentication (decoding the JWT) and authorization (the per-endpoint role check) are
+    enforced per-service today (`shared/auth.py` + each service's own `require_role(...)` calls) —
+    a deliberate choice at this scale (7 services), not an oversight. At a larger scale,
+    authentication would move to a Dapr sidecar/service-mesh middleware layer (enforced once per
+    sidecar instead of imported into every service), while authorization would stay in each
+    service, since only that service knows its own role matrix. The existing split between
+    `shared/auth.py` (generic) and `require_role(...)` (domain-specific) was already designed so
+    that move would be a targeted swap, not a redesign.
 - Invoice, payment, and budget records currently live in Dapr state (Redis) rather than
   PostgreSQL; this is a documented interim choice, not an oversight (`ARCHITECTURE.md` §8/§9), and
   the repository interfaces are already shaped so the swap doesn't ripple into calling code.
@@ -454,8 +702,40 @@ dashboard (`dashboard.html`).
   operations rather than one atomic transaction (no Transactional Outbox yet), so a crash between
   them could leave one without the other — deferred until a real transactional store backs the
   affected repositories.
-- No OpenTelemetry tracing yet (N4, planned nice-to-have) — tracing today is structured logs plus
-  a correlation id, not distributed spans.
+- **CD (N2) publishes an artifact; it doesn't deploy one.** The `publish` job produces the
+  deployable artifact on every merge to `main` — a tagged, labelled container image in GHCR, no
+  manual release step — but there's no environment for it to roll out to (no staging cluster, and
+  no Kubernetes manifests: B3 is unimplemented). The pipeline honestly ends at a pullable image.
+- **Bulkhead + Throttling are implemented (N3)** — see **Reliability — bulkhead & throttling
+  (N3)** above for the design, and `ARCHITECTURE.md` §12 for the full rationale. One
+  accepted limitation, found and confirmed live (not assumed) while building this: Dapr's Redis
+  state store silently ignores per-operation TTL metadata on `execute_state_transaction()` — a
+  `redis-cli TTL` check after a direct write confirmed no expiry was actually set, even though the
+  identical metadata works on a plain `save_state()` call. Switching to `save_state()` to get real
+  TTL was considered and rejected: its ETag-conflict path raises a different, less-trusted
+  exception type than the one this project's Dapr-state repositories already rely on for correct
+  concurrent writes (same reason `DaprStateBudgetRepository` avoids it too). Correctness of the
+  rate-limit counter was kept over self-cleaning storage — rate-limit keys accumulate in Redis
+  without auto-expiry; a real, accepted trade-off, not a silent gap. Outbox pattern (the third N3
+  checklist item) remains unimplemented — deferred to its own future pass (a genuine architectural
+  migration to Postgres for the affected repositories, not a bolt-on addition).
+- **Observability (N4) is tracing only, and the tracing has two edges.** See **Observability —
+  tracing (N4)** above for the design; the limitations are:
+  - The Gateway→service HTTP hop is outside every trace, because it bypasses the Dapr sidecar — so
+    a trace starts at the first service, not at the browser.
+  - Jaeger's trace id is generated by Dapr and is *not* the same value as the tracking/correlation
+    id, so you can't search Jaeger by tracking id — you find the journey by service and timestamp,
+    then join to logs and `GET /audit/{tracking_id}` by the correlation id. Making the two
+    searchable by one value needs app-level OpenTelemetry instrumentation, the same extension the
+    missing first hop needs.
+  - **Metrics (Prometheus/Grafana) are not implemented** — the heavier half of N4, deferred in
+    favour of the half that demonstrates the distributed-system property at this scale.
+- **Policy retrieval (N5) is lexical, not semantic.** TF-IDF/cosine matches shared vocabulary,
+  not paraphrase — a note reading "drinks with the client" that never uses a word from the Meals
+  section wouldn't pull that section in on similarity alone. What makes this safe rather than
+  merely lucky is the deterministic floor: the rules a decision hinges on are present regardless of
+  any score, and the router never reads policy text at all. A real embedding model is the upgrade
+  path if `policy.md` ever grows past the point where a fixed floor plus seven sections is enough.
 
 ## Documentation map
 

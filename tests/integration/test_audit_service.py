@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from services.audit.app import create_app
 from services.audit.repository import AuditRepository, InMemoryAuditRepository
+from shared.auth import AuthenticatedUser, Role, get_current_user
 from shared.contracts.models import ApprovalResolution, PaymentResolution, Route
 from tests.support.event_fixtures import (
     approval_completed_event,
@@ -29,7 +30,11 @@ from tests.support.event_fixtures import (
 
 
 def _build_app(repository: AuditRepository | None = None) -> FastAPI:
-    return create_app(repository=repository or InMemoryAuditRepository())
+    app = create_app(repository=repository or InMemoryAuditRepository())
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="test-admin@example.com", role=Role.ADMIN
+    )
+    return app
 
 
 def _post_decision_completed(client: TestClient, **overrides: Any) -> Any:
@@ -168,3 +173,39 @@ def test_unknown_tracking_id_still_returns_404_alongside_summary_route() -> None
         response = client.get("/audit/unknown")
 
     assert response.status_code == 404
+
+
+# --- N1: authentication/authorization gates ---------------------------------
+
+
+def test_get_audit_trail_requires_authentication() -> None:
+    app = _build_app()
+    app.dependency_overrides.pop(get_current_user, None)
+    with TestClient(app) as client:
+        response = client.get("/audit/corr-1")
+
+    assert response.status_code == 401
+
+
+def test_get_audit_trail_succeeds_for_approver_role() -> None:
+    app = _build_app()
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="approver@example.com", role=Role.APPROVER
+    )
+    with TestClient(app) as client:
+        _post_decision_completed(client, route=Route.AUTO_APPROVE)
+
+        response = client.get("/audit/corr-1")
+
+    assert response.status_code == 200
+
+
+def test_get_summary_requires_admin_role_not_approver() -> None:
+    app = _build_app()
+    app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+        sub="approver@example.com", role=Role.APPROVER
+    )
+    with TestClient(app) as client:
+        response = client.get("/audit/summary")
+
+    assert response.status_code == 403

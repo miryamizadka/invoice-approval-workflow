@@ -6,15 +6,20 @@ Endpoints only call IntakeService; all business logic lives there.
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 
 from services.intake.approval_status_client import (
     ApprovalStatusClient,
     DaprApprovalStatusClient,
 )
+from services.intake.bulkhead_approval_status_client import BulkheadApprovalStatusClient
 from services.intake.dapr_state_repository import DaprStateInvoiceRepository
 from services.intake.decision_completed_publisher import (
     DaprDecisionCompletedPublisher,
@@ -25,7 +30,16 @@ from services.intake.logging_config import configure_logging
 from services.intake.models import SubmissionStatusResponse
 from services.intake.repository import InvoiceRepository
 from services.intake.service import IntakeService, build_intake_service
+from shared.auth import AuthenticatedUser, get_current_user
 from shared.contracts.models import DecisionCompletedEvent, Invoice
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
+from shared.rate_limiter import DaprStateRateLimiter, RateLimiter, throttle_by_user
+
+_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT = 20  # comfortably above verify_phase8's
+# own measured peak (7 submissions under one identity in a single run,
+# 2-6 more under separately-acquired identities from concurrency_check) -
+# a real anti-flood ceiling, not a limit that would trip live verification.
+_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS = 60
 
 
 def create_app(
@@ -33,17 +47,57 @@ def create_app(
     publisher: DecisionPublisher | None = None,
     decision_completed_publisher: DecisionCompletedPublisher | None = None,
     approval_status_client: ApprovalStatusClient | None = None,
+    rate_limiter: RateLimiter | None = None,
+    invoice_submit_rate_limit: int | None = None,
+    invoice_submit_rate_limit_window_seconds: int | None = None,
 ) -> FastAPI:
     configure_logging()
+    # N3: wrapped unconditionally, including under test - existing stub
+    # clients are instant (no sleep), so always-on wrapping is harmless and
+    # keeps bulkhead behavior uniformly active rather than silently
+    # disabled whenever a caller injects its own client.
     intake_service = build_intake_service(
         repository or DaprStateInvoiceRepository(),
         publisher or DaprDecisionPublisher(),
         decision_completed_publisher or DaprDecisionCompletedPublisher(),
-        approval_status_client or DaprApprovalStatusClient(),
+        BulkheadApprovalStatusClient(approval_status_client or DaprApprovalStatusClient()),
     )
+    resolved_invoice_submit_rate_limit = invoice_submit_rate_limit
+    if resolved_invoice_submit_rate_limit is None:
+        resolved_invoice_submit_rate_limit = int(
+            os.environ.get("INVOICE_SUBMIT_RATE_LIMIT", str(_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT))
+        )
+    resolved_invoice_submit_rate_limit_window_seconds = invoice_submit_rate_limit_window_seconds
+    if resolved_invoice_submit_rate_limit_window_seconds is None:
+        resolved_invoice_submit_rate_limit_window_seconds = int(
+            os.environ.get(
+                "INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS",
+                str(_DEFAULT_INVOICE_SUBMIT_RATE_LIMIT_WINDOW_SECONDS),
+            )
+        )
 
-    app = FastAPI(title="ApprovalFlow Intake Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5/N1: app.state.jwt_secret is what shared/auth.py's
+        # get_current_user prefers over the JWT_SECRET env var (see
+        # shared/jwt_secret_loader.py). Gated behind an explicit flag, not
+        # called unconditionally: DaprClient()'s constructor blocks up to
+        # 60s if no sidecar is reachable, which would hang any test that
+        # triggers this lifespan (`with TestClient(app) as client:`) without
+        # a real sidecar running - same reasoning as Decision's own
+        # LLM_PROVIDER=groq gate around its GROQ_API_KEY fetch.
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
+        yield
+
+    app = FastAPI(title="ApprovalFlow Intake Service", lifespan=_lifespan)
     app.state.intake_service = intake_service
+    app.state.rate_limiter = rate_limiter or DaprStateRateLimiter()
     dapr_app = DaprApp(app)
 
     @app.get("/health")
@@ -52,8 +106,22 @@ def create_app(
 
     @app.post("/invoices", status_code=202)
     async def submit_invoice(
-        invoice: Invoice, background_tasks: BackgroundTasks, request: Request, response: Response
+        invoice: Invoice,
+        background_tasks: BackgroundTasks,
+        request: Request,
+        response: Response,
+        user: AuthenticatedUser = Depends(
+            throttle_by_user(
+                scope="invoice_submit",
+                limit=resolved_invoice_submit_rate_limit,
+                window_seconds=resolved_invoice_submit_rate_limit_window_seconds,
+            )
+        ),
     ) -> dict[str, str]:
+        # N1 anti-spoofing: submitter is always the authenticated identity,
+        # never trusted from the client payload - model_copy works fine on
+        # a frozen model (shared/contracts/models.py's Invoice is unchanged).
+        invoice = invoice.model_copy(update={"submitter": user.sub})
         service: IntakeService = request.app.state.intake_service
         tracking_id = await service.submit(invoice)
         background_tasks.add_task(service.process, tracking_id)
@@ -61,7 +129,11 @@ def create_app(
         return {"tracking_id": tracking_id, "status": "received"}
 
     @app.get("/invoices/{tracking_id}", response_model=SubmissionStatusResponse)
-    async def get_invoice_status(tracking_id: str, request: Request) -> SubmissionStatusResponse:
+    async def get_invoice_status(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> SubmissionStatusResponse:
         service: IntakeService = request.app.state.intake_service
         response = await service.get_status_response(tracking_id)
         if response is None:

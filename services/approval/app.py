@@ -6,10 +6,14 @@ Endpoints only call ApprovalService; all business logic lives there.
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from services.approval.dapr_state_repository import DaprStateApprovalRepository
@@ -27,7 +31,9 @@ from services.approval.service import (
     ApprovalService,
     build_approval_service,
 )
+from shared.auth import AuthenticatedUser, Role, get_current_user, require_role
 from shared.contracts.models import DecisionCompletedEvent
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 class _AdditionalInfoBody(BaseModel):
@@ -44,7 +50,21 @@ def create_app(
         publisher or DaprApprovalOutcomePublisher(),
     )
 
-    app = FastAPI(title="ApprovalFlow Approval Service")
+    @asynccontextmanager
+    async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
+        yield
+
+    app = FastAPI(title="ApprovalFlow Approval Service", lifespan=_lifespan)
     app.state.approval_service = approval_service
     dapr_app = DaprApp(app)
 
@@ -53,12 +73,18 @@ def create_app(
         return {"status": "ok", "service": "approval-service"}
 
     @app.get("/approvals", response_model=list[PendingApproval])
-    async def list_approvals(request: Request) -> list[PendingApproval]:
+    async def list_approvals(
+        request: Request, user: AuthenticatedUser = Depends(require_role(Role.APPROVER))
+    ) -> list[PendingApproval]:
         service: ApprovalService = request.app.state.approval_service
         return await service.list_pending()
 
     @app.get("/approvals/{tracking_id}", response_model=PendingApproval)
-    async def get_approval(tracking_id: str, request: Request) -> PendingApproval:
+    async def get_approval(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         try:
             return await service.get(tracking_id)
@@ -66,23 +92,38 @@ def create_app(
             raise HTTPException(status_code=404, detail="tracking_id not found") from exc
 
     @app.post("/approvals/{tracking_id}/approve", response_model=PendingApproval)
-    async def approve(tracking_id: str, request: Request) -> PendingApproval:
+    async def approve(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.approve, tracking_id)
 
     @app.post("/approvals/{tracking_id}/reject", response_model=PendingApproval)
-    async def reject(tracking_id: str, request: Request) -> PendingApproval:
+    async def reject(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.reject, tracking_id)
 
     @app.post("/approvals/{tracking_id}/request-info", response_model=PendingApproval)
-    async def request_info(tracking_id: str, request: Request) -> PendingApproval:
+    async def request_info(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.APPROVER)),
+    ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         return await _resolve(service.request_info, tracking_id)
 
     @app.post("/approvals/{tracking_id}/additional-info", response_model=PendingApproval)
     async def additional_info(
-        tracking_id: str, body: _AdditionalInfoBody, request: Request
+        tracking_id: str,
+        body: _AdditionalInfoBody,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
     ) -> PendingApproval:
         service: ApprovalService = request.app.state.approval_service
         try:

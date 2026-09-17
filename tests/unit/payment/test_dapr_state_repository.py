@@ -158,6 +158,56 @@ async def test_save_wraps_transaction_failure_as_payment_repository_error() -> N
         await repo.save(_payment_record())
 
 
+async def test_save_writes_index_with_the_etag_just_read() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStatePaymentRepository(client=client)
+    await repo.save(_payment_record(tracking_id="tid-1"))
+    etag_before = client.etags[PAYMENT_INDEX_KEY]
+
+    await repo.save(_payment_record(tracking_id="tid-2"))
+
+    etag_after = client.etags[PAYMENT_INDEX_KEY]
+    assert etag_after != etag_before
+    assert json.loads(client.store[PAYMENT_INDEX_KEY]) == ["tid-1", "tid-2"]
+
+
+async def test_save_retries_on_index_conflict_and_succeeds_on_second_attempt() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStatePaymentRepository(client=client)
+    await repo.save(_payment_record(tracking_id="tid-1"))
+    client._fail_transactions = client.transaction_calls + 1  # next transaction call fails once
+
+    await repo.save(_payment_record(tracking_id="tid-2"))
+
+    assert json.loads(client.store[PAYMENT_INDEX_KEY]) == ["tid-1", "tid-2"]
+
+
+async def test_save_raises_payment_repository_error_after_exhausting_retries() -> None:
+    client = _FakeDaprStateClient()
+    repo = DaprStatePaymentRepository(client=client)
+    client._fail_transactions = client.transaction_calls + 999
+
+    with pytest.raises(PaymentRepositoryError):
+        await repo.save(_payment_record(tracking_id="tid-1"))
+
+
+async def test_save_sleeps_between_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = _FakeDaprStateClient()
+    repo = DaprStatePaymentRepository(client=client)
+    await repo.save(_payment_record(tracking_id="tid-1"))
+    client._fail_transactions = client.transaction_calls + 1
+
+    await repo.save(_payment_record(tracking_id="tid-2"))
+
+    assert len(sleep_calls) == 1
+
+
 def test_payment_repository_construction_does_not_call_factory_eagerly() -> None:
     built: list[_FakeDaprStateClient] = []
 

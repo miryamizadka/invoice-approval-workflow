@@ -11,12 +11,13 @@ docstring for the resulting TestClient usage requirement.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from dapr.ext.fastapi import DaprApp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from services.payment.accessors.payment_gateway import PaymentGateway
@@ -35,7 +36,9 @@ from services.payment.service import (
     PaymentService,
     build_payment_service,
 )
+from shared.auth import AuthenticatedUser, Role, get_current_user, require_role
 from shared.contracts.models import ApprovalCompletedEvent, DecisionCompletedEvent
+from shared.jwt_secret_loader import load_jwt_secret_from_dapr, resolve_jwt_secret
 
 
 def create_app(
@@ -57,6 +60,16 @@ def create_app(
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         for department, total in load_budgets().items():
             await resolved_budget_repository.ensure_seeded(department, total)
+        # M5/N1 - see services/intake/app.py's identical block for the full
+        # reasoning (app.state.jwt_secret precedence, the JWT_SECRET_DAPR_ENABLED
+        # gate against DaprClient()'s 60s constructor block in tests).
+        if os.environ.get("JWT_SECRET_DAPR_ENABLED", "false").lower() == "true":
+            dapr_secret = await load_jwt_secret_from_dapr()
+            resolved = resolve_jwt_secret(dapr_secret, os.environ.get("JWT_SECRET"))
+            if resolved:
+                app.state.jwt_secret = resolved
+                if dapr_secret:
+                    logging.getLogger(__name__).info("jwt_secret_rebuilt_from_dapr_secret")
         yield
 
     app = FastAPI(title="ApprovalFlow Payment Service", lifespan=_lifespan)
@@ -69,12 +82,18 @@ def create_app(
         return {"status": "ok", "service": "payment-service"}
 
     @app.get("/payments", response_model=list[PaymentRecord])
-    async def list_payments(request: Request) -> list[PaymentRecord]:
+    async def list_payments(
+        request: Request, user: AuthenticatedUser = Depends(require_role(Role.ADMIN))
+    ) -> list[PaymentRecord]:
         service: PaymentService = request.app.state.payment_service
         return await service.list_all()
 
     @app.get("/payments/{tracking_id}", response_model=PaymentRecord)
-    async def get_payment(tracking_id: str, request: Request) -> PaymentRecord:
+    async def get_payment(
+        tracking_id: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(get_current_user),
+    ) -> PaymentRecord:
         service: PaymentService = request.app.state.payment_service
         try:
             return await service.get(tracking_id)
@@ -82,7 +101,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="tracking_id not found") from exc
 
     @app.get("/budgets/{department}", response_model=Budget)
-    async def get_budget(department: str, request: Request) -> Budget:
+    async def get_budget(
+        department: str,
+        request: Request,
+        user: AuthenticatedUser = Depends(require_role(Role.ADMIN)),
+    ) -> Budget:
         service: PaymentService = request.app.state.payment_service
         try:
             return await service.get_budget(department)
