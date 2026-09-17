@@ -28,14 +28,15 @@ what's implemented and how each was verified, see
 ## Technologies used
 
 Python 3.12 · FastAPI · LangGraph · Groq (swappable LLM provider) · Dapr (pub/sub, state, service
-invocation, secrets, configuration) · Redis · PostgreSQL · Traefik · pytest · Ruff · MyPy · GitHub
-Actions · Docker / Docker Compose · static HTML/CSS/vanilla JS (no frontend framework)
+invocation, secrets, configuration) · Redis · PostgreSQL · Traefik · Jaeger (distributed tracing,
+Zipkin-protocol export) · pytest · Ruff · MyPy · GitHub Actions + GHCR · Docker / Docker Compose ·
+static HTML/CSS/vanilla JS (no frontend framework)
 
 ## Bird's-eye view
 
 The system is nine containers plus their Dapr sidecars, Redis (state store + pub/sub broker),
-PostgreSQL (audit trail), and a Traefik gateway sitting in front of all of it as the single
-external entry point.
+PostgreSQL (audit trail), Jaeger (trace collector, N4), and a Traefik gateway sitting in front of
+all of it as the single external entry point.
 
 ```mermaid
 flowchart TB
@@ -211,7 +212,7 @@ install is needed just to run the system.
    matrix under **Details and component highlights** below. Every one of them now requires an
    `Authorization: Bearer <token>` header from `/auth/login`. `POST /invoices`, `POST
    /auth/register`, and `POST /auth/login` can also return `429` if throttled (N3) — see
-   **Known issues / limitations** for the per-identity limits.
+   **Reliability — bulkhead & throttling (N3)** for the per-identity limits.
 5. Distributed tracing (N4) is visible at **http://localhost:16686** (Jaeger UI) — every Dapr
    sidecar exports spans automatically, no extra setup needed.
 
@@ -336,7 +337,19 @@ flowchart TD
 
 ## How to test
 
-**Automated test suite** (451 unit + integration tests, no Docker required):
+Tests sit at three layers (N6), each answering a question the others structurally can't:
+
+| Layer | Where | Size | Docker? | What it actually proves |
+|---|---|---|---|---|
+| **Unit** | `tests/unit/` — one package per service, plus `shared/` | 499 tests | No | One component's logic in isolation: router thresholds, policy retrieval, idempotency keys, saga compensation, password hashing, rate-limit windows |
+| **Integration** | `tests/integration/` — one suite per service | 110 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
+| **End-to-end** | `scripts/verify_phase8.py` | 4 journeys + 3 guards | Yes | The real running system — nine containers, Dapr sidecars, Redis, Postgres, Traefik, and the *real* Groq LLM — driven through the actual gateway, no mocks anywhere |
+
+The first two layers run anywhere in seconds and gate every push; the end-to-end layer needs a live
+stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
+for why CI always stubs the LLM).
+
+**Automated test suite** (609 unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
@@ -361,6 +374,15 @@ python -m scripts.verify_phase8
 ```
 This is the one script that talks to the real LLM provider instead of the mock — see
 `ARCHITECTURE.md` §14 for why CI itself always stubs the LLM.
+
+**Tracing verification (N4)** (also needs the stack running) — checks the distributed trace really
+exists, by asserting against Jaeger's own HTTP API rather than "open the UI and have a look":
+```bash
+python -m scripts.verify_tracing
+```
+It drives INV-1001 and INV-1003 through the live gateway, then verifies that all six traced
+services emitted spans and reports whether INV-1003's spans share one trace id across the whole
+choreography. They do — see **Observability — tracing (N4)** below.
 
 ## Details and component highlights
 
@@ -481,12 +503,151 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
 (`index.html`), the approver queue (`approvals.html`), and the aggregate dashboard
 (`dashboard.html`) — the nav only shows the tabs the logged-in role can actually use.
 
+## Cross-cutting capabilities
+
+Authentication (N1) is documented with the Auth service above, because it *is* a service with its
+own routes. The four below aren't services — they're properties of the system as a whole.
+
+### Policy retrieval — RAG (N5)
+
+The agent never sees the whole policy. `policy.md` is parsed **once**, at Decider construction,
+into a preamble plus its seven sections (Meals, Travel, SaaS, Hardware, Global rules, Autonomy
+thresholds, Department budgets); each `decide()` call then builds a prompt from only the sections
+that matter to *that* invoice (`services/decision/service/policy_index.py`).
+
+Retrieval is two layers, and the split is the whole point:
+
+- **A deterministic floor that never depends on a score.** The preamble, **Global rules**,
+  **Autonomy thresholds**, and the invoice's own category section are *always* included. A
+  retrieval miss therefore can't drop a rule the decision hinges on — the floor is a guarantee,
+  not a ranking.
+- **An additive TF-IDF / cosine-similarity layer on top**, which can only ever *add* sections,
+  never remove one. This is what catches genuine cross-references: a Travel invoice whose notes
+  mention *"alcohol"* also pulls in the Meals section, because that's Meals vocabulary. It scores
+  ~0.20 against a 0.15 threshold, while a clean single-category invoice scores exactly 0.0 — not
+  merely "below threshold" — against every unrelated section. The threshold sits in that measured
+  gap rather than being a round number someone liked.
+
+Pure Python/stdlib: no embeddings, no vector database. `policy.md` is seven short, fixed sections,
+so an embedding model or a vector store would buy no separation that lexical similarity isn't
+already getting cleanly, in exchange for a dependency, latency, and a non-deterministic failure
+mode. An LLM-based reranker was rejected for the same reason — there are no near-duplicate
+candidates for it to disambiguate.
+
+Two properties make imperfect retrieval survivable rather than dangerous. The **deterministic
+router never sees policy text at all**, so retrieval quality can only move the agent's
+*recommendation*, never the correctness of a decision. And **any retrieval exception falls back to
+the full policy text unconditionally** (`decider.py`) — RAG is allowed to improve relevance, never
+to become a new way for an invoice to fail. Every retrieval logs the section ids it chose under
+the correlation id, so what the agent was shown is auditable after the fact, not a black box.
+
+### Reliability — bulkhead & throttling (N3)
+
+**Bulkhead.** Most inter-service traffic is already isolated by construction: async Dapr pub/sub
+means a slow consumer has no shared call stack to exhaust. Exactly two call sites *aren't*
+decoupled that way, and each gets its own concurrency cap plus a total-latency timeout
+(`shared/bulkhead.py` — a semaphore and an `asyncio.timeout()` covering both the wait for a slot
+*and* the call itself, so a queue of waiters can't quietly become unbounded latency):
+
+| Call site | Concurrency cap | Timeout |
+|---|---|---|
+| Decision → Groq (`BulkheadLLMProvider`) | 5 | 15s — this call had **no** timeout at all before N3 |
+| Intake → Approval (`BulkheadApprovalStatusClient`) | 20 | 5s, just above the inner client's own 3s |
+
+The wrapper is applied at the construction site only — `Decider` and `IntakeService` are
+unchanged — and on timeout each adapter raises the *same* error type its wrapped dependency
+already raises (`LLMProviderError` / `ApprovalStatusClientError`). Both already had a tested
+fail-clean path (Decision falls back to `human_review`, Intake returns the frozen decision), so
+the bulkhead needed no new error handling anywhere downstream.
+
+**Throttling.** Per-identity fixed-window counters (`shared/rate_limiter.py` — a `RateLimiter`
+Protocol with Dapr-state and in-memory implementations, the same Protocol + Dapr + fake pattern
+every repository in the project uses):
+
+| Endpoint | Limit | Keyed by |
+|---|---|---|
+| `POST /invoices` | 20 / 60s | authenticated user |
+| `POST /auth/register` | 5 / 60s | email **and** source IP |
+| `POST /auth/login` | 20 / 60s | email **and** source IP |
+
+The dual key on the auth endpoints isn't belt-and-braces. Registration spam is caught *only* by
+IP-keying, since the attacker picks the emails; credential stuffing spread across many
+attacker-controlled accounts is caught *only* by email-keying. Either key alone leaves one of the
+two wide open. This is also a different layer from the gateway's flat per-client-IP rate limit
+(M6): that one defends the system against raw traffic volume, this one defends a specific identity
+and endpoint against abuse — using identity the system didn't even have before N1. A `429` carries
+`Retry-After`, and the limiter **fails open** if its backing store is unreachable: throttling is
+defense-in-depth, never a hard gate legitimate traffic depends on.
+
+### Observability — tracing (N4)
+
+Every Dapr sidecar exports spans over the Zipkin protocol to a self-hosted Jaeger v2 instance
+(`dapr/components/tracing.yaml`, sampling rate `1` — every request, which is the right call at
+this volume). **No application code changed for this.** Tracing is a sidecar configuration
+(`--config /components/tracing.yaml`), not an instrumentation library imported into seven
+services — the same reasoning that keeps retries, service discovery, and secrets out of the
+application code. The UI is at **http://localhost:16686**.
+
+The payoff is the thing distributed tracing actually exists for: one escalate-and-resume journey
+(INV-1003) appears as **one connected trace** spanning
+`intake → decision → approval → payment → notification → audit` — not six disconnected per-hop
+traces. Dapr propagates W3C trace context through the pub/sub CloudEvents envelope, so the trace
+id survives the whole async choreography, human pause included, with nothing extra written. That
+was *verified*, not assumed: `scripts/verify_tracing.py` intersects the trace ids Jaeger reports
+per service and fails loudly if the intersection is empty.
+
+Coverage is Dapr-mediated traffic only, which is a real boundary and worth stating plainly:
+
+| Flow | Traced? |
+|---|---|
+| Pub/sub choreography (all four topics) | Yes, automatically |
+| Service invocation (Intake → Approval) | Yes, automatically |
+| State / config / secrets operations | Yes, automatically |
+| Gateway → service (direct REST) | **No** — that traffic hits the app port and bypasses the sidecar entirely |
+
+Closing the last row needs FastAPI-level OpenTelemetry instrumentation in each service — a new
+dependency and per-service setup, a separate and larger extension than this one. Metrics
+(Prometheus/Grafana) are not implemented. `ARCHITECTURE.md` §12 carries the full matrix.
+
+### CI/CD (N2)
+
+One workflow (`.github/workflows/ci.yml`), three jobs:
+
+| Job | Runs on | Does |
+|---|---|---|
+| `quality` | every push and PR | Ruff, MyPy, the full pytest suite with coverage, plus a coverage artifact |
+| `docker-build` | every push and PR | Builds the image to prove the Dockerfile stays buildable — validate only, never pushes |
+| `publish` (**the CD stage**) | pushes to `main` only | Builds and pushes to `ghcr.io/<owner>/invoice-approval-workflow`, tagged `latest` **and** the commit SHA, with OCI revision/source/created labels |
+
+`publish` is gated two ways. `needs: [quality, docker-build]` makes the quality gates a hard
+prerequisite — a red lint, a type error, or one failing test means no artifact is published at
+all. `if: github.ref == 'refs/heads/main'` means a feature branch or PR never publishes, however
+green it is. Between them there's **no manual release step**: merging the PR *is* the release.
+Authentication uses the `GITHUB_TOKEN` that every Actions run already gets, with `packages: write`
+granted as a job-level override so the workflow-level `contents: read` stays least-privilege for
+every other job — no new secret to store or rotate.
+
+Two deliberate non-optimisations: `quality` and `docker-build` run in **parallel** rather than
+chained, because a broken Dockerfile and a failing test are independent failure modes and
+sequencing them would hide one behind the other for an extra push-cycle; and `publish` **rebuilds**
+the image instead of sharing a layer cache across jobs, because at this CI volume buildx setup and
+cache-key management cost more than the runner minutes they'd save. It also keeps the always-on,
+side-effect-free job cleanly separate from the one that has side effects.
+
+The result is pullable:
+```bash
+docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest
+```
+
+
 ## Additional info
 
 - **Logging.** Every service logs structured JSON, and every log line carries the same
   correlation id (the tracking id) end-to-end, so one submission's path through all nine services
   can be traced with `docker compose logs <service>` — there's no separate log-shipping setup in
-  this project; stdout is the interface.
+  this project; stdout is the interface. Distributed tracing (N4) sits alongside this, not instead
+  of it: logs and the Audit trail join on the tracking id, traces show the same journey's shape and
+  timing across sidecars.
 - **Configuration.** The autonomy policy text and thresholds are not hard-coded — they're read
   once at startup from Dapr's configuration store, changeable by writing directly to the backing
   Redis key and restarting the Decision container, no code change or rebuild required (M13).
@@ -503,7 +664,7 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
 - The system runs over plain HTTP, not HTTPS — acceptable for a local/CI capstone, not for a real
   deployment.
 - **JWT authentication with roles is implemented (N1)** — see **Authentication & roles (N1)**
-  above — with three accepted, documented tradeoffs rather than gaps:
+  above — with the accepted, documented tradeoffs below, rather than gaps:
   - The UI stores the token in `localStorage`, not an `HttpOnly` cookie. An XSS bug on this page
     could exfiltrate it; acceptable given this project's scope (no third-party scripts are ever
     loaded), but a real production UI should prefer an `HttpOnly` cookie instead.
@@ -521,7 +682,7 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
   - Out of scope for N1: logout/token revocation, password reset, refresh tokens, and an
     Approver/Admin self-service provisioning UI (by design — see above). Dedicated per-identity
     throttling on `/auth/register`/`/auth/login` was out of scope for N1 specifically but is now
-    implemented — see **N3 Reliability** below.
+    implemented — see **Reliability — bulkhead & throttling (N3)** above.
   - Both authentication (decoding the JWT) and authorization (the per-endpoint role check) are
     enforced per-service today (`shared/auth.py` + each service's own `require_role(...)` calls) —
     a deliberate choice at this scale (7 services), not an oversight. At a larger scale,
@@ -541,13 +702,12 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
   operations rather than one atomic transaction (no Transactional Outbox yet), so a crash between
   them could leave one without the other — deferred until a real transactional store backs the
   affected repositories.
-- Distributed tracing (N4) is implemented via Dapr's built-in exporter + a self-hosted Jaeger
-  instance, but only for Dapr-mediated traffic (pub/sub + the one service-invocation call) — the
-  initial Gateway→service HTTP hop isn't part of the same trace, since that traffic bypasses the
-  Dapr sidecar entirely (see `ARCHITECTURE.md` §12). Prometheus/Grafana metrics remain
-  unimplemented.
-- **Bulkhead + Throttling are implemented (N3)** — see `ARCHITECTURE.md` §12 for the full design
-  (defaults, live-verified 429 behavior, and why the two mechanisms exist where they do). One
+- **CD (N2) publishes an artifact; it doesn't deploy one.** The `publish` job produces the
+  deployable artifact on every merge to `main` — a tagged, labelled container image in GHCR, no
+  manual release step — but there's no environment for it to roll out to (no staging cluster, and
+  no Kubernetes manifests: B3 is unimplemented). The pipeline honestly ends at a pullable image.
+- **Bulkhead + Throttling are implemented (N3)** — see **Reliability — bulkhead & throttling
+  (N3)** above for the design, and `ARCHITECTURE.md` §12 for the full rationale. One
   accepted limitation, found and confirmed live (not assumed) while building this: Dapr's Redis
   state store silently ignores per-operation TTL metadata on `execute_state_transaction()` — a
   `redis-cli TTL` check after a direct write confirmed no expiry was actually set, even though the
@@ -559,6 +719,23 @@ the JWT from login attached to each request. Four pages: login (`login.html`), s
   without auto-expiry; a real, accepted trade-off, not a silent gap. Outbox pattern (the third N3
   checklist item) remains unimplemented — deferred to its own future pass (a genuine architectural
   migration to Postgres for the affected repositories, not a bolt-on addition).
+- **Observability (N4) is tracing only, and the tracing has two edges.** See **Observability —
+  tracing (N4)** above for the design; the limitations are:
+  - The Gateway→service HTTP hop is outside every trace, because it bypasses the Dapr sidecar — so
+    a trace starts at the first service, not at the browser.
+  - Jaeger's trace id is generated by Dapr and is *not* the same value as the tracking/correlation
+    id, so you can't search Jaeger by tracking id — you find the journey by service and timestamp,
+    then join to logs and `GET /audit/{tracking_id}` by the correlation id. Making the two
+    searchable by one value needs app-level OpenTelemetry instrumentation, the same extension the
+    missing first hop needs.
+  - **Metrics (Prometheus/Grafana) are not implemented** — the heavier half of N4, deferred in
+    favour of the half that demonstrates the distributed-system property at this scale.
+- **Policy retrieval (N5) is lexical, not semantic.** TF-IDF/cosine matches shared vocabulary,
+  not paraphrase — a note reading "drinks with the client" that never uses a word from the Meals
+  section wouldn't pull that section in on similarity alone. What makes this safe rather than
+  merely lucky is the deterministic floor: the rules a decision hinges on are present regardless of
+  any score, and the router never reads policy text at all. A real embedding model is the upgrade
+  path if `policy.md` ever grows past the point where a fixed floor plus seven sections is enough.
 
 ## Documentation map
 
