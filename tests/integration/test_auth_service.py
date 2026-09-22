@@ -100,9 +100,31 @@ def test_login_with_unknown_email_returns_401() -> None:
     assert response.status_code == 401
 
 
-def test_demo_accounts_are_seeded_and_can_log_in() -> None:
-    """Proves the lifespan hook actually ran and seeded the demo Approver/
-    Admin accounts from services/auth/demo_users.json."""
+def test_demo_accounts_are_not_seeded_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Secure by default: demo_users.json ships inside the published container
+    image, so seeding it unconditionally would give every deployment of that
+    image a working admin login at a password published in the README. With
+    SEED_DEMO_USERS unset, the accounts must simply not exist."""
+    monkeypatch.delenv("SEED_DEMO_USERS", raising=False)
+
+    with TestClient(_build_app()) as client:
+        response = client.post(
+            "/auth/login", json={"email": "approver@example.com", "password": "ApproverDemo123!"}
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "True"])
+def test_demo_accounts_are_seeded_when_explicitly_enabled(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Proves the lifespan hook still seeds the demo Approver/Admin accounts
+    from services/auth/demo_users.json once opted into - the mode
+    docker-compose.yml runs in. Parametrized because the flag is compared
+    case-insensitively, which is a documented promise, not an accident."""
+    monkeypatch.setenv("SEED_DEMO_USERS", value)
+
     with TestClient(_build_app()) as client:
         response = client.post(
             "/auth/login", json={"email": "approver@example.com", "password": "ApproverDemo123!"}
@@ -111,6 +133,22 @@ def test_demo_accounts_are_seeded_and_can_log_in() -> None:
     assert response.status_code == 200
     user = decode_token(response.json()["access_token"], secret=JWT_SECRET)
     assert user.role == Role.APPROVER
+
+
+@pytest.mark.parametrize("value", ["false", "FALSE", "0", "yes", ""])
+def test_demo_accounts_stay_unseeded_for_any_non_true_flag_value(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Only an explicit "true" opts in - a typo'd or truthy-looking value must
+    fail closed, not accidentally seed admin credentials."""
+    monkeypatch.setenv("SEED_DEMO_USERS", value)
+
+    with TestClient(_build_app()) as client:
+        response = client.post(
+            "/auth/login", json={"email": "approver@example.com", "password": "ApproverDemo123!"}
+        )
+
+    assert response.status_code == 401
 
 
 # --- N3: per-identity throttling on register/login ---------------------------
