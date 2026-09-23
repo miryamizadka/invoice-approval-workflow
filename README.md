@@ -348,14 +348,14 @@ Tests sit at three layers (N6), each answering a question the others structurall
 | Layer | Where | Size | Docker? | What it actually proves |
 |---|---|---|---|---|
 | **Unit** | `tests/unit/` — one package per service, plus `shared/` | 499 tests | No | One component's logic in isolation: router thresholds, policy retrieval, idempotency keys, saga compensation, password hashing, rate-limit windows |
-| **Integration** | `tests/integration/` — one suite per service | 110 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
+| **Integration** | `tests/integration/` — one suite per service | 118 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
 | **End-to-end** | `scripts/verify_phase8.py` | 4 journeys + 3 guards | Yes | The real running system — nine containers, Dapr sidecars, Redis, Postgres, Traefik, and the *real* Groq LLM — driven through the actual gateway, no mocks anywhere |
 
 The first two layers run anywhere in seconds and gate every push; the end-to-end layer needs a live
 stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
 for why CI always stubs the LLM).
 
-**Automated test suite** (609 unit + integration tests, no Docker required):
+**Automated test suite** (617 unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
