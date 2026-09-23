@@ -1,6 +1,11 @@
+# Docker matches these against the full relative path, and a bare pattern is
+# NOT recursive: `__pycache__` excludes only a root-level one, while
+# services/decision/__pycache__ would still be copied in. The `**/` prefix is
+# what makes each pattern apply at any depth - verified by inspecting a built
+# image, which had 17 nested __pycache__ directories before this change.
 .git
-__pycache__
-*.pyc
+**/__pycache__
+**/*.pyc
 .venv
 .pytest_cache
 .mypy_cache
@@ -8,4 +13,8 @@ __pycache__
 tests/
 docs/
 scripts/
+# Both spellings on purpose: the bare one for the root .env this project
+# actually uses, the `**/` one so a nested service-local .env can never be
+# baked into a published image either.
 .env
+**/.env

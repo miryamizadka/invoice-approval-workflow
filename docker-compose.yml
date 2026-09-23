@@ -406,6 +406,13 @@ services:
     command: uvicorn services.auth.app:app --host 0.0.0.0 --port 8007
     environment:
       - JWT_SECRET_DAPR_ENABLED=true
+      # Opt in to seeding the demo Approver/Admin accounts. The service
+      # defaults to NOT seeding (services/auth/app.py): demo_users.json ships
+      # inside the published image, so seeding unconditionally would give every
+      # deployment of that image a working admin login at a password published
+      # in the README. Set here, in the local demo stack that is meant to have
+      # those accounts - never baked into the image itself.
+      - SEED_DEMO_USERS=true
     env_file:
       - .env
     # JWT_SECRET (and optional JWT_EXPIRY_HOURS) still read directly from
