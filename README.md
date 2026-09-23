@@ -137,7 +137,8 @@ one submission's path through all nine services can be traced end-to-end.
 - **API Gateway** (Traefik) — the only externally reachable entry point (port `8080`). Routes by
   path prefix to each service, applies a shared rate limit, and serves the static UI. No business
   logic lives here at all.
-- **Auth** — issues JWTs on register/login and seeds the Approver/Admin demo accounts. Every other
+- **Auth** — issues JWTs on register/login and, when `SEED_DEMO_USERS=true`, seeds the
+  Approver/Admin demo accounts. Every other
   service's routes are gated by the tokens it issues (N1) — see **Authentication & roles (N1)**
   below.
 - **Intake** — accepts a submission, returns a tracking id immediately (never blocks on the AI
@@ -204,6 +205,11 @@ install is needed just to run the system.
    |---|---|---|
    | Approver | `approver@example.com` | `ApproverDemo123!` |
    | Admin | `admin@example.com` | `AdminDemo123!` |
+
+   These two accounts exist **only because `docker-compose.yml` sets `SEED_DEMO_USERS=true`** on
+   the Auth service. The service itself defaults to *not* seeding them, so the published container
+   image never ships a usable admin login — see **Demo accounts are opt-in** under **Authentication
+   & roles (N1)**.
 
    The nav bar only shows the tabs your role can use (Submit Invoice for everyone; Approval Queue
    for Approver/Admin; Dashboard for Admin only) — `/ui/approvals.html`, `/ui/dashboard.html`.
@@ -342,14 +348,14 @@ Tests sit at three layers (N6), each answering a question the others structurall
 | Layer | Where | Size | Docker? | What it actually proves |
 |---|---|---|---|---|
 | **Unit** | `tests/unit/` — one package per service, plus `shared/` | 499 tests | No | One component's logic in isolation: router thresholds, policy retrieval, idempotency keys, saga compensation, password hashing, rate-limit windows |
-| **Integration** | `tests/integration/` — one suite per service | 110 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
+| **Integration** | `tests/integration/` — one suite per service | 118 tests | No | A whole service through its real HTTP surface (FastAPI `TestClient`) against in-memory fakes: routes, role gates, status codes, event-subscriber handling |
 | **End-to-end** | `scripts/verify_phase8.py` | 4 journeys + 3 guards | Yes | The real running system — nine containers, Dapr sidecars, Redis, Postgres, Traefik, and the *real* Groq LLM — driven through the actual gateway, no mocks anywhere |
 
 The first two layers run anywhere in seconds and gate every push; the end-to-end layer needs a live
 stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
 for why CI always stubs the LLM).
 
-**Automated test suite** (609 unit + integration tests, no Docker required):
+**Automated test suite** (617 unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
@@ -413,6 +419,17 @@ generic `401`, so the API can't be used to enumerate registered emails.
 Only Submitter accounts are self-registerable. Approver and Admin exist solely via
 `services/auth/demo_users.json`, seeded at startup — there is no runtime endpoint that can create
 one, a deliberate tightening over letting Approver self-register too.
+
+**Demo accounts are opt-in.** `demo_users.json` ships *inside* the container image, so seeding it
+unconditionally would mean every deployment of the published image — which is on a public
+registry — came with a working admin account at a password printed in this README. Seeding is
+therefore gated behind `SEED_DEMO_USERS`, which must equal `true` (compared case-insensitively;
+`1` and `yes` deliberately don't count). It **defaults to off**, so the failure mode of forgetting
+the flag is "the demo accounts don't exist" rather than "anyone can log in as admin".
+`docker-compose.yml` sets it on the Auth service, which is why the local stack and the
+verification scripts still find those accounts. Auth logs `demo_users_seeded` or
+`demo_users_seeding_skipped` at startup, so which mode you're in is visible in
+`docker compose logs auth` rather than something to infer from a failed login.
 
 **Role matrix** — every route below requires *at least* the listed role (an Admin can do
 everything an Approver or Submitter can):

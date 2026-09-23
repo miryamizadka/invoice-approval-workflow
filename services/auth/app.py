@@ -86,7 +86,26 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-        await seed_demo_users(resolved_repository)
+        # Secure by default (fails closed): demo_users.json ships inside the
+        # published container image, so seeding it unconditionally would hand
+        # every deployment of that image a working admin account at a password
+        # published in the README. Gated the same way JWT_SECRET_DAPR_ENABLED
+        # below is: an explicit "true", compared case-insensitively (so TRUE
+        # and True work too), and nothing else - a typo'd or merely
+        # truthy-looking value ("1", "yes") leaves the accounts absent rather
+        # than created. docker-compose.yml sets it for the local demo stack;
+        # the image on its own never seeds.
+        if os.environ.get("SEED_DEMO_USERS", "false").lower() == "true":
+            await seed_demo_users(resolved_repository)
+            logging.getLogger(__name__).info("demo_users_seeded")
+        else:
+            # Logged, not silent: "why can't I log in as approver@example.com"
+            # is the first question this default provokes, and the answer
+            # should be visible in the service's own startup output.
+            logging.getLogger(__name__).info(
+                "demo_users_seeding_skipped",
+                extra={"reason": "SEED_DEMO_USERS is not 'true'"},
+            )
         # M5/N1: overrides the env-var-based secret with one built from
         # Dapr's secret store, if JWT_SECRET_DAPR_ENABLED=true and a value
         # is available - same fetch-once, resilient-fallback posture as
