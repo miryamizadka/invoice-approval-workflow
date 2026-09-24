@@ -1,5 +1,17 @@
 # ApprovalFlow
 
+[![CI](https://github.com/miryamizadka/invoice-approval-workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/miryamizadka/invoice-approval-workflow/actions)
+[![Tests](https://img.shields.io/badge/tests-600%2B-green.svg)](#how-to-test)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
+
+> An AI agent reads every invoice against company policy and recommends.
+> **Plain code — never the model — holds the authority to approve.**
+> The autonomy ceiling is *provable*, not probable.
+
+**9 services · Dapr choreography · LangGraph agent · 600+ tests · distributed tracing**
+
+![Dashboard](docs/screenshots/dashboard.png)
+
 ## Overview
 
 Let's jump right into it. ApprovalFlow is a set of microservices that automate invoice and
@@ -165,9 +177,8 @@ one submission's path through all nine services can be traced end-to-end.
 
 ## Screenshots
 
-**Dashboard** — auto-approval rate, human-escalation rate, and money auto- vs. human-approved per currency, after a full `verify_phase8` run:
-
-![Dashboard](docs/screenshots/dashboard.png)
+The dashboard is at the top of this README — auto-approval rate, human-escalation rate, and money
+auto- vs. human-approved per currency, after a full `verify_phase8` run. The other two pages:
 
 **Submitter view** — the submission form and live tracking status:
 
@@ -399,7 +410,8 @@ Resource) — so once you've read one service, the others are structurally famil
 
 **API Gateway** — Traefik, configured by a static file (`traefik/dynamic.yml`), not the Docker
 label provider (reverted after it proved incompatible with this environment's Docker Engine — see
-ADR-007). Path-prefix routes each of the six business services and `/ui`, applies one shared rate
+ADR-007). Path-prefix routes each of the six business services — Intake, Approval, Payment
+(two prefixes, `/payments` and `/budgets`), Notification, Audit, and Auth — plus `/ui`, applies one shared rate
 limit (10 req/s average, burst 50) per client IP to every router, and strips no internal detail
 beyond hiding the port each service would otherwise expose. Decision gets no route at all — it's
 pure choreography, nothing external ever calls it over HTTP.
@@ -601,9 +613,15 @@ defense-in-depth, never a hard gate legitimate traffic depends on.
 Every Dapr sidecar exports spans over the Zipkin protocol to a self-hosted Jaeger v2 instance
 (`dapr/components/tracing.yaml`, sampling rate `1` — every request, which is the right call at
 this volume). **No application code changed for this.** Tracing is a sidecar configuration
-(`--config /components/tracing.yaml`), not an instrumentation library imported into seven
-services — the same reasoning that keeps retries, service discovery, and secrets out of the
-application code. The UI is at **http://localhost:16686**.
+(`--config /components/tracing.yaml`), not an instrumentation library imported into the seven
+sidecar-backed services — the same reasoning that keeps retries, service discovery, and secrets
+out of the application code. The UI is at **http://localhost:16686**.
+
+**Seven and six are both right, and they mean different things:** all seven Dapr-sidecar services
+(Intake, Decision, Approval, Payment, Notification, Auth, Audit) export spans, but an *invoice
+journey* only ever passes through six of them — Auth issues tokens at login, outside any
+invoice's path, so it's correctly absent from the trace below and from what
+`scripts/verify_tracing.py` asserts.
 
 The payoff is the thing distributed tracing actually exists for: one escalate-and-resume journey
 (INV-1003) appears as **one connected trace** spanning
@@ -678,7 +696,7 @@ docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest
 
 ## Known issues / limitations
 
-- The system runs over plain HTTP, not HTTPS — acceptable for a local/CI capstone, not for a real
+- The system runs over plain HTTP, not HTTPS — acceptable for a local/CI project, not for a real
   deployment.
 - **JWT authentication with roles is implemented (N1)** — see **Authentication & roles (N1)**
   above — with the accepted, documented tradeoffs below, rather than gaps:
@@ -702,9 +720,11 @@ docker pull ghcr.io/miryamizadka/invoice-approval-workflow:latest
     implemented — see **Reliability — bulkhead & throttling (N3)** above.
   - Both authentication (decoding the JWT) and authorization (the per-endpoint role check) are
     enforced per-service today (`shared/auth.py` + each service's own `require_role(...)` calls) —
-    a deliberate choice at this scale (7 services), not an oversight. At a larger scale,
-    authentication would move to a Dapr sidecar/service-mesh middleware layer (enforced once per
-    sidecar instead of imported into every service), while authorization would stay in each
+    a deliberate choice at this scale — **five services actually verify a token** (Intake,
+    Approval, Payment, Notification, Audit), plus Auth itself, which issues them; Decision has no
+    authenticated routes at all, being pure pub/sub choreography — not an oversight. At a larger
+    scale, authentication would move to a Dapr sidecar/service-mesh middleware layer (enforced once
+    per sidecar instead of imported into every service), while authorization would stay in each
     service, since only that service knows its own role matrix. The existing split between
     `shared/auth.py` (generic) and `require_role(...)` (domain-specific) was already designed so
     that move would be a targeted swap, not a redesign.
