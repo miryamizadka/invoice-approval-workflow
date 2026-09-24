@@ -1,14 +1,14 @@
 # ApprovalFlow
 
 [![CI](https://github.com/miryamizadka/invoice-approval-workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/miryamizadka/invoice-approval-workflow/actions)
-[![Tests](https://img.shields.io/badge/tests-617-green.svg)](#how-to-test)
+[![Tests](https://img.shields.io/badge/tests-600%2B-green.svg)](#how-to-test)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 
 > An AI agent reads every invoice against company policy and recommends.
 > **Plain code — never the model — holds the authority to approve.**
 > The autonomy ceiling is *provable*, not probable.
 
-**9 services · Dapr choreography · LangGraph agent · 617 tests · distributed tracing**
+**9 services · Dapr choreography · LangGraph agent · 600+ tests · distributed tracing**
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
@@ -366,7 +366,7 @@ The first two layers run anywhere in seconds and gate every push; the end-to-end
 stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
 for why CI always stubs the LLM).
 
-**Automated test suite** (617 unit + integration tests, no Docker required):
+**Automated test suite** (600+ unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
