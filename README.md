@@ -355,7 +355,7 @@ The first two layers run anywhere in seconds and gate every push; the end-to-end
 stack and a real LLM, so it's run deliberately rather than on every commit (`ARCHITECTURE.md` §14
 for why CI always stubs the LLM).
 
-**Automated test suite** (617 unit + integration tests, no Docker required):
+**Automated test suite** (600+ unit + integration tests, no Docker required):
 ```bash
 pip install -e .[dev]
 pytest --cov=services --cov=shared --cov-report=term-missing
